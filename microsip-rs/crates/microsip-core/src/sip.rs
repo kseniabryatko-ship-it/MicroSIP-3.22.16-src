@@ -1,4 +1,7 @@
+pub mod client;
+pub mod digest;
 pub mod message;
+pub mod sdp;
 use std::error::Error;
 use std::fmt;
 
