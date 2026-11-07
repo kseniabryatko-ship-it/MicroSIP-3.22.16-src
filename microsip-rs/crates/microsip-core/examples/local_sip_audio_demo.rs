@@ -1,19 +1,12 @@
 use microsip_core::audio::{Microphone, Speaker};
-use microsip_core::rtp::{
-    PCMU_CLOCK_RATE, PCMU_PAYLOAD_TYPE, PCMU_SAMPLES_PER_PACKET, PcmuStream, RtpError, RtpPacket,
-    decode_pcmu,
-};
+use microsip_core::rtp::PCMU_CLOCK_RATE;
+use microsip_core::rtp::session::{RtpSession, RtpSessionConfig};
 use microsip_core::sip::message::{InviteRequest, Message, Request, Response, ResponseBuilder};
 use microsip_core::sip::sdp::{MediaKind, Sdp};
 use std::error::Error;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{
-    Arc,
-    mpsc::{self, Receiver, Sender},
-};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 type DemoError = Box<dyn Error + Send + Sync>;
@@ -32,13 +25,7 @@ struct RawRequest<'a> {
     call_id: &'a str,
     contact: &'a str,
     cseq_number: u32,
-}
-
-struct RtpReceiver {
-    stop: Arc<AtomicBool>,
-    packet_count: Arc<AtomicU64>,
-    decoded_samples: Receiver<Vec<f32>>,
-    thread: JoinHandle<DemoResult<()>>,
+    cseq_method: &'a str,
 }
 
 fn main() -> DemoResult<()> {
@@ -66,11 +53,12 @@ fn main() -> DemoResult<()> {
 
     let callee_result = run_callee(callee_sip, callee_rtp, caller_address);
 
-    caller_thread
+    let caller_result = caller_thread
         .join()
-        .map_err(|_| -> DemoError { io::Error::other("Caller thread panicked").into() })??;
+        .map_err(|_| -> DemoError { io::Error::other("Caller thread panicked").into() })?;
 
     callee_result?;
+    caller_result?;
 
     println!("Local SIP call with real PCMU/RTP audio completed");
 
@@ -162,25 +150,18 @@ fn run_caller(
         call_id: call_id.as_str(),
         contact: caller_contact.as_str(),
         cseq_number: invite_cseq_number,
+        cseq_method: "INVITE",
     };
 
     sip_socket.send_to(&build_raw_request(&ack_request), callee_sip_address)?;
 
     println!("Caller sent ACK");
 
-    let receiver_socket = rtp_socket.try_clone()?;
+    let rtp_config = RtpSessionConfig::new(callee_rtp_address, microphone.format().sample_rate);
 
-    let RtpReceiver {
-        stop: receiver_stop,
-        packet_count: receiver_packet_count,
-        decoded_samples: decoded_receiver,
-        thread: receiver_thread,
-    } = start_rtp_receiver(receiver_socket, callee_rtp_address)?;
-
-    let mut pcmu_stream = PcmuStream::new(0x1122_3344, microphone.format().sample_rate)?;
+    let mut rtp_session = RtpSession::from_socket(rtp_socket, rtp_config, 0x1122_3344)?;
 
     let started = Instant::now();
-    let mut sent_packets = 0_usize;
 
     println!(
         "Running full-duplex call audio for {} seconds...",
@@ -188,29 +169,19 @@ fn run_caller(
     );
 
     while started.elapsed() < duration {
-        let packet_count = transmit_microphone(
-            &microphone,
-            &mut pcmu_stream,
-            &rtp_socket,
-            callee_rtp_address,
-        )?;
+        if let Some(samples) = microphone.read_chunk()? {
+            rtp_session.push_pcm(&samples)?;
+        }
 
-        sent_packets += packet_count;
-
-        drain_decoded_audio(&decoded_receiver, &speaker)?;
+        drain_decoded_audio(&rtp_session, &speaker)?;
 
         thread::sleep(Duration::from_millis(5));
     }
 
-    receiver_stop.store(true, Ordering::Release);
+    rtp_session.shutdown()?;
 
-    receiver_thread
-        .join()
-        .map_err(|_| -> DemoError { io::Error::other("RTP receiver thread panicked").into() })??;
-
-    drain_decoded_audio(&decoded_receiver, &speaker)?;
-
-    let received_packets = receiver_packet_count.load(Ordering::Acquire);
+    let sent_packets = rtp_session.sent_packets();
+    let received_packets = rtp_session.received_packets();
 
     let bye_cseq_number = invite_cseq_number
         .checked_add(1)
@@ -227,6 +198,7 @@ fn run_caller(
         call_id: call_id.as_str(),
         contact: caller_contact.as_str(),
         cseq_number: bye_cseq_number,
+        cseq_method: "BYE",
     };
 
     sip_socket.send_to(&build_raw_request(&bye_request), callee_sip_address)?;
@@ -349,28 +321,18 @@ fn run_callee(
 
     sip_socket.set_read_timeout(Some(Duration::from_millis(20)))?;
 
-    let receiver_socket = rtp_socket.try_clone()?;
+    let rtp_config = RtpSessionConfig::new(caller_rtp_address, microphone.format().sample_rate);
 
-    let RtpReceiver {
-        stop: receiver_stop,
-        packet_count: receiver_packet_count,
-        decoded_samples: decoded_receiver,
-        thread: receiver_thread,
-    } = start_rtp_receiver(receiver_socket, caller_rtp_address)?;
-
-    let mut pcmu_stream = PcmuStream::new(0x5566_7788, microphone.format().sample_rate)?;
+    let mut rtp_session = RtpSession::from_socket(rtp_socket, rtp_config, 0x5566_7788)?;
 
     println!("Callee started full-duplex call audio");
 
     loop {
-        transmit_microphone(
-            &microphone,
-            &mut pcmu_stream,
-            &rtp_socket,
-            caller_rtp_address,
-        )?;
+        if let Some(samples) = microphone.read_chunk()? {
+            rtp_session.push_pcm(&samples)?;
+        }
 
-        drain_decoded_audio(&decoded_receiver, &speaker)?;
+        drain_decoded_audio(&rtp_session, &speaker)?;
 
         match sip_socket.recv_from(&mut sip_buffer) {
             Ok((length, source)) => {
@@ -423,135 +385,23 @@ fn run_callee(
         }
     }
 
-    receiver_stop.store(true, Ordering::Release);
+    rtp_session.shutdown()?;
 
-    receiver_thread
-        .join()
-        .map_err(|_| -> DemoError { io::Error::other("RTP receiver thread panicked").into() })??;
+    let sent_packets = rtp_session.sent_packets();
+    let received_packets = rtp_session.received_packets();
 
-    drain_decoded_audio(&decoded_receiver, &speaker)?;
-
-    let received_packets = receiver_packet_count.load(Ordering::Acquire);
-
+    println!("Callee RTP packets sent: {sent_packets}");
     println!("Callee RTP packets received: {received_packets}");
 
-    if received_packets == 0 {
-        return Err(io::Error::other("Callee received no RTP packets").into());
+    if sent_packets == 0 || received_packets == 0 {
+        return Err(io::Error::other("No RTP packets were transferred during the call").into());
     }
 
     Ok(())
 }
 
-fn start_rtp_receiver(socket: UdpSocket, expected_source: SocketAddr) -> DemoResult<RtpReceiver> {
-    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let packet_count = Arc::new(AtomicU64::new(0));
-
-    let (decoded_sender, decoded_receiver) = mpsc::channel::<Vec<f32>>();
-
-    let receiver_stop = Arc::clone(&stop);
-    let receiver_packet_count = Arc::clone(&packet_count);
-
-    let receiver_thread = thread::spawn(move || {
-        run_rtp_receiver(
-            socket,
-            expected_source,
-            decoded_sender,
-            receiver_stop,
-            receiver_packet_count,
-        )
-    });
-
-    Ok(RtpReceiver {
-        stop,
-        packet_count,
-        decoded_samples: decoded_receiver,
-        thread: receiver_thread,
-    })
-}
-
-fn run_rtp_receiver(
-    socket: UdpSocket,
-    expected_source: SocketAddr,
-    decoded_sender: Sender<Vec<f32>>,
-    stop: Arc<AtomicBool>,
-    packet_count: Arc<AtomicU64>,
-) -> DemoResult<()> {
-    let mut buffer = [0_u8; 65_535];
-
-    while !stop.load(Ordering::Acquire) {
-        match socket.recv_from(&mut buffer) {
-            Ok((length, source)) => {
-                if source != expected_source {
-                    continue;
-                }
-
-                let packet = RtpPacket::parse(&buffer[..length])?;
-
-                if packet.payload_type != PCMU_PAYLOAD_TYPE {
-                    return Err(RtpError::UnsupportedPayloadType(packet.payload_type).into());
-                }
-
-                if packet.payload.len() != PCMU_SAMPLES_PER_PACKET {
-                    return Err(RtpError::InvalidPayloadLength {
-                        expected: PCMU_SAMPLES_PER_PACKET,
-                        actual: packet.payload.len(),
-                    }
-                    .into());
-                }
-
-                let samples = decode_pcmu(&packet.payload);
-
-                decoded_sender
-                    .send(samples)
-                    .map_err(|_| io::Error::other("Decoded audio channel was disconnected"))?;
-
-                packet_count.fetch_add(1, Ordering::Relaxed);
-            }
-
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                continue;
-            }
-
-            Err(error) => {
-                return Err(error.into());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn transmit_microphone(
-    microphone: &Microphone,
-    pcmu_stream: &mut PcmuStream,
-    rtp_socket: &UdpSocket,
-    destination: SocketAddr,
-) -> DemoResult<usize> {
-    let Some(samples) = microphone.read_chunk()? else {
-        return Ok(0);
-    };
-
-    let packets = pcmu_stream.push_pcm(&samples);
-    let packet_count = packets.len();
-
-    for packet in packets {
-        let bytes = packet.serialize()?;
-
-        rtp_socket.send_to(&bytes, destination)?;
-    }
-
-    Ok(packet_count)
-}
-
-fn drain_decoded_audio(receiver: &Receiver<Vec<f32>>, speaker: &Speaker) -> DemoResult<()> {
-    while let Ok(samples) = receiver.try_recv() {
+fn drain_decoded_audio(rtp_session: &RtpSession, speaker: &Speaker) -> DemoResult<()> {
+    while let Some(samples) = rtp_session.try_receive_decoded()? {
         speaker.play_mono(&samples, PCMU_CLOCK_RATE)?;
     }
 
@@ -567,6 +417,7 @@ fn build_raw_request(request: &RawRequest<'_>) -> Vec<u8> {
     let call_id = request.call_id;
     let contact = request.contact;
     let cseq_number = request.cseq_number;
+    let cseq_method = request.cseq_method;
 
     format!(
         "{method} {request_uri} SIP/2.0\r\n\
@@ -575,7 +426,7 @@ fn build_raw_request(request: &RawRequest<'_>) -> Vec<u8> {
          From: {from}\r\n\
          To: {to}\r\n\
          Call-ID: {call_id}\r\n\
-         CSeq: {cseq_number} {method}\r\n\
+         CSeq: {cseq_number} {cseq_method}\r\n\
          Contact: {contact}\r\n\
          Content-Length: 0\r\n\r\n"
     )
@@ -732,7 +583,11 @@ fn parse_duration() -> DemoResult<Duration> {
     };
 
     if seconds == 0 {
-        return Err(io::Error::other("Duration must be greater than zero").into());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Duration must be greater than zero",
+        )
+        .into());
     }
 
     Ok(Duration::from_secs(seconds))

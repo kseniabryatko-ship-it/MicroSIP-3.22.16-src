@@ -127,14 +127,22 @@ impl RtpSession {
         config: RtpSessionConfig,
         ssrc: u32,
     ) -> Result<Self, RtpSessionError> {
+        let socket = UdpSocket::bind(local_address)?;
+
+        Self::from_socket(socket, config, ssrc)
+    }
+
+    pub fn from_socket(
+        socket: UdpSocket,
+        config: RtpSessionConfig,
+        ssrc: u32,
+    ) -> Result<Self, RtpSessionError> {
         let RtpSessionConfig {
             remote_address,
             expected_source,
             source_sample_rate,
             receive_timeout,
         } = config;
-
-        let socket = UdpSocket::bind(local_address)?;
 
         let pcmu_stream = PcmuStream::new(ssrc, source_sample_rate)?;
 
@@ -345,12 +353,14 @@ mod tests {
 
     #[test]
     fn transfers_pcmu_between_sessions() {
-        let receiver_config =
-            RtpSessionConfig::new("127.0.0.1:0".parse().expect("valid address"), 48_000)
-                .with_expected_source(None);
+        let receiver_config = RtpSessionConfig::new(
+            "127.0.0.1:0".parse::<SocketAddr>().expect("valid address"),
+            48_000,
+        )
+        .with_expected_source(None);
 
         let mut receiver = RtpSession::bind(
-            "127.0.0.1:0".parse().expect("valid address"),
+            "127.0.0.1:0".parse::<SocketAddr>().expect("valid address"),
             receiver_config,
             0x1111_1111,
         )
@@ -363,7 +373,7 @@ mod tests {
         let sender_config = RtpSessionConfig::new(receiver_address, 48_000);
 
         let mut sender = RtpSession::bind(
-            "127.0.0.1:0".parse().expect("valid address"),
+            "127.0.0.1:0".parse::<SocketAddr>().expect("valid address"),
             sender_config,
             0x2222_2222,
         )
@@ -394,13 +404,38 @@ mod tests {
     }
 
     #[test]
+    fn accepts_prebound_socket() {
+        let socket = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().expect("valid address"))
+            .expect("socket should bind");
+
+        let expected_address = socket.local_addr().expect("socket address should exist");
+
+        let config = RtpSessionConfig::new(expected_address, 48_000);
+
+        let mut session =
+            RtpSession::from_socket(socket, config, 0x3333_3333).expect("session should start");
+
+        assert_eq!(
+            session
+                .local_address()
+                .expect("session address should exist"),
+            expected_address
+        );
+
+        session.shutdown().expect("session should stop cleanly");
+    }
+
+    #[test]
     fn shutdown_is_idempotent() {
-        let config = RtpSessionConfig::new("127.0.0.1:0".parse().expect("valid address"), 48_000);
+        let config = RtpSessionConfig::new(
+            "127.0.0.1:0".parse::<SocketAddr>().expect("valid address"),
+            48_000,
+        );
 
         let mut session = RtpSession::bind(
-            "127.0.0.1:0".parse().expect("valid address"),
+            "127.0.0.1:0".parse::<SocketAddr>().expect("valid address"),
             config,
-            0x3333_3333,
+            0x4444_4444,
         )
         .expect("session should start");
 
