@@ -1,0 +1,47 @@
+name: Rust Windows preview
+
+on:
+  push:
+    branches: [rust-rewrite]
+    paths:
+      - 'microsip-rs/**'
+      - '.github/workflows/rust-windows.yml'
+  pull_request:
+    paths:
+      - 'microsip-rs/**'
+      - '.github/workflows/rust-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: microsip-rs
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check, test, build and package
+        run: ./build-release.ps1
+
+      - name: Upload preview archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: microsip-rs-windows-x64-preview
+          path: |
+            microsip-rs/target/portable-releases/*.zip
+            microsip-rs/target/portable-releases/*.sha256
+          if-no-files-found: error
+          retention-days: 7
