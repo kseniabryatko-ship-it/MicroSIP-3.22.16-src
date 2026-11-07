@@ -9,6 +9,15 @@ use std::time::Duration;
 type DemoError = Box<dyn Error + Send + Sync>;
 type DemoResult<T> = Result<T, DemoError>;
 
+const RTP_PACKET: [u8; 14] = [
+    0x80, // RTP version 2, no padding, no extension
+    0x00, // payload type: PCMU
+    0x00, 0x01, // sequence number
+    0x00, 0x00, 0x00, 0x00, // timestamp
+    0x11, 0x22, 0x33, 0x44, // SSRC
+    0xfa, 0xff, // test PCMU payload
+];
+
 fn main() -> DemoResult<()> {
     let caller_sip = UdpSocket::bind("127.0.0.1:0")?;
     let caller_rtp = UdpSocket::bind("127.0.0.1:0")?;
@@ -30,12 +39,11 @@ fn main() -> DemoResult<()> {
 
     let callee_result = run_callee(callee_sip, callee_rtp, caller_address);
 
-    let caller_result = caller_thread
+    caller_thread
         .join()
         .map_err(|_| -> DemoError { io::Error::other("Caller thread panicked").into() })??;
 
     callee_result?;
-    caller_result;
 
     println!("Incoming INVITE and RTP simulation completed");
 
@@ -76,16 +84,19 @@ fn run_caller(
     println!("Caller sent INVITE with SDP");
 
     let trying = receive_response(&sip_socket, callee_address)?;
+
     ensure_status(&trying, 100)?;
 
     println!("Caller received 100 Trying");
 
     let ringing = receive_response(&sip_socket, callee_address)?;
+
     ensure_status(&ringing, 180)?;
 
     println!("Caller received 180 Ringing");
 
     let ok = receive_response(&sip_socket, callee_address)?;
+
     ensure_status(&ok, 200)?;
 
     println!("Caller received 200 OK");
@@ -101,7 +112,7 @@ fn run_caller(
 
     println!("Caller received RTP packet from {source}, {} bytes", length);
 
-    rtp_socket.send_to(&rtp_packet(), callee_rtp_address)?;
+    rtp_socket.send_to(&RTP_PACKET, callee_rtp_address)?;
 
     println!("Caller sent RTP packet to callee");
 
@@ -111,11 +122,16 @@ fn run_caller(
 fn run_callee(
     sip_socket: UdpSocket,
     rtp_socket: UdpSocket,
-    caller_address: SocketAddr,
+    expected_caller_address: SocketAddr,
 ) -> DemoResult<()> {
     let mut buffer = [0_u8; 65_535];
 
     let (length, peer_address) = sip_socket.recv_from(&mut buffer)?;
+
+    if peer_address != expected_caller_address {
+        return Err(io::Error::other(format!("Unexpected SIP source: {peer_address}")).into());
+    }
+
     let request = parse_request(&buffer[..length])?;
 
     if request.method.as_str() != "INVITE" {
@@ -129,7 +145,9 @@ fn run_callee(
 
     let via = required_header(&request, "via")?;
     let from = required_header(&request, "from")?;
+
     let to = format!("{};tag=callee-tag", required_header(&request, "to")?);
+
     let call_id = required_header(&request, "call-id")?;
     let cseq = required_header(&request, "cseq")?;
 
@@ -158,6 +176,7 @@ fn run_callee(
     println!("Callee sent 180 Ringing");
 
     let callee_rtp_address = rtp_socket.local_addr()?;
+
     let callee_sdp = build_sdp(
         "bob",
         &callee_rtp_address.ip().to_string(),
@@ -178,7 +197,7 @@ fn run_callee(
 
     println!("Callee sent 200 OK with SDP");
 
-    rtp_socket.send_to(&rtp_packet(), caller_rtp_address)?;
+    rtp_socket.send_to(&RTP_PACKET, caller_rtp_address)?;
 
     println!("Callee sent RTP packet to caller");
 
@@ -225,6 +244,7 @@ fn receive_response(socket: &UdpSocket, expected_source: SocketAddr) -> DemoResu
 
 fn receive_rtp(socket: &UdpSocket) -> DemoResult<(usize, SocketAddr)> {
     let mut buffer = [0_u8; 65_535];
+
     let (length, source) = socket.recv_from(&mut buffer)?;
 
     if length < 12 {
@@ -300,17 +320,6 @@ m=audio {rtp_port} RTP/AVP 0\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
 a=sendrecv\r\n"
     )
-}
-
-fn rtp_packet() -> Vec<u8> {
-    vec![
-        0x80, // RTP version 2, no padding, no extension
-        0x00, // payload type: PCMU
-        0x00, 0x01, // sequence number
-        0x00, 0x00, 0x00, 0x00, // timestamp
-        0x11, 0x22, 0x33, 0x44, // SSRC
-        0xfa, 0xff, // test PCMU payload
-    ]
 }
 
 fn ensure_status(response: &Response, expected: u16) -> DemoResult<()> {
