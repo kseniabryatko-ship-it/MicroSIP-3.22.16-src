@@ -8,3 +8,6 @@ pub mod transaction_headers;
 
 #[path = "sip/dialog.rs"]
 pub mod dialog;
+
+#[path = "sip/invite_control.rs"]
+pub mod invite_control;
