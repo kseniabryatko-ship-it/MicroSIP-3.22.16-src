@@ -1,3 +1,4 @@
+pub mod session;
 use std::error::Error;
 use std::fmt;
 
