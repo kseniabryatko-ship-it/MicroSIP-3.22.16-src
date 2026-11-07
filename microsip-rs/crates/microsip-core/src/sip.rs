@@ -2,6 +2,7 @@ pub mod client;
 pub mod digest;
 pub mod message;
 pub mod sdp;
+pub mod transaction;
 use std::error::Error;
 use std::fmt;
 
