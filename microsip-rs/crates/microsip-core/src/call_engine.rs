@@ -10,7 +10,8 @@
 //! retransmission of the current INVITE or a second new INVITE is not an
 //! [`Input::IncomingInvite`] for an engine that is already busy. Retained
 //! transactions (retransmitted answers, repeated ACKs) belong to the
-//! transaction layer and are not modelled here. The engine has no timers.
+//! transaction layer and are not modelled here. The engine has no timers: the
+//! executor owns them and reports an expired one as [`Input::Timeout`].
 
 use std::error::Error;
 use std::fmt;
@@ -59,6 +60,8 @@ pub enum Input {
     InviteResponse(u16),
     /// Response to our BYE.
     ByeResponse(u16),
+    /// The executor's retransmission timer gave up waiting for the peer.
+    Timeout,
 }
 
 /// Work the executor must perform, in the order returned.
@@ -139,6 +142,10 @@ impl CallEngine {
             }
 
             (State::Outgoing, Input::Command(Command::Hangup)) => Ok(self.cancel_outgoing()),
+            (State::Outgoing, Input::Timeout) => {
+                self.state = State::Idle;
+                Ok(vec![Action::ReportEnded])
+            }
             (State::Outgoing, Input::InviteResponse(status)) => {
                 self.outgoing_response(input, status)
             }
@@ -169,6 +176,11 @@ impl CallEngine {
             }
             // CANCEL arrived after the 2xx: it has no effect on the call.
             (State::Answered, Input::IncomingCancel) => Ok(vec![Action::SendCancelSuccess]),
+            // No ACK for our 2xx within the retransmission window: end the session.
+            (State::Answered, Input::Timeout) => {
+                self.state = State::Ending;
+                Ok(vec![Action::SendBye])
+            }
             // BYE before the ACK: media never started.
             (State::Answered, Input::IncomingBye) => {
                 self.state = State::Idle;
@@ -202,6 +214,10 @@ impl CallEngine {
                 }
                 _ => Err(self.invalid(input)),
             },
+            (State::Ending, Input::Timeout) => {
+                self.state = State::Idle;
+                Ok(vec![Action::ReportEnded])
+            }
             // Both sides hung up at once: answer theirs, keep waiting for ours.
             (State::Ending, Input::IncomingBye) => Ok(vec![Action::SendByeSuccess]),
             // Retransmitted 2xx while our BYE is in flight.
@@ -314,6 +330,40 @@ mod tests {
         let error = engine.handle(Input::IncomingAck).unwrap_err();
         assert_eq!(error.state, State::Idle);
         assert_eq!(engine.state(), State::Idle);
+    }
+
+    #[test]
+    fn timeout_ends_an_unanswered_outgoing_call() {
+        let mut engine = CallEngine::new();
+        engine.handle(Input::Command(Command::Dial)).unwrap();
+        assert_eq!(
+            engine.handle(Input::Timeout).unwrap(),
+            vec![Action::ReportEnded]
+        );
+        assert_eq!(engine.state(), State::Idle);
+    }
+
+    #[test]
+    fn missing_ack_ends_with_bye_and_bye_timeout_ends_call() {
+        let mut engine = CallEngine::new();
+        engine.handle(Input::IncomingInvite).unwrap();
+        engine.handle(Input::Command(Command::Answer)).unwrap();
+        assert_eq!(
+            engine.handle(Input::Timeout).unwrap(),
+            vec![Action::SendBye]
+        );
+        assert_eq!(engine.state(), State::Ending);
+        assert_eq!(
+            engine.handle(Input::Timeout).unwrap(),
+            vec![Action::ReportEnded]
+        );
+        assert_eq!(engine.state(), State::Idle);
+    }
+
+    #[test]
+    fn timeout_is_invalid_when_nothing_is_pending() {
+        let mut engine = CallEngine::new();
+        assert!(engine.handle(Input::Timeout).is_err());
     }
 
     #[test]
