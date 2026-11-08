@@ -55,6 +55,18 @@ pub enum EndReason {
     Failed,
 }
 
+impl std::fmt::Display for EndReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Completed => formatter.write_str("completed"),
+            Self::Rejected(status) => write!(formatter, "rejected ({status})"),
+            Self::Cancelled => formatter.write_str("cancelled"),
+            Self::Timeout => formatter.write_str("timeout"),
+            Self::Failed => formatter.write_str("failed"),
+        }
+    }
+}
+
 /// Notifications for the user interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {

@@ -1,369 +1,434 @@
-use microsip_core::call_engine::{Action, CallEngine, Command, Input, State};
+use microsip_core::call_media::{Media, MediaError, NullMedia};
+use microsip_core::call_runner::{
+    CallHandle, EndReason, Event, Timers, UiCommand, spawn_with_timers,
+};
 use microsip_core::dialog::{DialogConfig, EstablishedDialog};
-use microsip_core::invite_control::{build_cancel, build_failure_ack};
-use microsip_core::sip::message::{InviteRequest, Message, Request, Response, ResponseBuilder};
-use microsip_core::transaction_headers::response_matches_request;
-use std::error::Error;
-use std::io;
-use std::net::UdpSocket;
+use microsip_core::sip::message::{InviteRequest, Message, Request, ResponseBuilder};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+const WAIT: Duration = Duration::from_secs(5);
+const LOOPBACK: &str = "127.0.0.1:0";
 
-struct Link {
-    caller: UdpSocket,
-    callee: UdpSocket,
+#[derive(Clone, Default)]
+struct Counters {
+    started: Arc<AtomicUsize>,
+    running: Arc<AtomicUsize>,
 }
 
-impl Link {
-    fn new() -> TestResult<Self> {
-        let caller = UdpSocket::bind("127.0.0.1:0")?;
-        let callee = UdpSocket::bind("127.0.0.1:0")?;
-        caller.set_read_timeout(Some(Duration::from_secs(2)))?;
-        callee.set_read_timeout(Some(Duration::from_secs(2)))?;
-        Ok(Self { caller, callee })
-    }
+struct CountingMedia {
+    inner: NullMedia,
+    counters: Counters,
+    on: bool,
+}
 
-    fn to_callee(&self, message: Message) -> TestResult<Message> {
-        transfer(&self.caller, &self.callee, message)
-    }
-
-    fn to_caller(&self, message: Message) -> TestResult<Message> {
-        transfer(&self.callee, &self.caller, message)
-    }
-
-    fn invite(&self) -> TestResult<Request> {
-        let caller = self.caller.local_addr()?;
-        let callee = self.callee.local_addr()?;
-        Ok(InviteRequest::new(
-            format!("sip:bob@{callee}"),
-            "sip:alice@local.test",
-            "sip:bob@local.test",
-            format!("sip:alice@{caller}"),
-            caller.to_string(),
-            "integration-call@local.test",
-            "z9hG4bK-integration-invite",
-            "alice-tag",
-        )
-        .build()?)
+impl CountingMedia {
+    fn new(counters: Counters) -> Self {
+        Self {
+            inner: NullMedia::default(),
+            counters,
+            on: false,
+        }
     }
 }
 
-fn transfer(from: &UdpSocket, to: &UdpSocket, message: Message) -> TestResult<Message> {
-    let bytes = message.serialize()?;
-    let sent = from.send_to(&bytes, to.local_addr()?)?;
-    assert_eq!(sent, bytes.len());
+impl Media for CountingMedia {
+    fn prepare(&mut self, ip: IpAddr) -> Result<SocketAddr, MediaError> {
+        self.inner.prepare(ip)
+    }
 
+    fn start(&mut self, remote: SocketAddr) -> Result<(), MediaError> {
+        self.inner.start(remote)?;
+        self.on = true;
+        self.counters.started.fetch_add(1, Ordering::SeqCst);
+        self.counters.running.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        self.inner.stop();
+        if self.on {
+            self.on = false;
+            self.counters.running.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+fn phone(timers: Timers) -> (CallHandle, Counters) {
+    let counters = Counters::default();
+    let for_media = counters.clone();
+    let handle = spawn_with_timers(LOOPBACK.parse().unwrap(), "phone", timers, move || {
+        CountingMedia::new(for_media)
+    })
+    .expect("executor should start");
+    (handle, counters)
+}
+
+fn default_phone() -> (CallHandle, Counters) {
+    phone(Timers::default())
+}
+
+fn fast_timers() -> Timers {
+    Timers {
+        t1: Duration::from_millis(30),
+        t2: Duration::from_millis(100),
+        give_up: Duration::from_millis(600),
+    }
+}
+
+/// Waits for `expected`, failing on any reported error or on timeout.
+fn wait_for(handle: &CallHandle, expected: Event) {
+    let deadline = std::time::Instant::now() + WAIT;
+    while std::time::Instant::now() < deadline {
+        match handle.wait_event(Duration::from_millis(50)) {
+            Some(event) if event == expected => return,
+            Some(Event::Error(message)) => panic!("executor reported an error: {message}"),
+            _ => {}
+        }
+    }
+    panic!("timed out waiting for {expected:?}");
+}
+
+fn scripted_socket() -> UdpSocket {
+    let socket = UdpSocket::bind(LOOPBACK).unwrap();
+    socket.set_read_timeout(Some(WAIT)).unwrap();
+    socket
+}
+
+fn receive(socket: &UdpSocket) -> (Message, SocketAddr) {
     let mut buffer = [0_u8; 65_535];
-    let (length, source) = to.recv_from(&mut buffer)?;
-    assert_eq!(source, from.local_addr()?);
-    Ok(Message::parse(std::str::from_utf8(&buffer[..length])?)?)
+    let (length, source) = socket.recv_from(&mut buffer).expect("expected a datagram");
+    let text = std::str::from_utf8(&buffer[..length]).unwrap();
+    (Message::parse(text).unwrap(), source)
 }
 
-fn required<'a>(request: &'a Request, name: &str) -> TestResult<&'a str> {
-    request
-        .headers
-        .get(name)
-        .ok_or_else(|| io::Error::other(format!("Missing request header: {name}")).into())
-}
-
-fn as_request(message: Message) -> TestResult<Request> {
-    match message {
-        Message::Request(request) => Ok(request),
-        Message::Response(_) => Err(io::Error::other("Expected request").into()),
+fn receive_request(socket: &UdpSocket, method: &str) -> Request {
+    loop {
+        if let (Message::Request(request), _) = receive(socket)
+            && request.method.as_str() == method
+        {
+            return request;
+        }
     }
 }
 
-fn as_response(message: Message) -> TestResult<Response> {
-    match message {
-        Message::Response(response) => Ok(response),
-        Message::Request(_) => Err(io::Error::other("Expected response").into()),
-    }
-}
-
-fn response(request: &Request, status: u16, contact: &str) -> TestResult<Response> {
-    let reason = match status {
-        180 => "Ringing",
-        200 => "OK",
-        486 => "Busy Here",
-        487 => "Request Terminated",
-        _ => "Test",
-    };
-    let original_to = required(request, "to")?;
-    let to = if original_to.contains(";tag=") {
-        original_to.to_owned()
+fn reply(request: &Request, status: u16, reason: &str) -> Vec<u8> {
+    let to = request.headers.get("to").unwrap();
+    let to = if to.contains(";tag=") {
+        to.to_owned()
     } else {
-        format!("{original_to};tag=bob-tag")
+        format!("{to};tag=scripted-tag")
     };
-
-    Ok(ResponseBuilder::new(status, reason)
-        .header("via", required(request, "via")?)?
-        .header("from", required(request, "from")?)?
-        .header("to", to)?
-        .header("call-id", required(request, "call-id")?)?
-        .header("cseq", required(request, "cseq")?)?
-        .header("contact", format!("<{contact}>"))?
-        .build()?)
+    let mut builder = ResponseBuilder::new(status, reason);
+    for via in request.headers.get_all("via") {
+        builder = builder.append_header("via", via).unwrap();
+    }
+    builder
+        .header("from", request.headers.get("from").unwrap())
+        .unwrap()
+        .header("to", to)
+        .unwrap()
+        .header("call-id", request.headers.get("call-id").unwrap())
+        .unwrap()
+        .header("cseq", request.headers.get("cseq").unwrap())
+        .unwrap()
+        .header("contact", "<sip:scripted@127.0.0.1:9>")
+        .unwrap()
+        .build()
+        .unwrap()
+        .serialize()
+        .unwrap()
 }
 
-fn assert_response_matches(request: &Request, response: &Response) -> TestResult {
-    assert!(response_matches_request(
-        &Message::Request(request.clone()),
-        &Message::Response(response.clone()),
-    )?);
-    Ok(())
+fn scripted_invite(socket: &UdpSocket, target: SocketAddr, call_id: &str) -> Request {
+    let local = socket.local_addr().unwrap();
+    let sdp = "v=0\r\no=raw 1 1 IN IP4 127.0.0.1\r\ns=raw\r\nc=IN IP4 127.0.0.1\r\n\
+               t=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+    InviteRequest::new(
+        format!("sip:phone@{target}"),
+        format!("sip:raw@{local}"),
+        format!("sip:phone@{target}"),
+        format!("sip:raw@{local}"),
+        local.to_string(),
+        call_id,
+        format!("z9hG4bK-{call_id}"),
+        "raw-tag",
+    )
+    .body(sdp.as_bytes().to_vec())
+    .build()
+    .unwrap()
 }
 
-fn dialog(link: &Link, invite: &Request, success: &Response) -> TestResult<EstablishedDialog> {
-    let contact = success
-        .headers
-        .get("contact")
-        .ok_or_else(|| io::Error::other("Missing response Contact"))?;
-    let remote_target = contact
-        .strip_prefix('<')
-        .and_then(|value| value.strip_suffix('>'))
-        .ok_or_else(|| io::Error::other("Invalid test Contact"))?;
-    let to = success
-        .headers
-        .get("to")
-        .ok_or_else(|| io::Error::other("Missing response To"))?;
+fn send(socket: &UdpSocket, request: &Request, target: SocketAddr) {
+    socket
+        .send_to(&request.serialize().unwrap(), target)
+        .unwrap();
+}
 
-    Ok(EstablishedDialog::new(DialogConfig {
-        remote_target: remote_target.to_owned(),
-        local_from: required(invite, "from")?.to_owned(),
-        remote_to: to.to_owned(),
-        call_id: required(invite, "call-id")?.to_owned(),
-        local_sent_by: link.caller.local_addr()?.to_string(),
-        local_contact: format!("<sip:alice@{}>", link.caller.local_addr()?),
+fn status_of(message: &Message) -> u16 {
+    match message {
+        Message::Response(response) => response.status_code,
+        Message::Request(_) => panic!("expected a response"),
+    }
+}
+
+fn connect(a: &CallHandle, b: &CallHandle) {
+    a.send(UiCommand::Dial(b.local_address()));
+    wait_for(
+        b,
+        Event::Incoming {
+            peer: a.local_address(),
+        },
+    );
+    wait_for(a, Event::Ringing);
+    b.send(UiCommand::Answer);
+    wait_for(a, Event::Established);
+    wait_for(b, Event::Established);
+}
+
+#[test]
+fn caller_hangup_ends_both_sides() {
+    let (a, a_media) = default_phone();
+    let (b, b_media) = default_phone();
+    connect(&a, &b);
+    assert_eq!(a_media.running.load(Ordering::SeqCst), 1);
+    assert_eq!(b_media.running.load(Ordering::SeqCst), 1);
+
+    a.send(UiCommand::Hangup);
+    wait_for(&a, Event::Ended(EndReason::Completed));
+    wait_for(&b, Event::Ended(EndReason::Completed));
+    assert_eq!(a_media.started.load(Ordering::SeqCst), 1);
+    assert_eq!(b_media.started.load(Ordering::SeqCst), 1);
+    assert_eq!(a_media.running.load(Ordering::SeqCst), 0);
+    assert_eq!(b_media.running.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn callee_hangup_ends_both_sides() {
+    let (a, _) = default_phone();
+    let (b, _) = default_phone();
+    connect(&a, &b);
+
+    b.send(UiCommand::Hangup);
+    wait_for(&b, Event::Ended(EndReason::Completed));
+    wait_for(&a, Event::Ended(EndReason::Completed));
+}
+
+#[test]
+fn rejection_ends_both_sides_and_allows_a_new_call() {
+    let (a, a_media) = default_phone();
+    let (b, _) = default_phone();
+    a.send(UiCommand::Dial(b.local_address()));
+    wait_for(
+        &b,
+        Event::Incoming {
+            peer: a.local_address(),
+        },
+    );
+    b.send(UiCommand::Reject);
+    wait_for(&a, Event::Ended(EndReason::Rejected(486)));
+    wait_for(&b, Event::Ended(EndReason::Rejected(486)));
+    assert_eq!(a_media.started.load(Ordering::SeqCst), 0);
+
+    connect(&a, &b);
+    a.send(UiCommand::Hangup);
+    wait_for(&a, Event::Ended(EndReason::Completed));
+    wait_for(&b, Event::Ended(EndReason::Completed));
+}
+
+#[test]
+fn cancel_while_ringing_ends_both_sides() {
+    let (a, _) = default_phone();
+    let (b, _) = default_phone();
+    a.send(UiCommand::Dial(b.local_address()));
+    wait_for(
+        &b,
+        Event::Incoming {
+            peer: a.local_address(),
+        },
+    );
+    wait_for(&a, Event::Ringing);
+
+    a.send(UiCommand::Hangup);
+    wait_for(&a, Event::Ended(EndReason::Cancelled));
+    wait_for(&b, Event::Ended(EndReason::Cancelled));
+}
+
+#[test]
+fn caller_retransmits_invite_and_acks_failure_with_original_branch() {
+    let scripted = scripted_socket();
+    let (a, _) = phone(Timers {
+        give_up: Duration::from_secs(5),
+        ..fast_timers()
+    });
+    a.send(UiCommand::Dial(scripted.local_addr().unwrap()));
+
+    let first = receive_request(&scripted, "INVITE");
+    let again = receive_request(&scripted, "INVITE");
+    assert_eq!(first, again, "INVITE must be retransmitted unchanged");
+
+    scripted
+        .send_to(&reply(&first, 486, "Busy Here"), a.local_address())
+        .unwrap();
+    let ack = receive_request(&scripted, "ACK");
+    assert_eq!(ack.headers.get("cseq"), Some("1 ACK"));
+    assert_eq!(ack.headers.get("via"), first.headers.get("via"));
+    wait_for(&a, Event::Ended(EndReason::Rejected(486)));
+
+    // The final response is repeated when the ACK was lost: ACK again.
+    scripted
+        .send_to(&reply(&first, 486, "Busy Here"), a.local_address())
+        .unwrap();
+    let ack_again = receive_request(&scripted, "ACK");
+    assert_eq!(ack_again, ack);
+}
+
+#[test]
+fn unanswered_invite_times_out() {
+    let silent = scripted_socket();
+    let (a, a_media) = phone(fast_timers());
+    a.send(UiCommand::Dial(silent.local_addr().unwrap()));
+    wait_for(&a, Event::Ended(EndReason::Timeout));
+    assert_eq!(a_media.started.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn called_side_follows_the_wire_protocol_for_a_scripted_caller() {
+    let scripted = scripted_socket();
+    let (b, b_media) = default_phone();
+    let target = b.local_address();
+
+    let invite = scripted_invite(&scripted, target, "scripted-call");
+    send(&scripted, &invite, target);
+    assert_eq!(status_of(&receive(&scripted).0), 100);
+    assert_eq!(status_of(&receive(&scripted).0), 180);
+    wait_for(
+        &b,
+        Event::Incoming {
+            peer: scripted.local_addr().unwrap(),
+        },
+    );
+
+    // A retransmitted INVITE gets the latest response again, not a new call.
+    send(&scripted, &invite, target);
+    assert_eq!(status_of(&receive(&scripted).0), 180);
+
+    // A different INVITE while busy is refused.
+    let other = scripted_invite(&scripted, target, "other-call");
+    send(&scripted, &other, target);
+    assert_eq!(status_of(&receive(&scripted).0), 486);
+
+    b.send(UiCommand::Answer);
+    let Message::Response(ok) = receive(&scripted).0 else {
+        panic!("expected 200 OK");
+    };
+    assert_eq!(ok.status_code, 200);
+    assert!(std::str::from_utf8(&ok.body).unwrap().contains("m=audio"));
+
+    let contact = ok.headers.get("contact").unwrap();
+    let mut dialog = EstablishedDialog::new(DialogConfig {
+        remote_target: contact
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+            .unwrap()
+            .to_owned(),
+        local_from: invite.headers.get("from").unwrap().to_owned(),
+        remote_to: ok.headers.get("to").unwrap().to_owned(),
+        call_id: "scripted-call".to_owned(),
+        local_sent_by: scripted.local_addr().unwrap().to_string(),
+        local_contact: format!("<sip:raw@{}>", scripted.local_addr().unwrap()),
         invite_cseq: 1,
-        invite_branch: "z9hG4bK-integration-invite".to_owned(),
-    })?)
-}
+        invite_branch: "z9hG4bK-scripted-call".to_owned(),
+    })
+    .unwrap();
+    send(
+        &scripted,
+        &dialog.build_success_ack("z9hG4bK-scripted-ack").unwrap(),
+        target,
+    );
+    wait_for(&b, Event::Established);
+    assert_eq!(b_media.running.load(Ordering::SeqCst), 1);
 
-fn start(link: &Link, engine: &mut CallEngine) -> TestResult<(Request, Request)> {
-    assert_eq!(
-        engine.handle(Input::Command(Command::Dial))?,
-        vec![Action::SendInvite]
-    );
-    let original = link.invite()?;
-    let received = as_request(link.to_callee(Message::Request(original.clone()))?)?;
-    assert_eq!(received, original);
-    Ok((original, received))
-}
+    let bye = dialog.build_bye("z9hG4bK-scripted-bye").unwrap();
+    send(&scripted, &bye, target);
+    let Message::Response(done) = receive(&scripted).0 else {
+        panic!("expected a response to BYE");
+    };
+    assert_eq!(done.status_code, 200);
+    assert_eq!(done.headers.get("cseq"), Some("2 BYE"));
+    wait_for(&b, Event::Ended(EndReason::Completed));
+    assert_eq!(b_media.running.load(Ordering::SeqCst), 0);
 
-#[test]
-fn udp_success_ack_and_bye_complete_both_engines() -> TestResult {
-    let link = Link::new()?;
-    let mut caller = CallEngine::new();
-    let mut callee = CallEngine::new();
-    let (original, incoming) = start(&link, &mut caller)?;
-    assert_eq!(
-        callee.handle(Input::IncomingInvite)?,
-        vec![Action::SendRinging]
-    );
-
-    let target = format!("sip:bob@{}", link.callee.local_addr()?);
-    let ringing =
-        as_response(link.to_caller(Message::Response(response(&incoming, 180, &target)?))?)?;
-    assert_response_matches(&original, &ringing)?;
-    assert!(
-        caller
-            .handle(Input::InviteResponse(ringing.status_code))?
-            .is_empty()
-    );
-
-    assert_eq!(
-        callee.handle(Input::Command(Command::Answer))?,
-        vec![Action::SendInviteSuccess]
-    );
-    let success =
-        as_response(link.to_caller(Message::Response(response(&incoming, 200, &target)?))?)?;
-    assert_response_matches(&original, &success)?;
-    assert_eq!(
-        caller.handle(Input::InviteResponse(success.status_code))?,
-        vec![
-            Action::SendSuccessAck,
-            Action::StartMedia,
-            Action::ReportEstablished,
-        ]
-    );
-
-    let mut dialog = dialog(&link, &original, &success)?;
-    let ack = as_request(link.to_callee(Message::Request(
-        dialog.build_success_ack("z9hG4bK-integration-success-ack")?,
-    ))?)?;
-    assert_eq!(required(&ack, "cseq")?, "1 ACK");
-    assert_ne!(required(&ack, "via")?, required(&original, "via")?);
-    assert_eq!(
-        callee.handle(Input::IncomingAck)?,
-        vec![Action::StartMedia, Action::ReportEstablished]
-    );
-
-    assert_eq!(
-        caller.handle(Input::Command(Command::Hangup))?,
-        vec![Action::SendBye, Action::StopMedia]
-    );
-    let outgoing_bye = dialog.build_bye("z9hG4bK-integration-bye")?;
-    let bye = as_request(link.to_callee(Message::Request(outgoing_bye.clone()))?)?;
-    assert_eq!(required(&bye, "cseq")?, "2 BYE");
-    assert_eq!(
-        callee.handle(Input::IncomingBye)?,
-        vec![
-            Action::SendByeSuccess,
-            Action::StopMedia,
-            Action::ReportEnded,
-        ]
-    );
-    let finished = as_response(link.to_caller(Message::Response(response(&bye, 200, &target)?))?)?;
-    assert_response_matches(&outgoing_bye, &finished)?;
-    assert_eq!(
-        caller.handle(Input::ByeResponse(finished.status_code))?,
-        vec![Action::ReportEnded]
-    );
-    dialog.finish_local_bye()?;
-    assert_eq!(caller.state(), State::Idle);
-    assert_eq!(callee.state(), State::Idle);
-    Ok(())
+    // A repeated BYE gets the same answer instead of an error.
+    send(&scripted, &bye, target);
+    assert_eq!(status_of(&receive(&scripted).0), 200);
 }
 
 #[test]
-fn udp_rejection_produces_failure_ack_with_original_branch() -> TestResult {
-    let link = Link::new()?;
-    let mut caller = CallEngine::new();
-    let mut callee = CallEngine::new();
-    let (original, incoming) = start(&link, &mut caller)?;
-    callee.handle(Input::IncomingInvite)?;
-    assert_eq!(
-        callee.handle(Input::Command(Command::Reject))?,
-        vec![Action::SendInviteFailure(486), Action::ReportEnded,]
+fn called_side_sends_bye_when_the_ack_never_arrives() {
+    let scripted = scripted_socket();
+    let (b, b_media) = phone(fast_timers());
+    let target = b.local_address();
+
+    send(
+        &scripted,
+        &scripted_invite(&scripted, target, "no-ack-call"),
+        target,
     );
-    let reply = as_response(link.to_caller(Message::Response(response(
-        &incoming,
-        486,
-        "sip:bob@local.test",
-    )?))?)?;
-    assert_response_matches(&original, &reply)?;
-    assert_eq!(
-        caller.handle(Input::InviteResponse(reply.status_code))?,
-        vec![Action::SendFailureAck, Action::ReportEnded,]
+    wait_for(
+        &b,
+        Event::Incoming {
+            peer: scripted.local_addr().unwrap(),
+        },
     );
-    let ack = as_request(link.to_callee(Message::Request(build_failure_ack(&original, &reply)?))?)?;
-    assert_eq!(required(&ack, "cseq")?, "1 ACK");
-    assert_eq!(required(&ack, "via")?, required(&original, "via")?);
-    assert_eq!(ack.headers.get("to"), reply.headers.get("to"));
-    assert_eq!(caller.state(), State::Idle);
-    assert_eq!(callee.state(), State::Idle);
-    // Failure ACK belongs to the retained INVITE transaction, not a new call.
-    assert_eq!(
-        caller.handle(Input::Command(Command::Dial))?,
-        vec![Action::SendInvite]
-    );
-    Ok(())
+    b.send(UiCommand::Answer);
+
+    let bye = receive_request(&scripted, "BYE");
+    scripted.send_to(&reply(&bye, 200, "OK"), target).unwrap();
+    wait_for(&b, Event::Ended(EndReason::Timeout));
+    assert_eq!(b_media.started.load(Ordering::SeqCst), 0);
 }
 
 #[test]
-fn udp_cancel_has_its_own_response_and_invite_failure_ack() -> TestResult {
-    let link = Link::new()?;
-    let mut caller = CallEngine::new();
-    let mut callee = CallEngine::new();
-    let (original, incoming) = start(&link, &mut caller)?;
-    callee.handle(Input::IncomingInvite)?;
-    let ringing = as_response(link.to_caller(Message::Response(response(
-        &incoming,
-        180,
-        "sip:bob@local.test",
-    )?))?)?;
-    assert_response_matches(&original, &ringing)?;
-    caller.handle(Input::InviteResponse(ringing.status_code))?;
-    assert_eq!(
-        caller.handle(Input::Command(Command::Hangup))?,
-        vec![Action::SendCancel]
-    );
-
-    let outgoing_cancel = build_cancel(&original)?;
-    let cancel = as_request(link.to_callee(Message::Request(outgoing_cancel.clone()))?)?;
-    assert_eq!(required(&cancel, "cseq")?, "1 CANCEL");
-    assert_eq!(required(&cancel, "via")?, required(&original, "via")?);
-    assert_eq!(
-        callee.handle(Input::IncomingCancel)?,
-        vec![
-            Action::SendCancelSuccess,
-            Action::SendInviteFailure(487),
-            Action::ReportEnded,
-        ]
-    );
-
-    let cancel_ok = as_response(link.to_caller(Message::Response(response(
-        &cancel,
-        200,
-        "sip:bob@local.test",
-    )?))?)?;
-    assert_response_matches(&outgoing_cancel, &cancel_ok)?;
-    // 200 to CANCEL does not finish the INVITE transaction.
-    assert_eq!(caller.state(), State::Outgoing);
-
-    let terminated = as_response(link.to_caller(Message::Response(response(
-        &incoming,
-        487,
-        "sip:bob@local.test",
-    )?))?)?;
-    assert_response_matches(&original, &terminated)?;
-    assert_eq!(
-        caller.handle(Input::InviteResponse(terminated.status_code))?,
-        vec![Action::SendFailureAck, Action::ReportEnded,]
-    );
-    let ack =
-        as_request(link.to_callee(Message::Request(build_failure_ack(&original, &terminated)?))?)?;
-    assert_eq!(required(&ack, "cseq")?, "1 ACK");
-    assert_eq!(caller.state(), State::Idle);
-    assert_eq!(callee.state(), State::Idle);
-    Ok(())
+fn dropping_the_handle_hangs_up_an_active_call() {
+    let (a, _) = default_phone();
+    let (b, _) = default_phone();
+    connect(&a, &b);
+    drop(a);
+    wait_for(&b, Event::Ended(EndReason::Completed));
 }
 
 #[test]
-fn udp_success_winning_cancel_race_is_acked_then_ended_with_bye() -> TestResult {
-    let link = Link::new()?;
-    let mut caller = CallEngine::new();
-    let mut callee = CallEngine::new();
-    let (original, incoming) = start(&link, &mut caller)?;
-    callee.handle(Input::IncomingInvite)?;
-    caller.handle(Input::InviteResponse(180))?;
-    assert_eq!(
-        caller.handle(Input::Command(Command::Hangup))?,
-        vec![Action::SendCancel]
-    );
-    let cancel = as_request(link.to_callee(Message::Request(build_cancel(&original)?))?)?;
+fn invalid_destination_reports_an_error_and_a_failed_call() {
+    let (a, _) = default_phone();
+    a.send(UiCommand::Dial("0.0.0.0:5060".parse().unwrap()));
+    assert!(matches!(
+        a.wait_event(WAIT),
+        Some(Event::Error(message)) if message.contains("invalid destination")
+    ));
+    assert_eq!(a.wait_event(WAIT), Some(Event::Ended(EndReason::Failed)));
 
-    callee.handle(Input::Command(Command::Answer))?;
-    assert_eq!(
-        callee.handle(Input::IncomingCancel)?,
-        vec![Action::SendCancelSuccess]
-    );
-    let target = format!("sip:bob@{}", link.callee.local_addr()?);
-    let cancel_ok =
-        as_response(link.to_caller(Message::Response(response(&cancel, 200, &target)?))?)?;
-    assert_response_matches(&cancel, &cancel_ok)?;
-    let success =
-        as_response(link.to_caller(Message::Response(response(&incoming, 200, &target)?))?)?;
-    assert_response_matches(&original, &success)?;
-    assert_eq!(
-        caller.handle(Input::InviteResponse(success.status_code))?,
-        vec![Action::SendSuccessAck, Action::SendBye,]
-    );
+    // The executor is still usable afterwards.
+    let (b, _) = default_phone();
+    connect(&a, &b);
+    a.send(UiCommand::Hangup);
+    wait_for(&a, Event::Ended(EndReason::Completed));
+}
 
-    let mut dialog = dialog(&link, &original, &success)?;
-    let ack = as_request(link.to_callee(Message::Request(
-        dialog.build_success_ack("z9hG4bK-race-ack")?,
-    ))?)?;
-    assert_eq!(required(&ack, "cseq")?, "1 ACK");
-    callee.handle(Input::IncomingAck)?;
-    let outgoing_bye = dialog.build_bye("z9hG4bK-race-bye")?;
-    let bye = as_request(link.to_callee(Message::Request(outgoing_bye.clone()))?)?;
-    callee.handle(Input::IncomingBye)?;
-    let finished = as_response(link.to_caller(Message::Response(response(&bye, 200, &target)?))?)?;
-    assert_response_matches(&outgoing_bye, &finished)?;
-    caller.handle(Input::ByeResponse(finished.status_code))?;
-    assert_eq!(caller.state(), State::Idle);
-    assert_eq!(callee.state(), State::Idle);
-    Ok(())
+#[test]
+fn media_counters_are_reported_when_audio_stops() {
+    let (a, _) = default_phone();
+    let (b, _) = default_phone();
+    connect(&a, &b);
+    a.send(UiCommand::Hangup);
+    wait_for(
+        &a,
+        Event::MediaStats {
+            sent: 0,
+            received: 0,
+        },
+    );
+    wait_for(&a, Event::Ended(EndReason::Completed));
 }

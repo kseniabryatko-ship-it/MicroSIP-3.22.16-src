@@ -2,6 +2,7 @@ pub mod audio;
 pub mod call_engine;
 pub mod call_media;
 pub mod call_runner;
+pub mod call_view;
 pub mod rtp;
 pub mod sip;
 pub mod transport;
