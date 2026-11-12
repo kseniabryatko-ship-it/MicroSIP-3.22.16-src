@@ -7,8 +7,13 @@
 //!
 //! Scope: UDP, one account, Digest MD5 as implemented by `sip::digest`. Each
 //! refresh is sent without credentials and answers the fresh challenge, so a
-//! nonce is never reused. No outbound proxy, no NAT handling (the Contact is
-//! the local socket address).
+//! nonce is never reused. No outbound proxy.
+//!
+//! NAT: every REGISTER asks for `rport` (RFC 3581). When the server's answer
+//! shows that it sees this phone at another address, the registration is
+//! repeated with that address as Contact, and [`Registration::keepalive_due`]
+//! tells the executor when to send a keep-alive so the router keeps the
+//! mapping open. No STUN: the address in SDP stays the local one.
 
 use crate::sip::digest::{DigestChallenge, authorization_header};
 use crate::sip::message::{Headers, RegisterRequest, Response};
@@ -22,6 +27,14 @@ pub const DEFAULT_EXPIRES: u32 = 300;
 
 /// Pause before a failed registration is tried again.
 pub const RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// Pause between keep-alive packets while registered. Home routers drop an
+/// idle UDP mapping after roughly 30 to 60 seconds.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The Contact follows the address the server reports at most this many
+/// times per registration, so two disagreeing answers cannot loop forever.
+const MAX_CONTACT_CHANGES: u8 = 3;
 
 /// A challenge is answered at most this many times per attempt; the second
 /// answer is only given to a `stale=true` challenge.
@@ -210,6 +223,10 @@ pub struct Registration {
     domain: String,
     server: SocketAddr,
     local: SocketAddr,
+    /// Address the server reaches this phone at; `local` unless behind NAT.
+    contact: SocketAddr,
+    contact_changes: u8,
+    next_keepalive: Option<Instant>,
     call_id: String,
     from_tag: String,
     seed: String,
@@ -250,6 +267,9 @@ impl Registration {
             domain,
             server,
             local,
+            contact: local,
+            contact_changes: 0,
+            next_keepalive: None,
             call_id: format!("reg-{seed}@{}", local.ip()),
             from_tag: format!("reg-{seed}"),
             seed: seed.to_owned(),
@@ -273,6 +293,32 @@ impl Registration {
 
     pub fn username(&self) -> &str {
         &self.username
+    }
+
+    /// Address to put into Contact headers: the local socket address, or the
+    /// public one the server reported when this phone is behind NAT.
+    pub fn contact_address(&self) -> SocketAddr {
+        self.contact
+    }
+
+    /// True when a keep-alive packet should be sent to the server now. The
+    /// next one is then due after [`KEEPALIVE_INTERVAL`].
+    pub fn keepalive_due(&mut self, now: Instant) -> bool {
+        if !self.bound || self.finished {
+            self.next_keepalive = None;
+            return false;
+        }
+        match self.next_keepalive {
+            Some(due) if now < due => false,
+            Some(_) => {
+                self.next_keepalive = Some(now + KEEPALIVE_INTERVAL);
+                true
+            }
+            None => {
+                self.next_keepalive = Some(now + KEEPALIVE_INTERVAL);
+                false
+            }
+        }
     }
 
     /// The SIP domain of the address of record.
@@ -417,6 +463,18 @@ impl Registration {
 
         match status {
             200..=299 => {
+                let seen = reported_address(&response.headers, self.local);
+                if let Some(seen) = seen.filter(|seen| *seen != self.contact)
+                    && self.contact_changes < MAX_CONTACT_CHANGES
+                {
+                    // Behind NAT: register the address the server really sees.
+                    // The binding made a moment ago simply expires.
+                    self.contact_changes += 1;
+                    self.contact = seen;
+                    self.bound = true;
+                    self.send(false, None, 0, transaction.interval_adjusted, &mut outputs);
+                    return Some(outputs);
+                }
                 let granted =
                     granted_expires(&response.headers, &self.contact_uri()).unwrap_or(self.expires);
                 if granted == 0 {
@@ -555,6 +613,7 @@ impl Registration {
                 .insert(name, value)
                 .map_err(|error| error.to_string())?;
         }
+        add_rport(&mut request.headers).map_err(|error| error.to_string())?;
         let bytes = request.serialize().map_err(|error| error.to_string())?;
         let headers =
             TransactionHeaders::from_message(&crate::sip::message::Message::Request(request))
@@ -567,7 +626,7 @@ impl Registration {
     }
 
     fn contact_uri(&self) -> String {
-        format!("sip:{}@{}", self.username, self.local)
+        format!("sip:{}@{}", self.username, self.contact)
     }
 
     fn authorization(&self, response: &Response) -> Result<(&'static str, String), String> {
@@ -594,6 +653,39 @@ impl Registration {
             outputs.push(Output::State(state));
         }
     }
+}
+
+/// Asks the server to answer to the source port of the request and to report
+/// it (RFC 3581). The Via must have no `rport` yet.
+pub fn add_rport(headers: &mut Headers) -> Result<(), crate::sip::message::SipMessageError> {
+    let Some(via) = headers.get("via").map(str::to_owned) else {
+        return Ok(());
+    };
+    headers.insert("via", format!("{via};rport"))
+}
+
+/// The address the server saw the request come from, taken from the
+/// `received` and `rport` parameters of the top Via of its response.
+fn reported_address(headers: &Headers, local: SocketAddr) -> Option<SocketAddr> {
+    let via = headers.get("via")?;
+    let parameter = |name: &str| {
+        via.split(';')
+            .skip(1)
+            .filter_map(|part| part.split_once('='))
+            .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim().trim_matches(|c| c == '[' || c == ']'))
+    };
+    let port = parameter("rport")?
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)?;
+    // A server on the same network may leave `received` out.
+    let ip = match parameter("received") {
+        Some(received) => received.parse().ok()?,
+        None => local.ip(),
+    };
+    let address = SocketAddr::new(ip, port);
+    (address.is_ipv4() == local.is_ipv4() && !ip.is_unspecified()).then_some(address)
 }
 
 fn challenge_headers(status: u16) -> (&'static str, &'static str) {
@@ -1121,6 +1213,182 @@ mod tests {
         let outputs = registration.on_timeout(now);
         assert_eq!(states(&outputs), [RegistrationState::Unregistered]);
         assert!(registration.is_finished());
+    }
+
+    /// A response whose top Via carries what a server behind our NAT saw.
+    fn reply_seen_at(request: &Request, seen: &str, extra: &[(&str, &str)]) -> Response {
+        let (ip, port) = seen.rsplit_once(':').unwrap();
+        let mut response = reply(request, 200, extra);
+        let via = request
+            .headers
+            .get("via")
+            .unwrap()
+            .replace(";rport", &format!(";rport={port};received={ip}"));
+        response.headers.insert("via", via).unwrap();
+        response
+    }
+
+    #[test]
+    fn register_asks_for_rport() {
+        let mut registration = registration();
+        let request = sent(&registration.start());
+        assert!(request.headers.get("via").unwrap().ends_with(";rport"));
+    }
+
+    #[test]
+    fn address_seen_by_the_server_becomes_the_contact() {
+        let mut registration = registration();
+        let now = Instant::now();
+        let first = sent(&registration.start());
+        assert_eq!(
+            registration.contact_address(),
+            "192.0.2.20:5070".parse().unwrap()
+        );
+
+        // The server saw another address: register that one, report nothing yet.
+        let outputs = feed(
+            &mut registration,
+            reply_seen_at(&first, "203.0.113.7:40000", &[("expires", "120")]),
+            now,
+        )
+        .unwrap();
+        assert!(states(&outputs).is_empty());
+        let second = sent(&outputs);
+        assert_eq!(second.headers.get("cseq"), Some("2 REGISTER"));
+        assert_eq!(second.headers.get("call-id"), first.headers.get("call-id"));
+        assert_eq!(
+            second.headers.get("contact"),
+            Some("<sip:alice@203.0.113.7:40000>")
+        );
+        // The Via still names the real local socket.
+        assert!(
+            second
+                .headers
+                .get("via")
+                .unwrap()
+                .contains("192.0.2.20:5070")
+        );
+        assert_eq!(
+            registration.contact_address(),
+            "203.0.113.7:40000".parse().unwrap()
+        );
+
+        // Same address again: now the registration is complete.
+        let outputs = feed(
+            &mut registration,
+            reply_seen_at(
+                &second,
+                "203.0.113.7:40000",
+                &[("contact", "<sip:alice@203.0.113.7:40000>;expires=60")],
+            ),
+            now,
+        )
+        .unwrap();
+        assert!(!has_send(&outputs));
+        assert_eq!(
+            states(&outputs),
+            [RegistrationState::Registered { expires: 60 }]
+        );
+    }
+
+    #[test]
+    fn matching_or_missing_server_view_keeps_the_local_contact() {
+        let now = Instant::now();
+
+        let mut registration = registration();
+        let first = sent(&registration.start());
+        let outputs = feed(
+            &mut registration,
+            reply_seen_at(&first, "192.0.2.20:5070", &[]),
+            now,
+        )
+        .unwrap();
+        assert!(!has_send(&outputs));
+        assert_eq!(
+            states(&outputs),
+            [RegistrationState::Registered { expires: 120 }]
+        );
+
+        // `rport` echoed without a value tells nothing.
+        let mut registration = self::registration();
+        let first = sent(&registration.start());
+        let outputs = feed(&mut registration, reply(&first, 200, &[]), now).unwrap();
+        assert!(!has_send(&outputs));
+        assert_eq!(
+            registration.contact_address(),
+            "192.0.2.20:5070".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn rport_without_received_keeps_the_local_ip() {
+        let mut registration = registration();
+        let first = sent(&registration.start());
+        let mut response = reply(&first, 200, &[]);
+        let via = first
+            .headers
+            .get("via")
+            .unwrap()
+            .replace(";rport", ";rport=6000");
+        response.headers.insert("via", via).unwrap();
+        let outputs = feed(&mut registration, response, Instant::now()).unwrap();
+        assert_eq!(
+            sent(&outputs).headers.get("contact"),
+            Some("<sip:alice@192.0.2.20:6000>")
+        );
+    }
+
+    #[test]
+    fn contact_stops_following_a_server_that_keeps_changing_its_mind() {
+        let mut registration = registration();
+        let now = Instant::now();
+        let mut request = sent(&registration.start());
+        for port in [40001, 40002, 40003] {
+            let outputs = feed(
+                &mut registration,
+                reply_seen_at(&request, &format!("203.0.113.7:{port}"), &[]),
+                now,
+            )
+            .unwrap();
+            request = sent(&outputs);
+        }
+        // The fourth different answer is accepted as it is.
+        let outputs = feed(
+            &mut registration,
+            reply_seen_at(&request, "203.0.113.7:40004", &[]),
+            now,
+        )
+        .unwrap();
+        assert!(!has_send(&outputs));
+        assert_eq!(
+            states(&outputs),
+            [RegistrationState::Registered { expires: 120 }]
+        );
+        assert_eq!(
+            registration.contact_address(),
+            "203.0.113.7:40003".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn keepalive_is_due_every_interval_only_while_registered() {
+        let mut registration = registration();
+        let now = Instant::now();
+        registration.start();
+        assert!(!registration.keepalive_due(now + KEEPALIVE_INTERVAL * 5));
+
+        let mut registration = self::registration();
+        register(&mut registration, now);
+        // The first call after registering only starts the clock.
+        assert!(!registration.keepalive_due(now));
+        assert!(!registration.keepalive_due(now + KEEPALIVE_INTERVAL - Duration::from_millis(1)));
+        assert!(registration.keepalive_due(now + KEEPALIVE_INTERVAL));
+        assert!(!registration.keepalive_due(now + KEEPALIVE_INTERVAL));
+        assert!(registration.keepalive_due(now + KEEPALIVE_INTERVAL * 2));
+
+        registration.unregister();
+        registration.on_timeout(now);
+        assert!(!registration.keepalive_due(now + KEEPALIVE_INTERVAL * 10));
     }
 
     #[test]

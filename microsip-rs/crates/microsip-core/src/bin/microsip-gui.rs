@@ -301,7 +301,7 @@ impl eframe::App for PhoneWindow {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("MicroSIP Rust — direct-call preview");
-            ui.label("UDP / PCMU. Direct calls and calls through a SIP server; no NAT or encryption yet.");
+            ui.label("UDP / PCMU. Direct calls and calls through a SIP server; basic NAT, no encryption yet.");
             ui.separator();
 
             ui.add_enabled_ui(!running, |ui| {

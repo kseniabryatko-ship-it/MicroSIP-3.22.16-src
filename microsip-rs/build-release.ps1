@@ -202,14 +202,17 @@ Registration on a SIP server (Register button) and calls through it are
 new: they were tested only against a scripted test server, not against
 a real provider or PBX. Once registered, type a number into Remote and
 click Call; IP:port in Remote still dials directly.
-The phone must be reachable from the server: no NAT traversal.
+Behind a home router the phone registers the public address the server
+reports and sends keep-alives, but it uses no STUN: audio works only if
+the server sends it back to where the phone's audio comes from.
 
 SETTINGS
 --------
 The address and account fields are remembered in
 %APPDATA%\MicroSIP-Rust\settings.ini. The password is never saved;
 type it again after each start.
-No guarantee of NAT traversal or interoperability with third-party phones.
+NAT handling is basic and untested on a real network; no guarantee of
+interoperability with third-party phones or servers.
 No TLS/SRTP, RTCP, jitter buffer, call hold or transfer.
 No installer, code signature or automatic updates.
 A successful build does not prove audio quality or a working real call.

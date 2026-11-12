@@ -470,3 +470,51 @@ fn call_from_the_server_is_offered_with_the_account_contact() {
     );
     assert!(handle.send(UiCommand::Reject));
 }
+
+#[test]
+fn address_reported_by_the_server_is_registered_as_contact() {
+    let registrar = Registrar::new();
+    let handle = phone(Timers::default());
+    assert!(handle.send(UiCommand::Register(registrar.account(PASSWORD))));
+
+    // Answers 200 with a top Via that says where the request came from.
+    let accept_as_seen_at = |request: &Request, peer: SocketAddr, seen: &str| {
+        let (ip, port) = seen.rsplit_once(':').unwrap();
+        let via = request.headers.get("via").unwrap();
+        assert!(via.ends_with(";rport"), "no rport in {via}");
+        let via = via.replace(";rport", &format!(";rport={port};received={ip}"));
+        let mut builder = ResponseBuilder::new(200, "OK").header("via", via).unwrap();
+        for name in ["from", "to", "call-id", "cseq"] {
+            builder = builder
+                .header(name, request.headers.get(name).unwrap())
+                .unwrap();
+        }
+        let response = builder.header("expires", "120").unwrap().build().unwrap();
+        let bytes = Message::Response(response).serialize().unwrap();
+        registrar.socket.send_to(&bytes, peer).unwrap();
+    };
+
+    let (first, peer) = registrar.next_register(None);
+    let local = handle.local_address();
+    assert_eq!(
+        first.headers.get("contact"),
+        Some(format!("<sip:alice@{local}>").as_str())
+    );
+    accept_as_seen_at(&first, peer, "127.0.0.9:45000");
+
+    // The phone registers again with the address the server saw.
+    let (second, peer) = registrar.next_register(Some(&first));
+    assert_eq!(
+        second.headers.get("contact"),
+        Some("<sip:alice@127.0.0.9:45000>")
+    );
+    assert_eq!(second.headers.get("call-id"), first.headers.get("call-id"));
+    accept_as_seen_at(&second, peer, "127.0.0.9:45000");
+
+    assert_eq!(wait_registration(&handle), RegistrationState::Registering);
+    assert_eq!(
+        wait_registration(&handle),
+        RegistrationState::Registered { expires: 120 }
+    );
+    assert_eq!(registrar.count_for(Duration::from_millis(200)), 0);
+}

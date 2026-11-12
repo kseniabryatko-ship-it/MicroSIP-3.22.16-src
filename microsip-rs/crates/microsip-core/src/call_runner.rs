@@ -9,7 +9,12 @@
 //! the same socket; the REGISTER logic lives in `registration`. While it is
 //! registered, a number can be called through that server: the INVITE answers
 //! one 401/407 challenge, and the Record-Route set of a loose-routing proxy is
-//! used for ACK and BYE (every request still goes to the first hop). Retransmission timers follow
+//! used for ACK and BYE (every request still goes to the first hop).
+//!
+//! NAT: requests ask for `rport`, the Contact follows the public address the
+//! registrar reported, and a keep-alive goes to the registrar while the
+//! account is registered. The SDP still carries the local address, so audio
+//! behind NAT depends on the server answering to where our RTP comes from. Retransmission timers follow
 //! the RFC 3261 doubling scheme with fixed constants; the older `transaction`
 //! module is not used here.
 
@@ -17,7 +22,7 @@ use crate::call_engine::{Action, CallEngine, Command, Input, State};
 use crate::call_media::Media;
 use crate::dialog::{DialogConfig, EstablishedDialog};
 use crate::invite_control::{build_cancel, build_failure_ack};
-use crate::registration::{Account, Output, Registration, RegistrationState};
+use crate::registration::{Account, Output, Registration, RegistrationState, add_rport};
 use crate::sip::message::{Headers, InviteRequest, Message, Request, Response, ResponseBuilder};
 use crate::sip::sdp::{MediaKind, Sdp};
 use crate::transaction_headers::TransactionHeaders;
@@ -35,6 +40,8 @@ type Result<T> = std::result::Result<T, BoxError>;
 
 const TICK: Duration = Duration::from_millis(10);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// Double CRLF, the keep-alive of RFC 5626; SIP servers ignore or echo it.
+const KEEPALIVE: &[u8] = b"\r\n\r\n";
 
 /// Commands from the user interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -475,12 +482,16 @@ impl<M: Media> Runner<M> {
     }
 
     fn contact(&self) -> String {
-        // While registered, calls use the account's user name.
-        let user = self
-            .registration
-            .as_ref()
-            .map_or(self.user.as_str(), Registration::username);
-        format!("<sip:{user}@{}>", self.local)
+        // While registered, calls use the account's user name and the
+        // address the server reaches this phone at.
+        match self.registration.as_ref() {
+            Some(registration) => format!(
+                "<sip:{}@{}>",
+                registration.username(),
+                registration.contact_address()
+            ),
+            None => format!("<sip:{}@{}>", self.user, self.local),
+        }
     }
 
     // ----- registration ----------------------------------------------------
@@ -786,6 +797,7 @@ impl<M: Media> Runner<M> {
             invite_branch: call.invite_headers.branch.clone(),
         })?;
         let mut ack = dialog.build_success_ack(&branch)?;
+        add_rport(&mut ack.headers)?;
         add_routes(&mut ack, &call.route_set)?;
         let bytes = ack.serialize()?;
         call.dialog = Some(dialog);
@@ -820,6 +832,7 @@ impl<M: Media> Runner<M> {
         }
         let dialog = call.dialog.as_mut().ok_or("no dialog")?;
         let mut request = dialog.build_bye(&branch)?;
+        add_rport(&mut request.headers)?;
         add_routes(&mut request, &call.route_set)?;
         let headers = TransactionHeaders::from_message(&Message::Request(request.clone()))?;
         let bytes = request.serialize()?;
@@ -892,6 +905,10 @@ impl<M: Media> Runner<M> {
         self.retained.retain(|entry| now < entry.expires);
 
         if let Some(registration) = self.registration.as_mut() {
+            if registration.keepalive_due(now) {
+                // Keeps the router's mapping open; a lost one does not matter.
+                let _ = self.socket.send_to(KEEPALIVE, registration.server());
+            }
             let outputs = registration.poll(now);
             self.apply_registration(outputs);
         }
@@ -1300,7 +1317,11 @@ impl<M: Media> Runner<M> {
         let target = server_target(text, registration.domain())?;
         let peer = registration.server();
         let from_uri = format!("sip:{}@{}", registration.username(), registration.domain());
-        let contact_uri = format!("sip:{}@{}", registration.username(), self.local);
+        let contact_uri = format!(
+            "sip:{}@{}",
+            registration.username(),
+            registration.contact_address()
+        );
         self.start_call(peer, target, from_uri, contact_uri, true)
     }
 
@@ -1320,7 +1341,7 @@ impl<M: Media> Runner<M> {
         let call_id = format!("{}@{}", self.unique(), local.ip());
         let branch = self.branch();
         let from_tag = self.unique();
-        let invite = InviteRequest::new(
+        let mut invite = InviteRequest::new(
             target.clone(),
             from_uri.clone(),
             target.clone(),
@@ -1332,6 +1353,7 @@ impl<M: Media> Runner<M> {
         )
         .body(make_sdp(local_rtp).into_bytes())
         .build()?;
+        add_rport(&mut invite.headers)?;
 
         let local_tag = format!("rs-{}", self.unique());
         let mut call = Call::new(peer, invite, local_rtp, local_tag)?;
@@ -1390,6 +1412,7 @@ impl<M: Media> Runner<M> {
         .body(make_sdp(call.local_rtp).into_bytes())
         .build()?;
         invite.headers.insert(name, value)?;
+        add_rport(&mut invite.headers)?;
         let invite_headers = TransactionHeaders::from_message(&Message::Request(invite.clone()))?;
 
         self.send(&ack, peer)?;
