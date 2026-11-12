@@ -9,9 +9,13 @@
 
 use std::collections::BTreeMap;
 
-/// Packets held back while waiting for a missing one. Each is 20 ms, so a
-/// late packet gets about 40 ms to arrive before it is declared lost.
-const MAX_HELD: usize = 2;
+/// Packets held back while waiting for a missing one. With one, a packet
+/// that is overtaken by its successor is still put back in place, and a
+/// lost packet stalls the audio for a single packet time. Waiting for two
+/// (as this first did) stalled it for 80 ms with the 40 ms packets some
+/// servers send, which on a lossy link emptied the playback reserve at
+/// every loss; measured on a real call as "gaps".
+const MAX_HELD: usize = 1;
 
 /// A jump this far ahead is a new stream (for example after a transfer),
 /// not a gap to wait for.
@@ -186,12 +190,22 @@ mod tests {
     }
 
     #[test]
-    fn packet_two_places_late_is_still_put_back() {
+    fn packet_overtaken_by_two_others_is_given_up() {
+        // The wait is one packet: when 4 arrives and 2 is still missing,
+        // play goes on without it, and 2 is dropped when it finally comes.
         let mut orderer = PacketOrderer::default();
         assert_eq!(
             run(&mut orderer, &[1, 3, 4, 2, 5]),
-            packets(&[1, 2, 3, 4, 5])
+            vec![Some(1), None, Some(3), Some(4), Some(5)]
         );
+        assert_eq!(orderer.stats().lost, 1);
+        assert_eq!(orderer.stats().discarded, 1);
+    }
+
+    #[test]
+    fn packet_overtaken_by_one_other_counts_as_reordered() {
+        let mut orderer = PacketOrderer::default();
+        assert_eq!(run(&mut orderer, &[1, 3, 2, 4]), packets(&[1, 2, 3, 4]));
         assert_eq!(orderer.stats().lost, 0);
         assert_eq!(orderer.stats().reordered, 1);
     }
@@ -200,12 +214,10 @@ mod tests {
     fn missing_packet_is_reported_lost_after_a_short_wait() {
         let mut orderer = PacketOrderer::default();
         assert_eq!(run(&mut orderer, &[1]), packets(&[1]));
-        // 2 never comes. Two later packets wait for it, the third gives up.
-        assert_eq!(run(&mut orderer, &[3, 4]), packets(&[]));
-        assert_eq!(
-            run(&mut orderer, &[5]),
-            vec![None, Some(3), Some(4), Some(5)]
-        );
+        // 2 never comes. The next packet waits for it, the one after gives up.
+        assert_eq!(run(&mut orderer, &[3]), packets(&[]));
+        assert_eq!(run(&mut orderer, &[4]), vec![None, Some(3), Some(4)]);
+        assert_eq!(run(&mut orderer, &[5]), packets(&[5]));
         assert_eq!(orderer.stats().lost, 1);
 
         // If 2 turns up now it is too late and must not be played.

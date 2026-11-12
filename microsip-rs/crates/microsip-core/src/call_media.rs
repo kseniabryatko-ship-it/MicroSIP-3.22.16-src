@@ -1,15 +1,15 @@
 //! Media side of a call, kept behind a trait so the SIP executor can be tested
 //! without sound devices.
 
-use crate::audio::{Microphone, Speaker};
+use crate::audio::{MAX_VOLUME_PERCENT, Microphone, Speaker, volume_factor};
 use crate::gain::AutoGain;
 use crate::rtp::PCMU_CLOCK_RATE;
 use crate::rtp::session::{RtpSession, RtpSessionConfig};
 use crate::tones::{TONE_RATE, Tone, ToneGenerator};
 use std::error::Error;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -138,6 +138,84 @@ impl Media for NullMedia {
     }
 }
 
+/// Sound settings shared between the interface and the phone's audio.
+/// Volumes act at once, also during a call; a newly chosen device is used
+/// from the next call (and the next ringing) on.
+#[derive(Clone)]
+pub struct AudioControls {
+    inner: Arc<ControlsInner>,
+}
+
+struct ControlsInner {
+    speaker_percent: Arc<AtomicU32>,
+    microphone_percent: AtomicU32,
+    input_device: Mutex<Option<String>>,
+    output_device: Mutex<Option<String>>,
+}
+
+impl Default for AudioControls {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(ControlsInner {
+                speaker_percent: Arc::new(AtomicU32::new(100)),
+                microphone_percent: AtomicU32::new(100),
+                input_device: Mutex::new(None),
+                output_device: Mutex::new(None),
+            }),
+        }
+    }
+}
+
+impl AudioControls {
+    /// Speaker volume in percent, 0 to [`MAX_VOLUME_PERCENT`]; 100 is unchanged.
+    pub fn set_speaker_volume(&self, percent: u32) {
+        self.inner
+            .speaker_percent
+            .store(percent.min(MAX_VOLUME_PERCENT), Ordering::Relaxed);
+    }
+
+    pub fn speaker_volume(&self) -> u32 {
+        self.inner.speaker_percent.load(Ordering::Relaxed)
+    }
+
+    /// Microphone volume in percent, applied after the automatic gain.
+    pub fn set_microphone_volume(&self, percent: u32) {
+        self.inner
+            .microphone_percent
+            .store(percent.min(MAX_VOLUME_PERCENT), Ordering::Relaxed);
+    }
+
+    pub fn microphone_volume(&self) -> u32 {
+        self.inner.microphone_percent.load(Ordering::Relaxed)
+    }
+
+    /// Microphone to use; `None` or an empty name is the system default.
+    pub fn set_input_device(&self, name: Option<String>) {
+        if let Ok(mut device) = self.inner.input_device.lock() {
+            *device = name.filter(|name| !name.is_empty());
+        }
+    }
+
+    pub fn input_device(&self) -> Option<String> {
+        self.inner.input_device.lock().ok()?.clone()
+    }
+
+    /// Speaker or headphones to use; `None` or an empty name is the default.
+    pub fn set_output_device(&self, name: Option<String>) {
+        if let Ok(mut device) = self.inner.output_device.lock() {
+            *device = name.filter(|name| !name.is_empty());
+        }
+    }
+
+    pub fn output_device(&self) -> Option<String> {
+        self.inner.output_device.lock().ok()?.clone()
+    }
+
+    fn speaker_volume_handle(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.inner.speaker_percent)
+    }
+}
+
 /// Microphone and speaker over a PCMU RTP session.
 #[derive(Default)]
 pub struct AudioMedia {
@@ -148,6 +226,10 @@ pub struct AudioMedia {
     ringer: Option<Ringer>,
     muted: bool,
     held: bool,
+    controls: AudioControls,
+    /// Playback reserve the last call ended with; the next call on the
+    /// same connection starts from it instead of learning it again.
+    reserve_ms: u32,
 }
 
 /// A speaker playing a call-progress tone until it is dropped.
@@ -160,8 +242,12 @@ struct Ringer {
 }
 
 impl Ringer {
-    fn start(tone: Tone) -> Result<Self, MediaError> {
-        let speaker = Speaker::start()?;
+    fn start(tone: Tone, controls: &AudioControls) -> Result<Self, MediaError> {
+        let speaker = Speaker::start_on(
+            controls.output_device().as_deref(),
+            controls.speaker_volume_handle(),
+            0,
+        )?;
         let mut sink = speaker.sink();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
@@ -216,6 +302,14 @@ impl AudioMedia {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Audio that follows the given settings (devices and volumes).
+    pub fn with_controls(controls: AudioControls) -> Self {
+        Self {
+            controls,
+            ..Self::default()
+        }
+    }
 }
 
 impl Media for AudioMedia {
@@ -240,8 +334,13 @@ impl Media for AudioMedia {
         // thread feeds the speaker and the sound card thread feeds the
         // sender, each the moment a block is ready. Waiting for the loop
         // added up to a packet's worth of uneven delay in both directions.
-        let format = Microphone::input_format()?;
-        let speaker = Speaker::start()?;
+        let input = self.controls.input_device();
+        let format = Microphone::input_format_of(input.as_deref())?;
+        let speaker = Speaker::start_on(
+            self.controls.output_device().as_deref(),
+            self.controls.speaker_volume_handle(),
+            self.reserve_ms,
+        )?;
         let mut to_speaker = speaker.sink();
         let config = RtpSessionConfig::new(remote, format.sample_rate)
             .with_dtmf_payload_type(self.dtmf_payload_type);
@@ -260,7 +359,8 @@ impl Media for AudioMedia {
         let mic_level = Arc::new(MicLevel::default());
         let level = Arc::clone(&mic_level);
         let mut gain = AutoGain::new(format.sample_rate);
-        let microphone = Microphone::start_with(move |mut samples| {
+        let controls = self.controls.clone();
+        let microphone = Microphone::start_on(input.as_deref(), move |mut samples| {
             let peak = samples
                 .iter()
                 .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
@@ -271,6 +371,12 @@ impl Media for AudioMedia {
             level
                 .gain_percent
                 .store((gain.gain() * 100.0).round() as u32, Ordering::Relaxed);
+            let volume = volume_factor(controls.microphone_volume());
+            if volume != 1.0 {
+                for sample in &mut samples {
+                    *sample = (*sample * volume).clamp(-1.0, 1.0);
+                }
+            }
             // Never wait on the sound card thread; a full queue drops a block.
             let _ = to_network.try_send(samples);
         })?;
@@ -310,7 +416,7 @@ impl Media for AudioMedia {
                     .is_some_and(|ringer| ringer.tone == tone) => {}
             Some(tone) if self.active.is_none() => {
                 self.ringer = None;
-                self.ringer = Some(Ringer::start(tone)?);
+                self.ringer = Some(Ringer::start(tone, &self.controls)?);
             }
             // During a conversation nothing rings over it.
             Some(_) => {}
@@ -370,11 +476,72 @@ impl Media for AudioMedia {
                 mut session,
                 ..
             } = active;
+            self.reserve_ms = speaker.reserve_ms();
             // The microphone first: its callback feeds the session.
             drop(microphone);
             // Errors while tearing down a finished call have nobody to act on them.
             let _ = session.shutdown();
             drop(speaker);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controls_start_neutral_and_are_shared_between_copies() {
+        let controls = AudioControls::default();
+        assert_eq!(controls.speaker_volume(), 100);
+        assert_eq!(controls.microphone_volume(), 100);
+        assert_eq!(controls.input_device(), None);
+        assert_eq!(controls.output_device(), None);
+
+        // The interface keeps one copy, the audio another.
+        let other = controls.clone();
+        controls.set_speaker_volume(40);
+        controls.set_microphone_volume(150);
+        controls.set_input_device(Some("Headset".to_owned()));
+        controls.set_output_device(Some("Speakers".to_owned()));
+        assert_eq!(other.speaker_volume(), 40);
+        assert_eq!(other.microphone_volume(), 150);
+        assert_eq!(other.input_device().as_deref(), Some("Headset"));
+        assert_eq!(other.output_device().as_deref(), Some("Speakers"));
+        // The running speaker reads the very same number.
+        assert_eq!(other.speaker_volume_handle().load(Ordering::Relaxed), 40);
+    }
+
+    #[test]
+    fn volumes_are_limited_and_an_empty_name_means_the_default_device() {
+        let controls = AudioControls::default();
+        controls.set_speaker_volume(10_000);
+        controls.set_microphone_volume(201);
+        assert_eq!(controls.speaker_volume(), MAX_VOLUME_PERCENT);
+        assert_eq!(controls.microphone_volume(), MAX_VOLUME_PERCENT);
+
+        controls.set_input_device(Some("Headset".to_owned()));
+        controls.set_input_device(Some(String::new()));
+        assert_eq!(controls.input_device(), None);
+        controls.set_output_device(None);
+        assert_eq!(controls.output_device(), None);
+    }
+
+    #[test]
+    fn quality_report_reads_as_one_line() {
+        let quality = MediaQuality {
+            gaps: 2,
+            lost: 5,
+            reordered: 1,
+            discarded: 0,
+            reserve_ms: 160,
+            mic_peak_percent: 12,
+            mic_gain_percent: 420,
+        };
+        assert_eq!(
+            quality.to_string(),
+            "gaps 2, lost packets 5, reordered 1, discarded 0, reserve 160 ms, \
+             microphone peak 12%, gain x4.2"
+        );
     }
 }

@@ -1,7 +1,8 @@
 #![windows_subsystem = "windows"]
 
 use eframe::egui;
-use microsip_core::call_media::AudioMedia;
+use microsip_core::audio::{input_device_names, output_device_names};
+use microsip_core::call_media::{AudioControls, AudioMedia};
 use microsip_core::call_runner::{CallHandle, Event, UiCommand, spawn};
 use microsip_core::call_view::{CallView, Phase};
 use microsip_core::registration::{Account, RegistrationState};
@@ -25,6 +26,14 @@ struct PhoneWindow {
     auth_user: String,
     password: String,
     show_password: bool,
+    /// Device names as saved; empty means the system default.
+    microphone: String,
+    speaker: String,
+    speaker_volume: u32,
+    microphone_volume: u32,
+    microphones: Vec<String>,
+    speakers: Vec<String>,
+    controls: AudioControls,
     muted: bool,
     domain: String,
     registration: Option<RegistrationState>,
@@ -86,6 +95,13 @@ impl PhoneWindow {
             auth_user: saved.auth_user.clone(),
             password: String::new(),
             show_password: false,
+            microphone: saved.microphone.clone(),
+            speaker: saved.speaker.clone(),
+            speaker_volume: saved.speaker_volume,
+            microphone_volume: saved.microphone_volume,
+            microphones: input_device_names(),
+            speakers: output_device_names(),
+            controls: AudioControls::default(),
             muted: false,
             domain: saved.domain.clone(),
             registration: None,
@@ -101,7 +117,18 @@ impl PhoneWindow {
         for note in notes {
             window.log(note);
         }
+        window.apply_audio_settings();
         window
+    }
+
+    /// Hands the chosen devices and volumes to the phone's audio. Volumes
+    /// act at once; a device is used from the next call on.
+    fn apply_audio_settings(&mut self) {
+        self.controls.set_speaker_volume(self.speaker_volume);
+        self.controls.set_microphone_volume(self.microphone_volume);
+        self.controls
+            .set_input_device(Some(self.microphone.clone()));
+        self.controls.set_output_device(Some(self.speaker.clone()));
     }
 
     /// Remembers the address and account fields; the password is left out.
@@ -113,6 +140,10 @@ impl PhoneWindow {
             domain: self.domain.trim().to_owned(),
             user: self.user.trim().to_owned(),
             auth_user: self.auth_user.trim().to_owned(),
+            microphone: self.microphone.clone(),
+            speaker: self.speaker.clone(),
+            speaker_volume: self.speaker_volume,
+            microphone_volume: self.microphone_volume,
         };
         if current == self.saved {
             return;
@@ -155,7 +186,8 @@ impl PhoneWindow {
             return Err("The phone is already running".to_owned());
         }
         let local = Self::address(&self.local)?;
-        let handle = spawn(local, "phone", AudioMedia::new)
+        let controls = self.controls.clone();
+        let handle = spawn(local, "phone", move || AudioMedia::with_controls(controls))
             .map_err(|error| format!("Cannot listen on {local}: {error}"))?;
         self.log(format!("Phone listening on {}", handle.local_address()));
         handle.send(UiCommand::Trace(self.trace_file.is_some()));
@@ -419,6 +451,24 @@ impl PhoneWindow {
     }
 }
 
+/// A drop-down list of devices; an empty choice is the system default.
+fn device_picker(ui: &mut egui::Ui, label: &str, chosen: &mut String, names: &[String]) {
+    let shown = if chosen.is_empty() {
+        "System default".to_owned()
+    } else {
+        chosen.clone()
+    };
+    egui::ComboBox::from_label(label)
+        .selected_text(shown)
+        .width(260.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(chosen, String::new(), "System default");
+            for name in names {
+                ui.selectable_value(chosen, name.clone(), name);
+            }
+        });
+}
+
 impl Drop for PhoneWindow {
     fn drop(&mut self) {
         // Closing the window keeps whatever was typed last.
@@ -568,6 +618,34 @@ impl eframe::App for PhoneWindow {
                 }
                 if view.is_remote_held() {
                     ui.colored_label(egui::Color32::YELLOW, "Held by the other side");
+                }
+            });
+
+            // Sound devices and volumes.
+            ui.horizontal(|ui| {
+                let before = (self.microphone.clone(), self.speaker.clone());
+                device_picker(ui, "Microphone", &mut self.microphone, &self.microphones);
+                device_picker(ui, "Speaker", &mut self.speaker, &self.speakers);
+                if ui.button("Refresh devices").clicked() {
+                    self.microphones = input_device_names();
+                    self.speakers = output_device_names();
+                }
+                if before != (self.microphone.clone(), self.speaker.clone()) {
+                    self.apply_audio_settings();
+                    self.save_settings();
+                    if self.view.phase() != Phase::Idle {
+                        self.log("The new sound device is used from the next call on.");
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                let before = (self.speaker_volume, self.microphone_volume);
+                ui.label("Speaker volume");
+                ui.add(egui::Slider::new(&mut self.speaker_volume, 0..=200).suffix("%"));
+                ui.label("Microphone volume");
+                ui.add(egui::Slider::new(&mut self.microphone_volume, 0..=200).suffix("%"));
+                if before != (self.speaker_volume, self.microphone_volume) {
+                    self.apply_audio_settings();
                 }
             });
 

@@ -84,6 +84,14 @@ impl PlayoutBuffer {
         }
     }
 
+    /// An adaptive buffer that starts with a larger reserve, for example the
+    /// one the previous call on the same connection ended with.
+    pub fn adaptive_from(sample_rate: u32, start_ms: u32) -> Self {
+        let mut buffer = Self::adaptive(sample_rate);
+        buffer.set_target(start_ms.clamp(TARGET_MS, ADAPTIVE_LIMIT_MS));
+        buffer
+    }
+
     /// The reserve currently collected before playback starts.
     pub fn target_ms(&self) -> u32 {
         self.target_ms
@@ -385,6 +393,25 @@ mod tests {
 
         assert_eq!(buffer.underruns(), 2);
         assert_eq!(buffer.largest_target_ms(), 160);
+    }
+
+    #[test]
+    fn adaptive_buffer_can_start_from_a_remembered_reserve() {
+        let mut buffer = PlayoutBuffer::adaptive_from(RATE, 160);
+        assert_eq!(buffer.target_ms(), 160);
+        // 80 ms is not enough to start now; 160 ms is.
+        buffer.push(&[0.5; TARGET]);
+        assert_eq!(pull(&mut buffer, PACKET), vec![0.0; PACKET]);
+        buffer.push(&[0.5; TARGET]);
+        assert!(
+            pull(&mut buffer, PACKET)
+                .iter()
+                .any(|sample| *sample != 0.0)
+        );
+
+        // The hint is kept within the range an adaptive buffer uses.
+        assert_eq!(PlayoutBuffer::adaptive_from(RATE, 0).target_ms(), 80);
+        assert_eq!(PlayoutBuffer::adaptive_from(RATE, 5_000).target_ms(), 240);
     }
 
     #[test]

@@ -21,6 +21,13 @@ pub struct Settings {
     pub user: String,
     /// Login for authorization when it differs from `user`; usually empty.
     pub auth_user: String,
+    /// Chosen microphone; empty means the system default.
+    pub microphone: String,
+    /// Chosen speaker or headphones; empty means the system default.
+    pub speaker: String,
+    /// Volumes in percent, 0 to 200; 100 is unchanged.
+    pub speaker_volume: u32,
+    pub microphone_volume: u32,
 }
 
 impl Default for Settings {
@@ -32,6 +39,10 @@ impl Default for Settings {
             domain: String::new(),
             user: String::new(),
             auth_user: String::new(),
+            microphone: String::new(),
+            speaker: String::new(),
+            speaker_volume: 100,
+            microphone_volume: 100,
         }
     }
 }
@@ -59,6 +70,19 @@ impl Settings {
                 "domain" => settings.domain = value,
                 "user" => settings.user = value,
                 "auth_user" => settings.auth_user = value,
+                "microphone" => settings.microphone = value,
+                "speaker" => settings.speaker = value,
+                // A value that is not a sensible volume keeps the default.
+                "speaker_volume" => {
+                    if let Some(volume) = parse_volume(&value) {
+                        settings.speaker_volume = volume;
+                    }
+                }
+                "microphone_volume" => {
+                    if let Some(volume) = parse_volume(&value) {
+                        settings.microphone_volume = volume;
+                    }
+                }
                 _ => {}
             }
         }
@@ -68,6 +92,8 @@ impl Settings {
     pub fn serialize(&self) -> String {
         let mut text = String::from(HEADER);
         text.push('\n');
+        let speaker_volume = self.speaker_volume.to_string();
+        let microphone_volume = self.microphone_volume.to_string();
         for (key, value) in [
             ("local", &self.local),
             ("remote", &self.remote),
@@ -75,6 +101,10 @@ impl Settings {
             ("domain", &self.domain),
             ("user", &self.user),
             ("auth_user", &self.auth_user),
+            ("microphone", &self.microphone),
+            ("speaker", &self.speaker),
+            ("speaker_volume", &speaker_volume),
+            ("microphone_volume", &microphone_volume),
         ] {
             text.push_str(key);
             text.push('=');
@@ -105,6 +135,10 @@ impl Settings {
         fs::write(&temporary, self.serialize())?;
         fs::rename(&temporary, path)
     }
+}
+
+fn parse_volume(value: &str) -> Option<u32> {
+    value.parse::<u32>().ok().filter(|volume| *volume <= 200)
 }
 
 /// A value must stay on its line; control characters are dropped.
@@ -146,6 +180,10 @@ mod tests {
             domain: "example.com".to_owned(),
             user: "alice".to_owned(),
             auth_user: "alice-login".to_owned(),
+            microphone: "Headset Microphone (USB Audio)".to_owned(),
+            speaker: "Headset Earphone (USB Audio)".to_owned(),
+            speaker_volume: 80,
+            microphone_volume: 150,
         }
     }
 
@@ -175,7 +213,10 @@ mod tests {
             "# MicroSIP Rust settings. The password is never stored here.\n\
              local=192.168.1.5:5060\nremote=192.168.1.9:5060\n\
              server=pbx.example.com:5080\ndomain=example.com\nuser=alice\n\
-             auth_user=alice-login\n"
+             auth_user=alice-login\n\
+             microphone=Headset Microphone (USB Audio)\n\
+             speaker=Headset Earphone (USB Audio)\n\
+             speaker_volume=80\nmicrophone_volume=150\n"
         );
         assert!(!text.contains("password="));
     }
@@ -190,8 +231,11 @@ mod tests {
         assert_eq!(settings.local, "10.0.0.1:5060");
         assert_eq!(settings.remote, Settings::default().remote);
         assert_eq!(settings.domain, "");
-        // A file written before `auth_user` existed has no such line.
+        // A file written before these settings existed has no such lines.
         assert_eq!(settings.auth_user, "");
+        assert_eq!(settings.microphone, "");
+        assert_eq!(settings.speaker_volume, 100);
+        assert_eq!(settings.microphone_volume, 100);
     }
 
     #[test]
@@ -202,6 +246,21 @@ mod tests {
         let parsed = Settings::parse(&settings.serialize());
         assert_eq!(parsed.user, "a=b");
         assert_eq!(parsed.domain, "example.comuser=mallory");
+    }
+
+    #[test]
+    fn unusable_volume_values_keep_the_default() {
+        let settings = Settings::parse(
+            "speaker_volume=loud\nmicrophone_volume=201\nspeaker=Speakers = main\n",
+        );
+        assert_eq!(settings.speaker_volume, 100);
+        assert_eq!(settings.microphone_volume, 100);
+        // A device name may contain anything but a line break.
+        assert_eq!(settings.speaker, "Speakers = main");
+
+        let settings = Settings::parse("speaker_volume=0\nmicrophone_volume=200\n");
+        assert_eq!(settings.speaker_volume, 0);
+        assert_eq!(settings.microphone_volume, 200);
     }
 
     #[test]
