@@ -53,6 +53,10 @@ pub enum UiCommand {
     Answer,
     Reject,
     Hangup,
+    /// Sends a keypad digit (`0`-`9`, `*`, `#`, `A`-`D`) during a call.
+    Dtmf(char),
+    /// Stops (`true`) or resumes sending the microphone during a call.
+    Mute(bool),
     /// Registers the account on its SIP server and keeps it registered.
     /// Progress is reported with [`Event::Registration`].
     Register(Account),
@@ -255,6 +259,8 @@ struct Call {
     invite_headers: TransactionHeaders,
     local_rtp: SocketAddr,
     remote_rtp: Option<SocketAddr>,
+    /// Telephone-event payload type the other side offered or accepted.
+    dtmf_payload_type: Option<u8>,
     local_tag: String,
     dialog: Option<EstablishedDialog>,
     last_invite_response: Option<Response>,
@@ -299,6 +305,7 @@ impl Call {
             invite_headers,
             local_rtp,
             remote_rtp: None,
+            dtmf_payload_type: None,
             local_tag,
             dialog: None,
             last_invite_response: None,
@@ -442,7 +449,21 @@ impl<M: Media> Runner<M> {
             }
             UiCommand::Answer => self.dispatch(Input::Command(Command::Answer)),
             UiCommand::Reject => self.dispatch(Input::Command(Command::Reject)),
+            // The other side may end the call at the very moment the user
+            // presses the button; there is then nothing left to hang up.
+            UiCommand::Hangup if self.engine.state() == State::Idle => Ok(()),
             UiCommand::Hangup => self.dispatch(Input::Command(Command::Hangup)),
+            UiCommand::Dtmf(digit) => {
+                if self.media_running {
+                    self.media.send_dtmf(digit)
+                } else {
+                    Err("digits can be sent only during a connected call".into())
+                }
+            }
+            UiCommand::Mute(muted) => {
+                self.media.set_muted(muted);
+                Ok(())
+            }
             UiCommand::Register(account) => {
                 self.register(account);
                 Ok(())
@@ -696,7 +717,9 @@ impl<M: Media> Runner<M> {
                 self.send_to_peer(&bytes)?;
             }
             Action::SendInviteSuccess => {
-                let sdp = make_sdp(self.call_ref()?.local_rtp);
+                // Answer with the telephone-event type the caller offered.
+                let call = self.call_ref()?;
+                let sdp = make_sdp(call.local_rtp, call.dtmf_payload_type);
                 let bytes = self.invite_response(200, "OK", Some(sdp))?;
                 self.send_to_peer(&bytes)?;
                 self.start_final_retx(bytes)?;
@@ -755,8 +778,13 @@ impl<M: Media> Runner<M> {
                 self.send_to_peer(&bytes)?;
             }
             Action::StartMedia => {
-                let started = match self.call_ref()?.remote_rtp {
-                    Some(remote) => self.media.start(remote),
+                let call = self.call_ref()?;
+                let (remote_rtp, dtmf) = (call.remote_rtp, call.dtmf_payload_type);
+                let started = match remote_rtp {
+                    Some(remote) => {
+                        self.media.set_dtmf_payload_type(dtmf);
+                        self.media.start(remote)
+                    }
                     None => Err("peer did not offer usable PCMU audio".into()),
                 };
                 match started {
@@ -814,6 +842,7 @@ impl<M: Media> Runner<M> {
             .ok_or("no 2xx response to acknowledge")?;
 
         call.remote_rtp = media_address(&response.body).ok();
+        call.dtmf_payload_type = telephone_event_payload_type(&response.body);
         // The caller uses the recorded route in reverse order.
         call.route_set = record_routes(&response.headers);
         call.route_set.reverse();
@@ -1153,6 +1182,7 @@ impl<M: Media> Runner<M> {
         let tag = format!("rs-{}", self.unique());
         let mut call = Call::new(source, request.clone(), local_rtp, tag)?;
         call.remote_rtp = Some(remote_rtp);
+        call.dtmf_payload_type = telephone_event_payload_type(&request.body);
         // The called side uses the recorded route in the order received.
         call.route_set = record_routes(&request.headers);
         self.call = Some(call);
@@ -1404,7 +1434,7 @@ impl<M: Media> Runner<M> {
             branch,
             from_tag.clone(),
         )
-        .body(make_sdp(local_rtp).into_bytes())
+        .body(make_sdp(local_rtp, Some(OFFERED_DTMF_PAYLOAD_TYPE)).into_bytes())
         .build()?;
         add_rport(&mut invite.headers)?;
 
@@ -1462,7 +1492,7 @@ impl<M: Media> Runner<M> {
             server.from_tag.clone(),
         )
         .cseq(old_headers.cseq + 1)
-        .body(make_sdp(call.local_rtp).into_bytes())
+        .body(make_sdp(call.local_rtp, Some(OFFERED_DTMF_PAYLOAD_TYPE)).into_bytes())
         .build()?;
         invite.headers.insert(name, value)?;
         add_rport(&mut invite.headers)?;
@@ -1661,15 +1691,48 @@ fn server_target(text: &str, domain: &str) -> Result<String> {
     Ok(format!("sip:{user}@{host}"))
 }
 
-fn make_sdp(address: SocketAddr) -> String {
+/// Payload type this phone proposes for telephone-event (keypad digits).
+const OFFERED_DTMF_PAYLOAD_TYPE: u8 = 101;
+
+/// PCMU audio, plus telephone-event with the given payload type when the
+/// digits may be sent as RFC 4733 events.
+fn make_sdp(address: SocketAddr, dtmf: Option<u8>) -> String {
     let family = if address.is_ipv4() { "IP4" } else { "IP6" };
     let ip = address.ip();
+    let port = address.port();
+    let (dtmf_format, dtmf_lines) = match dtmf {
+        Some(payload) => (
+            format!(" {payload}"),
+            format!("a=rtpmap:{payload} telephone-event/8000\r\na=fmtp:{payload} 0-16\r\n"),
+        ),
+        None => (String::new(), String::new()),
+    };
     format!(
         "v=0\r\no=phone 1 1 IN {family} {ip}\r\ns=Rust direct call\r\n\
-         c=IN {family} {ip}\r\nt=0 0\r\nm=audio {} RTP/AVP 0\r\n\
-         a=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n",
-        address.port()
+         c=IN {family} {ip}\r\nt=0 0\r\nm=audio {port} RTP/AVP 0{dtmf_format}\r\n\
+         a=rtpmap:0 PCMU/8000\r\n{dtmf_lines}a=sendrecv\r\n"
     )
+}
+
+/// Payload type of 8 kHz telephone-event in an SDP body, if it is offered.
+fn telephone_event_payload_type(body: &[u8]) -> Option<u8> {
+    let sdp = Sdp::parse(std::str::from_utf8(body).ok()?).ok()?;
+    let audio = sdp.media(&MediaKind::Audio)?;
+    audio
+        .attributes
+        .iter()
+        .filter(|attribute| attribute.name.eq_ignore_ascii_case("rtpmap"))
+        .filter_map(|attribute| attribute.value.as_deref()?.split_once(' '))
+        .find(|(_, encoding)| encoding.trim().eq_ignore_ascii_case("telephone-event/8000"))
+        .and_then(|(payload, _)| payload.trim().parse::<u8>().ok())
+        // The type must also be listed on the m= line and be a dynamic one.
+        .filter(|payload| {
+            (96..=127).contains(payload)
+                && audio
+                    .formats
+                    .iter()
+                    .any(|format| *format == payload.to_string())
+        })
 }
 
 /// Audio address from an SDP body; requires RTP/AVP with PCMU (payload 0).
@@ -1696,7 +1759,57 @@ fn media_address(body: &[u8]) -> Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::redact;
+    use super::{make_sdp, media_address, redact, telephone_event_payload_type};
+
+    #[test]
+    fn offer_lists_telephone_event_and_stays_valid_pcmu() {
+        let address = "192.0.2.5:40000".parse().unwrap();
+        let offer = make_sdp(address, Some(101));
+        assert!(offer.contains("m=audio 40000 RTP/AVP 0 101\r\n"));
+        assert!(offer.contains("a=rtpmap:101 telephone-event/8000\r\n"));
+        assert!(offer.contains("a=fmtp:101 0-16\r\n"));
+        // Our own offer is something we would accept ourselves.
+        assert_eq!(media_address(offer.as_bytes()).unwrap(), address);
+        assert_eq!(telephone_event_payload_type(offer.as_bytes()), Some(101));
+
+        let plain = make_sdp(address, None);
+        assert!(plain.contains("m=audio 40000 RTP/AVP 0\r\n"));
+        assert!(!plain.contains("telephone-event"));
+        assert_eq!(telephone_event_payload_type(plain.as_bytes()), None);
+    }
+
+    #[test]
+    fn telephone_event_type_is_read_from_the_other_side() {
+        let sdp = |formats: &str, lines: &str| {
+            format!(
+                "v=0\r\no=x 1 1 IN IP4 192.0.2.1\r\ns=x\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n\
+                 m=audio 4000 RTP/AVP {formats}\r\na=rtpmap:0 PCMU/8000\r\n{lines}"
+            )
+        };
+        let found = |formats: &str, lines: &str| {
+            telephone_event_payload_type(sdp(formats, lines).as_bytes())
+        };
+        assert_eq!(
+            found("0 96", "a=rtpmap:96 telephone-event/8000\r\n"),
+            Some(96)
+        );
+        assert_eq!(
+            found(
+                "0 8 101",
+                "a=rtpmap:8 PCMA/8000\r\na=rtpmap:101 TELEPHONE-EVENT/8000\r\n"
+            ),
+            Some(101)
+        );
+        // Wideband events, a type missing from the m= line, a static type.
+        assert_eq!(
+            found("0 101", "a=rtpmap:101 telephone-event/16000\r\n"),
+            None
+        );
+        assert_eq!(found("0", "a=rtpmap:101 telephone-event/8000\r\n"), None);
+        assert_eq!(found("0 8", "a=rtpmap:8 telephone-event/8000\r\n"), None);
+        assert_eq!(found("0", ""), None);
+        assert_eq!(telephone_event_payload_type(b"not sdp"), None);
+    }
 
     #[test]
     fn digest_response_is_hidden_and_everything_else_is_kept() {

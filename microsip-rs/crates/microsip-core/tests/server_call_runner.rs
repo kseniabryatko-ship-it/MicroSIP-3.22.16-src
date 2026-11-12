@@ -541,3 +541,80 @@ fn called_side_echoes_the_recorded_route_and_uses_it_for_bye() {
     server.reply(&bye, peer, 200, &[], None);
     wait_for(&handle, Event::Ended(EndReason::Completed));
 }
+
+#[test]
+fn offer_proposes_keypad_events_and_answer_follows_the_caller() {
+    let server = Server::new();
+    let handle = phone(fast_timers());
+    let local = handle.local_address();
+    let address = server.address();
+
+    // Our own offer proposes telephone-event next to PCMU.
+    assert!(handle.send(UiCommand::DialTarget(address.to_string())));
+    let (invite, peer) = server.request("INVITE");
+    let offer = std::str::from_utf8(&invite.body).unwrap();
+    assert!(offer.contains(" RTP/AVP 0 101\r\n"), "{offer}");
+    assert!(offer.contains("a=rtpmap:101 telephone-event/8000\r\n"));
+    server.reply(&invite, peer, 486, &[], None);
+    wait_for(&handle, Event::Ended(EndReason::Rejected(486)));
+
+    // A caller's offer decides what our answer contains.
+    let answer_to = |call_id: &str, formats: &str, extra: &str| {
+        let sdp = format!(
+            "v=0\r\no=raw 1 1 IN IP4 127.0.0.1\r\ns=raw\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+             m=audio 40000 RTP/AVP {formats}\r\na=rtpmap:0 PCMU/8000\r\n{extra}"
+        );
+        let invite = InviteRequest::new(
+            format!("sip:phone@{local}"),
+            format!("sip:bob@{address}"),
+            format!("sip:phone@{local}"),
+            format!("sip:bob@{address}"),
+            address.to_string(),
+            call_id,
+            format!("z9hG4bK-{call_id}"),
+            "bob-tag",
+        )
+        .body(sdp.into_bytes())
+        .build()
+        .unwrap();
+        server.send(&invite, local);
+        wait_for(&handle, Event::Incoming { peer: address });
+        assert!(handle.send(UiCommand::Answer));
+        // Skip repeated answers that are still arriving from an earlier call.
+        let ok = loop {
+            let response = server.response(200);
+            if response.headers.get("call-id") == Some(call_id) {
+                break response;
+            }
+        };
+        // No ACK follows: with the fast timers the phone gives the call up.
+        wait_for(&handle, Event::Ended(EndReason::Timeout));
+        String::from_utf8(ok.body).unwrap()
+    };
+
+    let answer = answer_to(
+        "with-events",
+        "0 96",
+        "a=rtpmap:96 telephone-event/8000\r\n",
+    );
+    assert!(answer.contains(" RTP/AVP 0 96\r\n"), "{answer}");
+    assert!(answer.contains("a=rtpmap:96 telephone-event/8000\r\n"));
+
+    let answer = answer_to("without-events", "0", "");
+    assert!(answer.contains(" RTP/AVP 0\r\n"), "{answer}");
+    assert!(!answer.contains("telephone-event"));
+}
+
+#[test]
+fn hangup_with_no_call_is_quietly_ignored_but_a_digit_is_refused() {
+    let handle = phone(fast_timers());
+    assert!(handle.send(UiCommand::Hangup));
+    assert!(handle.send(UiCommand::Mute(true)));
+    assert!(handle.send(UiCommand::Dtmf('5')));
+    // The only thing reported is the digit that could not be sent.
+    assert_eq!(
+        wait_error(&handle),
+        "digits can be sent only during a connected call"
+    );
+    assert!(handle.wait_event(Duration::from_millis(200)).is_none());
+}

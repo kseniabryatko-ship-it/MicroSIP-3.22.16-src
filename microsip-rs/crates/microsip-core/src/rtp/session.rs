@@ -81,6 +81,7 @@ pub struct RtpSessionConfig {
     expected_source: Option<SocketAddr>,
     source_sample_rate: u32,
     receive_timeout: Duration,
+    dtmf_payload_type: Option<u8>,
 }
 
 impl RtpSessionConfig {
@@ -90,11 +91,19 @@ impl RtpSessionConfig {
             expected_source: Some(remote_address),
             source_sample_rate,
             receive_timeout: DEFAULT_RECEIVE_TIMEOUT,
+            dtmf_payload_type: None,
         }
     }
 
     pub fn with_expected_source(mut self, expected_source: Option<SocketAddr>) -> Self {
         self.expected_source = expected_source;
+        self
+    }
+
+    /// The telephone-event payload type agreed in SDP. Without it digits
+    /// are sent as tones inside the voice.
+    pub fn with_dtmf_payload_type(mut self, payload_type: Option<u8>) -> Self {
+        self.dtmf_payload_type = payload_type;
         self
     }
 
@@ -121,6 +130,7 @@ pub struct RtpSession {
     sent_packets: Arc<AtomicU64>,
     received_packets: Arc<AtomicU64>,
     order_stats: Arc<Mutex<OrderStats>>,
+    control: Arc<SenderControl>,
     sender_thread: Option<JoinHandle<Result<(), RtpSessionError>>>,
     receiver_thread: Option<JoinHandle<Result<(), RtpSessionError>>>,
 }
@@ -158,9 +168,13 @@ impl RtpSession {
             expected_source,
             source_sample_rate,
             receive_timeout,
+            dtmf_payload_type,
         } = config;
 
-        let pcmu_stream = PcmuStream::new(ssrc, source_sample_rate)?;
+        let mut pcmu_stream = PcmuStream::new(ssrc, source_sample_rate)?;
+        pcmu_stream.set_dtmf_payload_type(dtmf_payload_type);
+        let control = Arc::new(SenderControl::default());
+        let sender_control = Arc::clone(&control);
 
         let (sample_sender, sample_receiver) =
             mpsc::sync_channel::<Vec<f32>>(SAMPLE_QUEUE_CAPACITY);
@@ -180,6 +194,7 @@ impl RtpSession {
                 remote_address,
                 sender_counter,
                 sender_stop,
+                sender_control,
             )
         });
 
@@ -215,6 +230,7 @@ impl RtpSession {
             sent_packets,
             received_packets,
             order_stats,
+            control,
             sender_thread: Some(sender_thread),
             receiver_thread: Some(receiver_thread),
         })
@@ -237,6 +253,27 @@ impl RtpSession {
         sender
             .send(samples.to_vec())
             .map_err(|_| RtpSessionError::SampleChannelDisconnected)
+    }
+
+    /// Sends a keypad digit to the other side. Returns false when the
+    /// character is not on a keypad.
+    pub fn send_dtmf(&self, digit: char) -> bool {
+        if crate::rtp::dtmf::event_code(digit).is_none() {
+            return false;
+        }
+        match self.control.digits.lock() {
+            Ok(mut digits) => {
+                digits.push(digit);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// While muted, silence is sent instead of the microphone. Digits are
+    /// still sent.
+    pub fn set_muted(&self, muted: bool) {
+        self.control.muted.store(muted, Ordering::Release);
     }
 
     /// A second input for microphone samples that another thread may own,
@@ -309,6 +346,13 @@ impl Drop for RtpSession {
     }
 }
 
+/// Requests from the session's owner to its sender thread.
+#[derive(Default)]
+struct SenderControl {
+    muted: AtomicBool,
+    digits: Mutex<Vec<char>>,
+}
+
 fn run_sender(
     socket: UdpSocket,
     samples: Receiver<Vec<f32>>,
@@ -316,9 +360,10 @@ fn run_sender(
     remote_address: SocketAddr,
     sent_packets: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    control: Arc<SenderControl>,
 ) -> Result<(), RtpSessionError> {
     loop {
-        let samples = match samples.recv_timeout(Duration::from_millis(50)) {
+        let mut samples = match samples.recv_timeout(Duration::from_millis(50)) {
             Ok(samples) => samples,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if stop.load(Ordering::Acquire) {
@@ -328,6 +373,14 @@ fn run_sender(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        if let Ok(mut digits) = control.digits.lock() {
+            for digit in digits.drain(..) {
+                pcmu_stream.queue_dtmf(digit);
+            }
+        }
+        if control.muted.load(Ordering::Acquire) {
+            samples.fill(0.0);
+        }
         let packets = pcmu_stream.push_pcm(&samples);
 
         for packet in packets {
@@ -640,6 +693,58 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(input.try_send(vec![0.0; 960]).is_err());
         receiver.shutdown().expect("receiver should stop cleanly");
+    }
+
+    #[test]
+    fn mute_sends_silence_and_digits_are_sent_as_negotiated() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("peer should bind");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout should be set");
+        let config = RtpSessionConfig::new(peer.local_addr().expect("address"), 8_000)
+            .with_dtmf_payload_type(Some(101));
+        let mut session = RtpSession::bind(
+            "127.0.0.1:0".parse::<SocketAddr>().expect("valid address"),
+            config,
+            0x9999_9999,
+        )
+        .expect("session should start");
+        let receive = || {
+            let mut buffer = [0_u8; 2_048];
+            let (length, _) = peer.recv_from(&mut buffer).expect("packet expected");
+            RtpPacket::parse(&buffer[..length]).expect("valid RTP")
+        };
+        let loud = |packet: &RtpPacket| {
+            decode_pcmu(&packet.payload)
+                .iter()
+                .any(|sample| sample.abs() > 0.1)
+        };
+
+        session.push_pcm(&[0.5; 160]).expect("PCM should be queued");
+        assert!(loud(&receive()));
+
+        session.set_muted(true);
+        session.push_pcm(&[0.5; 160]).expect("PCM should be queued");
+        let muted = receive();
+        assert_eq!(muted.payload_type, PCMU_PAYLOAD_TYPE);
+        assert!(!loud(&muted));
+
+        // A digit goes out even while muted.
+        assert!(session.send_dtmf('9'));
+        assert!(!session.send_dtmf('z'));
+        session.push_pcm(&[0.5; 160]).expect("PCM should be queued");
+        let event = receive();
+        assert_eq!(event.payload_type, 101);
+        assert_eq!(event.payload[0], 9);
+        assert!(event.marker);
+
+        session.set_muted(false);
+        for _ in 0..12 {
+            session.push_pcm(&[0.5; 160]).expect("PCM should be queued");
+        }
+        let rest: Vec<RtpPacket> = (0..12).map(|_| receive()).collect();
+        assert!(rest[..9].iter().all(|packet| packet.payload_type == 101));
+        assert!(loud(&rest[11]));
+        session.shutdown().expect("session should stop cleanly");
     }
 
     #[test]

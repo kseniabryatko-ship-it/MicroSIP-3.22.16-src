@@ -25,6 +25,7 @@ struct PhoneWindow {
     auth_user: String,
     password: String,
     show_password: bool,
+    muted: bool,
     domain: String,
     registration: Option<RegistrationState>,
     handle: Option<CallHandle>,
@@ -85,6 +86,7 @@ impl PhoneWindow {
             auth_user: saved.auth_user.clone(),
             password: String::new(),
             show_password: false,
+            muted: false,
             domain: saved.domain.clone(),
             registration: None,
             handle: None,
@@ -336,6 +338,26 @@ impl PhoneWindow {
         }
     }
 
+    fn toggle_mute(&mut self) {
+        if self.view.phase() != Phase::Connected {
+            return;
+        }
+        self.muted = !self.muted;
+        self.log(if self.muted {
+            "> mute: the other side does not hear you"
+        } else {
+            "> unmute"
+        });
+        self.send(UiCommand::Mute(self.muted));
+    }
+
+    fn dtmf(&mut self, digit: char) {
+        if self.view.phase() == Phase::Connected {
+            self.log(format!("> digit {digit}"));
+            self.send(UiCommand::Dtmf(digit));
+        }
+    }
+
     fn poll(&mut self) {
         while let Some(event) = self.handle.as_ref().and_then(|handle| handle.try_event()) {
             self.view.on_event(&event);
@@ -347,7 +369,11 @@ impl PhoneWindow {
                     self.log(format!("RTP sent: {sent}; RTP received: {received}"));
                 }
                 Event::AudioQuality(quality) => self.log(format!("Audio: {quality}")),
-                Event::Ended(reason) => self.log(format!("Call ended: {reason}")),
+                Event::Ended(reason) => {
+                    // Every call starts with the microphone on.
+                    self.muted = false;
+                    self.log(format!("Call ended: {reason}"));
+                }
                 Event::Registration(state) => {
                     self.log(format!("Account: {state}"));
                     self.registration = Some(state);
@@ -506,6 +532,33 @@ impl eframe::App for PhoneWindow {
                     .clicked()
                 {
                     self.hangup();
+                }
+                let connected = running && view.phase() == Phase::Connected;
+                let label = if self.muted { "Unmute" } else { "Mute" };
+                if ui
+                    .add_enabled(connected, egui::Button::new(label))
+                    .clicked()
+                {
+                    self.toggle_mute();
+                }
+                if self.muted {
+                    ui.colored_label(egui::Color32::YELLOW, "Microphone is off");
+                }
+            });
+
+            // Keypad for menus such as "press 1 for ...", active during a call.
+            let connected = running && self.view.phase() == Phase::Connected;
+            ui.add_enabled_ui(connected, |ui| {
+                for row in ["123", "456", "789", "*0#"] {
+                    ui.horizontal(|ui| {
+                        for digit in row.chars() {
+                            let button = egui::Button::new(digit.to_string())
+                                .min_size(egui::vec2(36.0, 24.0));
+                            if ui.add(button).clicked() {
+                                self.dtmf(digit);
+                            }
+                        }
+                    });
                 }
             });
 

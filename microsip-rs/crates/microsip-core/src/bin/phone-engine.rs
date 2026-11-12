@@ -17,6 +17,7 @@ const HELP: &str = "Usage: phone-engine.exe LOCAL_IP:SIP_PORT [--no-audio] [--tr
 Port 0 picks a free port; the chosen address is printed on the first line.\n\
 Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit\n\
           register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister\n\
+          dtmf DIGITS | mute | unmute\n\
 call IP:PORT dials directly. register keeps the account registered on a SIP\n\
 server; after that the server can send calls here and call NUMBER (or\n\
 USER@DOMAIN) dials through it.\n\
@@ -24,7 +25,7 @@ USER@DOMAIN) dials through it.\n\
 (the Digest response value is hidden).";
 
 const COMMANDS: &str = "Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit | \
-register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister";
+register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister | dtmf DIGITS | mute | unmute";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -151,6 +152,21 @@ impl Phone {
                 let account =
                     Account::new(server, user, password).with_domain(parts.next().unwrap_or(""));
                 self.handle.send(UiCommand::Register(account));
+            }
+            Some("dtmf") => match parts.next() {
+                Some(digits) if self.state == State::Connected => {
+                    for digit in digits.chars() {
+                        self.handle.send(UiCommand::Dtmf(digit));
+                    }
+                    println!("Sending digits {digits}");
+                }
+                Some(_) => println!("Digits can be sent only during a connected call."),
+                None => println!("Usage: dtmf DIGITS"),
+            },
+            Some(word @ ("mute" | "unmute")) => {
+                let muted = word == "mute";
+                self.handle.send(UiCommand::Mute(muted));
+                println!("Microphone {}.", if muted { "off" } else { "on" });
             }
             Some("unregister") => {
                 self.handle.send(UiCommand::Unregister);

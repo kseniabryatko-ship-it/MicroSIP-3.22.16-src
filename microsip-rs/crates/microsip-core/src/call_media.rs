@@ -79,6 +79,19 @@ pub trait Media {
         MediaStats::default()
     }
 
+    /// Tells the media which telephone-event payload type the other side
+    /// agreed to (`None`: digits go as tones in the voice). Called before
+    /// `start`.
+    fn set_dtmf_payload_type(&mut self, _payload_type: Option<u8>) {}
+
+    /// Sends a keypad digit to the other side.
+    fn send_dtmf(&mut self, _digit: char) -> Result<(), MediaError> {
+        Err("this phone has no audio to send digits with".into())
+    }
+
+    /// Stops or resumes sending the microphone. A new call starts unmuted.
+    fn set_muted(&mut self, _muted: bool) {}
+
     /// Quality of the received audio; `None` when this media plays nothing.
     fn quality(&self) -> Option<MediaQuality> {
         None
@@ -117,6 +130,7 @@ pub struct AudioMedia {
     socket: Option<UdpSocket>,
     active: Option<ActiveAudio>,
     next_ssrc: u32,
+    dtmf_payload_type: Option<u8>,
 }
 
 struct ActiveAudio {
@@ -162,7 +176,8 @@ impl Media for AudioMedia {
         let format = Microphone::input_format()?;
         let speaker = Speaker::start()?;
         let mut to_speaker = speaker.sink();
-        let config = RtpSessionConfig::new(remote, format.sample_rate);
+        let config = RtpSessionConfig::new(remote, format.sample_rate)
+            .with_dtmf_payload_type(self.dtmf_payload_type);
         self.next_ssrc = self.next_ssrc.wrapping_add(0x0101_0101).max(1);
         let session = RtpSession::from_socket_with_sink(
             socket,
@@ -213,6 +228,25 @@ impl Media for AudioMedia {
                 received_packets: active.session.received_packets(),
             })
             .unwrap_or_default()
+    }
+
+    fn set_dtmf_payload_type(&mut self, payload_type: Option<u8>) {
+        self.dtmf_payload_type = payload_type;
+    }
+
+    fn send_dtmf(&mut self, digit: char) -> Result<(), MediaError> {
+        let active = self.active.as_ref().ok_or("no audio is running")?;
+        if active.session.send_dtmf(digit) {
+            Ok(())
+        } else {
+            Err(format!("'{digit}' is not a keypad digit").into())
+        }
+    }
+
+    fn set_muted(&mut self, muted: bool) {
+        if let Some(active) = self.active.as_ref() {
+            active.session.set_muted(muted);
+        }
     }
 
     fn quality(&self) -> Option<MediaQuality> {

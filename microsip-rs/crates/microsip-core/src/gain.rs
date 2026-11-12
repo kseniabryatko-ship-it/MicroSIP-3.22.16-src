@@ -16,8 +16,15 @@ pub const NOISE_FLOOR: f32 = 0.01;
 /// Amplified audio stays below this, leaving a little room under full scale.
 const CEILING: f32 = 0.9;
 
-/// How long the remembered speech level takes to fade, in seconds.
+/// How long the remembered speech level takes to fade while speech goes on,
+/// in seconds.
 const LEVEL_DECAY_SECONDS: f32 = 2.0;
+/// A block this far below the remembered speech level is a pause (room
+/// noise, breathing), not speech.
+const PAUSE_RATIO: f32 = 0.25;
+/// During pauses the remembered level fades this slowly, so listening
+/// quietly for a while does not turn the room noise up.
+const PAUSE_DECAY_SECONDS: f32 = 30.0;
 /// How fast the gain may rise and fall, in seconds.
 const RISE_SECONDS: f32 = 0.5;
 const FALL_SECONDS: f32 = 0.01;
@@ -63,9 +70,16 @@ impl AutoGain {
             self.gain
         };
         if peak > NOISE_FLOOR {
-            // Remember the loudest recent speech; forget it slowly.
-            let decay = (-seconds / LEVEL_DECAY_SECONDS).exp();
-            self.level = peak.max(self.level * decay);
+            // Remember the loudest recent speech; forget it slowly, and
+            // much more slowly while the talker is only pausing.
+            let speaking = peak >= self.level * PAUSE_RATIO;
+            let time = if speaking {
+                LEVEL_DECAY_SECONDS
+            } else {
+                PAUSE_DECAY_SECONDS
+            };
+            let faded = self.level * (-seconds / time).exp();
+            self.level = if speaking { peak.max(faded) } else { faded };
             let wanted = (TARGET_PEAK / self.level).clamp(1.0, MAX_GAIN);
             let time = if wanted < self.gain {
                 FALL_SECONDS
@@ -168,6 +182,23 @@ mod tests {
         assert_eq!(gain.gain(), speaking);
         // The background got the same gain as the speech, not more.
         assert!(peak(output.last().unwrap()) <= 0.004 * speaking + 0.0001);
+    }
+
+    #[test]
+    fn room_noise_while_listening_barely_raises_the_gain() {
+        let mut gain = AutoGain::new(RATE);
+        // Normal speech, then ten seconds of listening with audible room noise.
+        run(&mut gain, 0.25, 300, 0);
+        let speaking = gain.gain();
+        assert!((speaking - 2.0).abs() < 0.1, "gain {speaking}");
+
+        run(&mut gain, 0.03, 1_000, 0);
+        let listening = gain.gain();
+        assert!(listening < speaking * 1.5, "gain rose to {listening}");
+
+        // A talker who really became quieter is still followed.
+        run(&mut gain, 0.1, 400, 0);
+        assert!((gain.gain() - 5.0).abs() < 0.3, "gain {}", gain.gain());
     }
 
     #[test]

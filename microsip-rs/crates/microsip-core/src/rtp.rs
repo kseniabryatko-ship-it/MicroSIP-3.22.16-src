@@ -1,6 +1,8 @@
+pub mod dtmf;
 pub mod order;
 pub mod session;
 use crate::resample::Resampler;
+use dtmf::{DtmfFrame, DtmfSender};
 use std::error::Error;
 use std::fmt;
 
@@ -199,6 +201,7 @@ pub struct PcmuStream {
     next_timestamp: u32,
     ssrc: u32,
     first_packet: bool,
+    dtmf: DtmfSender,
 }
 
 impl PcmuStream {
@@ -211,7 +214,20 @@ impl PcmuStream {
             next_timestamp: 0,
             ssrc,
             first_packet: true,
+            dtmf: DtmfSender::default(),
         })
+    }
+
+    /// Sets the negotiated telephone-event payload type. Without one, digits
+    /// are sent as tones inside the voice.
+    pub fn set_dtmf_payload_type(&mut self, payload_type: Option<u8>) {
+        self.dtmf = DtmfSender::new(payload_type);
+    }
+
+    /// Queues a keypad digit; false when it is not a keypad character or too
+    /// many are waiting.
+    pub fn queue_dtmf(&mut self, digit: char) -> bool {
+        self.dtmf.queue(digit)
     }
 
     pub fn push_pcm(&mut self, samples: &[f32]) -> Vec<RtpPacket> {
@@ -227,13 +243,27 @@ impl PcmuStream {
                 .drain(..PCMU_SAMPLES_PER_PACKET)
                 .collect::<Vec<f32>>();
 
-            let payload = encode_pcmu(&chunk);
+            // A digit being sent takes the place of the microphone; the
+            // sequence numbers and the voice clock run on regardless.
+            let voice = |payload: Vec<u8>| (PCMU_PAYLOAD_TYPE, payload, self.first_packet, None);
+            let (payload_type, payload, marker, timestamp) =
+                match self.dtmf.next_frame(self.next_timestamp) {
+                    DtmfFrame::Voice => voice(encode_pcmu(&chunk)),
+                    DtmfFrame::Tone(tone) => voice(encode_pcmu(&tone)),
+                    DtmfFrame::Silence => voice(encode_pcmu(&[0.0; PCMU_SAMPLES_PER_PACKET])),
+                    DtmfFrame::Event {
+                        payload_type,
+                        payload,
+                        marker,
+                        timestamp,
+                    } => (payload_type, payload.to_vec(), marker, Some(timestamp)),
+                };
 
             let packet = RtpPacket {
-                marker: self.first_packet,
-                payload_type: PCMU_PAYLOAD_TYPE,
+                marker,
+                payload_type,
                 sequence_number: self.next_sequence_number,
-                timestamp: self.next_timestamp,
+                timestamp: timestamp.unwrap_or(self.next_timestamp),
                 ssrc: self.ssrc,
                 payload,
             };
@@ -379,6 +409,68 @@ mod tests {
         let output = resampler.push(&input);
 
         assert_eq!(output.len(), 2);
+    }
+
+    #[test]
+    fn digit_replaces_voice_packets_and_keeps_the_stream_continuous() {
+        let mut stream = PcmuStream::new(1, 8_000).expect("PCMU stream should be valid");
+        stream.set_dtmf_payload_type(Some(101));
+        let voice = vec![0.25; 160];
+
+        let before = stream.push_pcm(&voice);
+        assert_eq!(before[0].payload_type, PCMU_PAYLOAD_TYPE);
+        assert!(stream.queue_dtmf('7'));
+        assert!(!stream.queue_dtmf('?'));
+
+        let mut packets = before;
+        for _ in 0..12 {
+            packets.extend(stream.push_pcm(&voice));
+        }
+        // One voice packet, ten event packets, then voice again.
+        let types: Vec<u8> = packets.iter().map(|packet| packet.payload_type).collect();
+        assert_eq!(
+            types,
+            [0, 101, 101, 101, 101, 101, 101, 101, 101, 101, 101, 0, 0]
+        );
+
+        // Sequence numbers never skip.
+        for (index, packet) in packets.iter().enumerate() {
+            assert_eq!(usize::from(packet.sequence_number), index);
+        }
+        // Event packets all carry the time the digit started ...
+        assert!(packets[1..11].iter().all(|packet| packet.timestamp == 160));
+        assert!(packets[1].marker);
+        assert!(packets[2..].iter().all(|packet| !packet.marker));
+        assert_eq!(packets[1].payload[0], 7);
+        // ... and the voice clock went on underneath.
+        assert_eq!(packets[11].timestamp, 11 * 160);
+    }
+
+    #[test]
+    fn digit_without_negotiation_is_carried_inside_voice_packets() {
+        let mut stream = PcmuStream::new(1, 8_000).expect("PCMU stream should be valid");
+        assert!(stream.queue_dtmf('1'));
+        let silence = vec![0.0; 160];
+        let packets: Vec<RtpPacket> = (0..12).flat_map(|_| stream.push_pcm(&silence)).collect();
+
+        assert!(
+            packets
+                .iter()
+                .all(|packet| packet.payload_type == PCMU_PAYLOAD_TYPE)
+        );
+        // The microphone is silent, so anything audible is the tone.
+        let loud = |packet: &RtpPacket| {
+            decode_pcmu(&packet.payload)
+                .iter()
+                .any(|sample| sample.abs() > 0.1)
+        };
+        let audible: Vec<bool> = packets.iter().map(loud).collect();
+        assert_eq!(
+            audible,
+            [
+                true, true, true, true, true, true, true, true, false, false, false, false
+            ]
+        );
     }
 
     #[test]
