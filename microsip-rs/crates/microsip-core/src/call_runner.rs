@@ -58,6 +58,8 @@ pub enum UiCommand {
     Register(Account),
     /// Removes the registration made by [`UiCommand::Register`].
     Unregister,
+    /// Turns [`Event::Trace`] on or off. It is off at the start.
+    Trace(bool),
     Shutdown,
 }
 
@@ -104,6 +106,13 @@ pub enum Event {
     Ended(EndReason),
     /// The account's registration changed state.
     Registration(RegistrationState),
+    /// A SIP message as sent or received, for diagnostics. The Digest
+    /// `response` value is replaced, so the text holds no credentials.
+    Trace {
+        outgoing: bool,
+        peer: SocketAddr,
+        text: String,
+    },
     Error(String),
 }
 
@@ -317,6 +326,7 @@ struct Runner<M: Media> {
     events: Sender<Event>,
     call: Option<Call>,
     registration: Option<Registration>,
+    trace: bool,
     retx: Vec<Retx>,
     retained: Vec<Retained>,
     pending: VecDeque<Input>,
@@ -344,6 +354,7 @@ impl<M: Media> Runner<M> {
             events,
             call: None,
             registration: None,
+            trace: false,
             retx: Vec::new(),
             retained: Vec::new(),
             pending: VecDeque::new(),
@@ -438,6 +449,10 @@ impl<M: Media> Runner<M> {
                     self.emit(Event::Registration(RegistrationState::Unregistered));
                 }
                 self.unregister();
+                Ok(())
+            }
+            UiCommand::Trace(enabled) => {
+                self.trace = enabled;
                 Ok(())
             }
             UiCommand::Shutdown => Ok(()),
@@ -857,8 +872,19 @@ impl<M: Media> Runner<M> {
     // ----- sending and timers ---------------------------------------------
 
     fn send(&self, bytes: &[u8], peer: SocketAddr) -> Result<()> {
+        self.trace_message(true, peer, bytes);
         self.socket.send_to(bytes, peer)?;
         Ok(())
+    }
+
+    fn trace_message(&self, outgoing: bool, peer: SocketAddr, bytes: &[u8]) {
+        if self.trace {
+            self.emit(Event::Trace {
+                outgoing,
+                peer,
+                text: redact(&String::from_utf8_lossy(bytes)),
+            });
+        }
     }
 
     fn send_to_peer(&self, bytes: &[u8]) -> Result<()> {
@@ -906,6 +932,13 @@ impl<M: Media> Runner<M> {
                 expired.push((retx.kind, retx.call_id.clone()));
             } else if now >= retx.next {
                 // A lost retransmission is repaired by the next one.
+                if self.trace {
+                    let _ = self.events.send(Event::Trace {
+                        outgoing: true,
+                        peer: retx.peer,
+                        text: redact(&String::from_utf8_lossy(&retx.bytes)),
+                    });
+                }
                 let _ = self.socket.send_to(&retx.bytes, retx.peer);
                 retx.interval = (retx.interval * 2).min(retx.cap);
                 retx.next = now + retx.interval;
@@ -1022,6 +1055,10 @@ impl<M: Media> Runner<M> {
     }
 
     fn on_datagram(&mut self, data: &[u8], source: SocketAddr) {
+        if !data.iter().all(u8::is_ascii_whitespace) {
+            // Keep-alive answers are not worth a trace line.
+            self.trace_message(false, source, data);
+        }
         let Ok(text) = std::str::from_utf8(data) else {
             return;
         };
@@ -1441,6 +1478,32 @@ impl<M: Media> Runner<M> {
 
 // ----- message helpers -----------------------------------------------------
 
+/// Hides the Digest `response` value: with the rest of the message it would
+/// allow guessing the password offline.
+fn redact(text: &str) -> String {
+    const MARKER: &str = "response=\"";
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(MARKER) {
+        // `response=` must be a parameter of its own, not the tail of `cresponse=`.
+        let own = rest[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !before.is_ascii_alphanumeric());
+        let value = start + MARKER.len();
+        output.push_str(&rest[..value]);
+        match rest[value..].find('"') {
+            Some(end) if own => {
+                output.push_str("<hidden>");
+                rest = &rest[value + end..];
+            }
+            _ => rest = &rest[value..],
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         180 => "Ringing",
@@ -1623,4 +1686,30 @@ fn media_address(body: &[u8]) -> Result<SocketAddr> {
         return Err("hold or unspecified media address is not supported".into());
     }
     Ok(SocketAddr::new(ip, audio.port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact;
+
+    #[test]
+    fn digest_response_is_hidden_and_everything_else_is_kept() {
+        let text = "Authorization: Digest username=\"alice\", nonce=\"n1\", \
+                    response=\"0123456789abcdef\", cnonce=\"c1\"\r\n\
+                    Proxy-Authorization: Digest response=\"feedface\"\r\n";
+        let hidden = redact(text);
+        assert!(!hidden.contains("0123456789abcdef"));
+        assert!(!hidden.contains("feedface"));
+        assert_eq!(hidden.matches("response=\"<hidden>\"").count(), 2);
+        assert!(hidden.contains("username=\"alice\""));
+        assert!(hidden.contains("nonce=\"n1\""));
+        assert!(hidden.contains("cnonce=\"c1\""));
+    }
+
+    #[test]
+    fn text_without_credentials_is_unchanged() {
+        let text = "SIP/2.0 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"pbx\"\r\n";
+        assert_eq!(redact(text), text);
+        assert_eq!(redact("response=\"unterminated"), "response=\"unterminated");
+    }
 }

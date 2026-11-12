@@ -13,14 +13,15 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
-const HELP: &str = "Usage: phone-engine.exe LOCAL_IP:SIP_PORT [--no-audio]\n\
+const HELP: &str = "Usage: phone-engine.exe LOCAL_IP:SIP_PORT [--no-audio] [--trace]\n\
 Port 0 picks a free port; the chosen address is printed on the first line.\n\
 Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit\n\
           register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister\n\
 call IP:PORT dials directly. register keeps the account registered on a SIP\n\
 server; after that the server can send calls here and call NUMBER (or\n\
 USER@DOMAIN) dials through it.\n\
---no-audio runs without sound devices.";
+--no-audio runs without sound devices. --trace prints every SIP message\n\
+(the Digest response value is hidden).";
 
 const COMMANDS: &str = "Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit | \
 register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister";
@@ -92,6 +93,16 @@ impl Phone {
                 self.registration = state.to_string();
                 self.registered = matches!(state, RegistrationState::Registered { .. });
                 println!("Registration: {state}");
+            }
+            Event::Trace {
+                outgoing,
+                peer,
+                text,
+            } => {
+                let arrow = if outgoing { "sent to" } else { "received from" };
+                println!("--- SIP {arrow} {peer} ---");
+                println!("{}", text.trim_end());
+                println!("--- end ---");
             }
             Event::Error(message) => println!("Error: {message}"),
         }
@@ -204,11 +215,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let no_audio = args.iter().any(|argument| argument == "--no-audio");
+    let trace = args.iter().any(|argument| argument == "--trace");
     let positional: Vec<&String> = args
         .iter()
         .filter(|argument| !argument.starts_with("--"))
         .collect();
-    if positional.len() != 1 || args.len() - positional.len() > 1 {
+    if positional.len() != 1 || args.len() - positional.len() > 2 {
         println!("{HELP}");
         return Err("expected LOCAL_IP:SIP_PORT".into());
     }
@@ -224,6 +236,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         spawn(local, "phone", AudioMedia::new)?
     };
 
+    if trace {
+        handle.send(UiCommand::Trace(true));
+    }
     // With port 0 the system chose the port; report the real address.
     let local = handle.local_address();
     println!("Listening on {local}");

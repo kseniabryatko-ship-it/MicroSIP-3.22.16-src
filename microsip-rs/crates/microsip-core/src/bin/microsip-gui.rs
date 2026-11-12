@@ -8,9 +8,12 @@ use microsip_core::registration::{Account, RegistrationState};
 use microsip_core::settings::{self, Settings};
 use microsip_core::transport::{local_ip_towards, resolve_socket_address};
 use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
 
 const LOG_LIMIT: usize = 1_000;
 
@@ -28,6 +31,9 @@ struct PhoneWindow {
     last_error: Option<String>,
     settings_path: Option<PathBuf>,
     saved: Settings,
+    /// SIP messages go here, next to the settings file, for diagnostics.
+    trace_file: Option<File>,
+    started: Instant,
 }
 
 impl PhoneWindow {
@@ -51,6 +57,24 @@ impl PhoneWindow {
                 path.display()
             ));
         }
+        // A fresh trace for every run; the file never holds the password.
+        let trace_path = settings_path
+            .as_ref()
+            .map(|path| path.with_file_name("sip-trace.log"));
+        let trace_file = trace_path.as_ref().and_then(|path| {
+            std::fs::create_dir_all(path.parent()?).ok()?;
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .ok()
+        });
+        match (trace_path.as_ref(), trace_file.is_some()) {
+            (Some(path), true) => notes.push(format!("SIP trace file: {}", path.display())),
+            (Some(path), false) => notes.push(format!("Cannot write {}", path.display())),
+            (None, _) => {}
+        }
         let mut window = Self {
             local: saved.local.clone(),
             remote: saved.remote.clone(),
@@ -65,6 +89,8 @@ impl PhoneWindow {
             last_error: None,
             settings_path,
             saved,
+            trace_file,
+            started: Instant::now(),
         };
         for note in notes {
             window.log(note);
@@ -125,6 +151,7 @@ impl PhoneWindow {
         let handle = spawn(local, "phone", AudioMedia::new)
             .map_err(|error| format!("Cannot listen on {local}: {error}"))?;
         self.log(format!("Phone listening on {}", handle.local_address()));
+        handle.send(UiCommand::Trace(self.trace_file.is_some()));
         self.handle = Some(handle);
         self.view = CallView::default();
         self.last_error = None;
@@ -316,8 +343,31 @@ impl PhoneWindow {
                     self.log(format!("Account: {state}"));
                     self.registration = Some(state);
                 }
+                Event::Trace {
+                    outgoing,
+                    peer,
+                    text,
+                } => self.trace(outgoing, peer, &text),
                 Event::Error(message) => self.error(message),
             }
+        }
+    }
+
+    fn trace(&mut self, outgoing: bool, peer: SocketAddr, text: &str) {
+        let Some(file) = self.trace_file.as_mut() else {
+            return;
+        };
+        let arrow = if outgoing { "SENT TO" } else { "RECEIVED FROM" };
+        let seconds = self.started.elapsed().as_secs_f64();
+        let written = writeln!(
+            file,
+            "===== {seconds:9.3} s  {arrow} {peer} =====\n{}\n",
+            text.trim_end()
+        )
+        .and_then(|()| file.flush());
+        if written.is_err() {
+            self.trace_file = None;
+            self.log("Cannot write the SIP trace file; tracing stopped.");
         }
     }
 }

@@ -532,3 +532,48 @@ fn address_reported_by_the_server_is_registered_as_contact() {
     );
     assert_eq!(registrar.count_for(Duration::from_millis(200)), 0);
 }
+
+#[test]
+fn trace_reports_both_directions_without_the_digest_response() {
+    let registrar = Registrar::new();
+    let handle = phone(Timers::default());
+    assert!(handle.send(UiCommand::Trace(true)));
+    assert!(handle.send(UiCommand::Register(registrar.account(PASSWORD))));
+    let (authorized, _) = registrar.accept("120");
+    let secret = parameter(
+        authorized.headers.get("authorization").unwrap(),
+        " response",
+    );
+
+    let mut sent = Vec::new();
+    let mut received = Vec::new();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        assert!(Instant::now() < deadline, "registration did not finish");
+        match handle.wait_event(Duration::from_millis(50)) {
+            Some(Event::Trace {
+                outgoing,
+                peer,
+                text,
+            }) => {
+                assert_eq!(peer, registrar.address());
+                assert!(!text.contains(&secret), "the Digest response leaked");
+                if outgoing {
+                    sent.push(text);
+                } else {
+                    received.push(text);
+                }
+            }
+            Some(Event::Registration(RegistrationState::Registered { .. })) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(sent.len(), 2);
+    assert!(sent[0].starts_with("REGISTER sip:"));
+    assert!(sent[1].contains("response=\"<hidden>\""));
+    assert!(sent[1].contains("username=\"alice\""));
+    assert_eq!(received.len(), 2);
+    assert!(received[0].starts_with("SIP/2.0 401"));
+    assert!(received[0].contains("nonce=\"nonce-1\""));
+    assert!(received[1].starts_with("SIP/2.0 200"));
+}
