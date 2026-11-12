@@ -5,8 +5,10 @@ use microsip_core::call_media::AudioMedia;
 use microsip_core::call_runner::{CallHandle, Event, UiCommand, spawn};
 use microsip_core::call_view::{CallView, Phase};
 use microsip_core::registration::{Account, RegistrationState};
+use microsip_core::settings::{self, Settings};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 const LOG_LIMIT: usize = 1_000;
@@ -23,22 +25,70 @@ struct PhoneWindow {
     view: CallView,
     logs: VecDeque<String>,
     last_error: Option<String>,
+    settings_path: Option<PathBuf>,
+    saved: Settings,
 }
 
 impl PhoneWindow {
     fn new() -> Self {
-        Self {
-            local: "127.0.0.1:5070".to_owned(),
-            remote: "127.0.0.1:5072".to_owned(),
-            server: String::new(),
-            user: String::new(),
+        let settings_path = settings::default_path();
+        let mut notes = Vec::new();
+        let saved = match settings_path.as_deref().map(Settings::load) {
+            Some(Ok(saved)) => saved,
+            Some(Err(error)) => {
+                notes.push(format!("Cannot read the settings file: {error}"));
+                Settings::default()
+            }
+            None => {
+                notes.push("No profile folder was found; settings are not saved.".to_owned());
+                Settings::default()
+            }
+        };
+        if let Some(path) = settings_path.as_ref() {
+            notes.push(format!(
+                "Settings file (the password is never saved): {}",
+                path.display()
+            ));
+        }
+        let mut window = Self {
+            local: saved.local.clone(),
+            remote: saved.remote.clone(),
+            server: saved.server.clone(),
+            user: saved.user.clone(),
             password: String::new(),
-            domain: String::new(),
+            domain: saved.domain.clone(),
             registration: None,
             handle: None,
             view: CallView::default(),
             logs: VecDeque::new(),
             last_error: None,
+            settings_path,
+            saved,
+        };
+        for note in notes {
+            window.log(note);
+        }
+        window
+    }
+
+    /// Remembers the address and account fields; the password is left out.
+    fn save_settings(&mut self) {
+        let current = Settings {
+            local: self.local.trim().to_owned(),
+            remote: self.remote.trim().to_owned(),
+            server: self.server.trim().to_owned(),
+            domain: self.domain.trim().to_owned(),
+            user: self.user.trim().to_owned(),
+        };
+        if current == self.saved {
+            return;
+        }
+        let Some(path) = self.settings_path.clone() else {
+            return;
+        };
+        match current.save(&path) {
+            Ok(()) => self.saved = current,
+            Err(error) => self.log(format!("Cannot save the settings: {error}")),
         }
     }
 
@@ -77,6 +127,7 @@ impl PhoneWindow {
         self.handle = Some(handle);
         self.view = CallView::default();
         self.last_error = None;
+        self.save_settings();
         Ok(())
     }
 
@@ -126,6 +177,7 @@ impl PhoneWindow {
             return self.error("Enter the SIP server and the user name");
         }
         self.last_error = None;
+        self.save_settings();
         let account = Account::new(self.server.trim(), self.user.trim(), self.password.clone())
             .with_domain(self.domain.trim());
         // The password is never written to the log.
@@ -160,6 +212,7 @@ impl PhoneWindow {
             return;
         }
         self.last_error = None;
+        self.save_settings();
         self.view.dialing(remote);
         self.log(format!("Calling {remote}"));
         self.send(UiCommand::Dial(remote));
@@ -205,6 +258,13 @@ impl PhoneWindow {
                 Event::Error(message) => self.error(message),
             }
         }
+    }
+}
+
+impl Drop for PhoneWindow {
+    fn drop(&mut self) {
+        // Closing the window keeps whatever was typed last.
+        self.save_settings();
     }
 }
 

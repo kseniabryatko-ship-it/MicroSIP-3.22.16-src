@@ -200,7 +200,13 @@ LIMITATIONS
 Registration on a SIP server (Register button) is new: it was tested only
 against a scripted test server, not against a real provider or PBX.
 Outgoing calls through a server are not supported yet; Call still
-dials Remote IP:port directly. Account settings are not saved.
+dials Remote IP:port directly.
+
+SETTINGS
+--------
+The address and account fields are remembered in
+%APPDATA%\MicroSIP-Rust\settings.ini. The password is never saved;
+type it again after each start.
 No guarantee of NAT traversal or interoperability with third-party phones.
 No TLS/SRTP, RTCP, jitter buffer, call hold or transfer.
 No installer, code signature or automatic updates.

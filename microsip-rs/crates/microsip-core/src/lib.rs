@@ -5,6 +5,7 @@ pub mod call_runner;
 pub mod call_view;
 pub mod registration;
 pub mod rtp;
+pub mod settings;
 pub mod sip;
 pub mod transport;
 
