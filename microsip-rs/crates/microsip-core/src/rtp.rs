@@ -1,6 +1,7 @@
 pub mod dtmf;
 pub mod order;
 pub mod session;
+use crate::codec::Codec;
 use crate::resample::Resampler;
 use dtmf::{DtmfFrame, DtmfSender};
 use std::error::Error;
@@ -202,6 +203,7 @@ pub struct PcmuStream {
     ssrc: u32,
     first_packet: bool,
     dtmf: DtmfSender,
+    codec: Codec,
 }
 
 impl PcmuStream {
@@ -215,7 +217,13 @@ impl PcmuStream {
             ssrc,
             first_packet: true,
             dtmf: DtmfSender::default(),
+            codec: Codec::Pcmu,
         })
+    }
+
+    /// Chooses the codec of the voice packets; PCMU unless set otherwise.
+    pub fn set_codec(&mut self, codec: Codec) {
+        self.codec = codec;
     }
 
     /// Sets the negotiated telephone-event payload type. Without one, digits
@@ -245,12 +253,20 @@ impl PcmuStream {
 
             // A digit being sent takes the place of the microphone; the
             // sequence numbers and the voice clock run on regardless.
-            let voice = |payload: Vec<u8>| (PCMU_PAYLOAD_TYPE, payload, self.first_packet, None);
+            let codec = self.codec;
+            let voice = |samples: &[f32]| {
+                (
+                    codec.payload_type(),
+                    codec.encode(samples),
+                    self.first_packet,
+                    None,
+                )
+            };
             let (payload_type, payload, marker, timestamp) =
                 match self.dtmf.next_frame(self.next_timestamp) {
-                    DtmfFrame::Voice => voice(encode_pcmu(&chunk)),
-                    DtmfFrame::Tone(tone) => voice(encode_pcmu(&tone)),
-                    DtmfFrame::Silence => voice(encode_pcmu(&[0.0; PCMU_SAMPLES_PER_PACKET])),
+                    DtmfFrame::Voice => voice(&chunk),
+                    DtmfFrame::Tone(tone) => voice(&tone),
+                    DtmfFrame::Silence => voice(&[0.0; PCMU_SAMPLES_PER_PACKET]),
                     DtmfFrame::Event {
                         payload_type,
                         payload,
@@ -470,6 +486,27 @@ mod tests {
             [
                 true, true, true, true, true, true, true, true, false, false, false, false
             ]
+        );
+    }
+
+    #[test]
+    fn chosen_codec_sets_the_payload_type_and_the_encoding() {
+        let mut stream = PcmuStream::new(1, 8_000).expect("stream should be valid");
+        stream.set_codec(Codec::Pcma);
+        let packets = stream.push_pcm(&[0.5; 160]);
+        assert_eq!(packets[0].payload_type, 8);
+        let decoded = Codec::Pcma.decode(&packets[0].payload);
+        assert!(decoded.iter().all(|sample| (sample - 0.5).abs() < 0.02));
+
+        // An in-band digit is encoded with the same codec.
+        assert!(stream.queue_dtmf('5'));
+        let tone = stream.push_pcm(&[0.0; 160]);
+        assert_eq!(tone[0].payload_type, 8);
+        assert!(
+            Codec::Pcma
+                .decode(&tone[0].payload)
+                .iter()
+                .any(|sample| sample.abs() > 0.1)
         );
     }
 

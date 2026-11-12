@@ -1,5 +1,6 @@
+use crate::codec::Codec;
 use crate::rtp::order::{OrderStats, PacketOrderer, Released};
-use crate::rtp::{PCMU_PAYLOAD_TYPE, PcmuStream, RtpError, RtpPacket, decode_pcmu};
+use crate::rtp::{PcmuStream, RtpError, RtpPacket};
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -82,6 +83,7 @@ pub struct RtpSessionConfig {
     source_sample_rate: u32,
     receive_timeout: Duration,
     dtmf_payload_type: Option<u8>,
+    codec: Codec,
 }
 
 impl RtpSessionConfig {
@@ -92,6 +94,7 @@ impl RtpSessionConfig {
             source_sample_rate,
             receive_timeout: DEFAULT_RECEIVE_TIMEOUT,
             dtmf_payload_type: None,
+            codec: Codec::Pcmu,
         }
     }
 
@@ -104,6 +107,14 @@ impl RtpSessionConfig {
     /// are sent as tones inside the voice.
     pub fn with_dtmf_payload_type(mut self, payload_type: Option<u8>) -> Self {
         self.dtmf_payload_type = payload_type;
+        self
+    }
+
+    /// The codec agreed in SDP for the voice this session sends. Received
+    /// voice is decoded by its own payload type, whichever of the supported
+    /// codecs it is.
+    pub fn with_codec(mut self, codec: Codec) -> Self {
+        self.codec = codec;
         self
     }
 
@@ -169,10 +180,12 @@ impl RtpSession {
             source_sample_rate,
             receive_timeout,
             dtmf_payload_type,
+            codec,
         } = config;
 
         let mut pcmu_stream = PcmuStream::new(ssrc, source_sample_rate)?;
         pcmu_stream.set_dtmf_payload_type(dtmf_payload_type);
+        pcmu_stream.set_codec(codec);
         let control = Arc::new(SenderControl::default());
         let sender_control = Arc::clone(&control);
 
@@ -419,20 +432,23 @@ fn run_receiver(
                 }
 
                 // One odd datagram must not end the audio of the whole call:
-                // anything that is not a PCMU voice packet is skipped. Servers
+                // anything that is not a G.711 voice packet is skipped. Servers
                 // send DTMF events (payload 101) and comfort noise (13) on the
                 // same port, and may use 10 or 30 ms packets instead of 20.
                 let Ok(packet) = RtpPacket::parse(&buffer[..length]) else {
                     continue;
                 };
 
-                if packet.payload_type != PCMU_PAYLOAD_TYPE || packet.payload.is_empty() {
+                let Some(codec) = Codec::from_payload_type(packet.payload_type) else {
+                    continue;
+                };
+                if packet.payload.is_empty() {
                     continue;
                 }
 
                 received_packets.fetch_add(1, Ordering::Relaxed);
 
-                let samples = decode_pcmu(&packet.payload);
+                let samples = codec.decode(&packet.payload);
                 for released in orderer.push(packet.ssrc, packet.sequence_number, samples) {
                     let samples = match released {
                         Released::Packet(samples) => {
@@ -479,7 +495,7 @@ fn run_receiver(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rtp::PCMU_SAMPLES_PER_PACKET;
+    use crate::rtp::{PCMU_PAYLOAD_TYPE, PCMU_SAMPLES_PER_PACKET, decode_pcmu};
 
     #[test]
     fn transfers_pcmu_between_sessions() {
@@ -745,6 +761,55 @@ mod tests {
         assert!(rest[..9].iter().all(|packet| packet.payload_type == 101));
         assert!(loud(&rest[11]));
         session.shutdown().expect("session should stop cleanly");
+    }
+
+    #[test]
+    fn pcma_is_sent_when_chosen_and_both_codecs_are_understood() {
+        let (heard_sender, heard) = mpsc::channel::<f32>();
+        let receiver_socket = UdpSocket::bind("127.0.0.1:0").expect("socket should bind");
+        let mut receiver = RtpSession::from_socket_with_sink(
+            receiver_socket,
+            RtpSessionConfig::new("127.0.0.1:9".parse().expect("valid address"), 8_000)
+                .with_expected_source(None),
+            0xAAAA_0001,
+            Some(Box::new(move |samples| {
+                let _ = heard_sender.send(samples[0]);
+            })),
+        )
+        .expect("receiver session should start");
+        let target = receiver.local_address().expect("address should exist");
+
+        // A session that agreed on PCMA sends payload type 8 ...
+        let mut sender = RtpSession::bind(
+            "127.0.0.1:0".parse::<SocketAddr>().expect("valid address"),
+            RtpSessionConfig::new(target, 8_000).with_codec(Codec::Pcma),
+            0xAAAA_0002,
+        )
+        .expect("sender session should start");
+        sender.push_pcm(&[0.5; 160]).expect("PCM should be queued");
+        let level = heard
+            .recv_timeout(Duration::from_secs(2))
+            .expect("PCMA voice should be heard");
+        assert!((level - 0.5).abs() < 0.02, "PCMA decoded as {level}");
+        sender.shutdown().expect("sender should stop cleanly");
+
+        // ... and PCMU from another sender is understood by the same receiver.
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("peer should bind");
+        let packet = RtpPacket {
+            marker: false,
+            payload_type: 0,
+            sequence_number: 1,
+            timestamp: 160,
+            ssrc: 0xAAAA_0003,
+            payload: Codec::Pcmu.encode(&[-0.25; 160]),
+        };
+        peer.send_to(&packet.serialize().expect("serialize"), target)
+            .expect("send");
+        let level = heard
+            .recv_timeout(Duration::from_secs(2))
+            .expect("PCMU voice should be heard");
+        assert!((level + 0.25).abs() < 0.02, "PCMU decoded as {level}");
+        receiver.shutdown().expect("receiver should stop cleanly");
     }
 
     #[test]

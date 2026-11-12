@@ -549,11 +549,12 @@ fn offer_proposes_keypad_events_and_answer_follows_the_caller() {
     let local = handle.local_address();
     let address = server.address();
 
-    // Our own offer proposes telephone-event next to PCMU.
+    // Our own offer proposes both G.711 codecs and telephone-event.
     assert!(handle.send(UiCommand::DialTarget(address.to_string())));
     let (invite, peer) = server.request("INVITE");
     let offer = std::str::from_utf8(&invite.body).unwrap();
-    assert!(offer.contains(" RTP/AVP 0 101\r\n"), "{offer}");
+    assert!(offer.contains(" RTP/AVP 0 8 101\r\n"), "{offer}");
+    assert!(offer.contains("a=rtpmap:8 PCMA/8000\r\n"), "{offer}");
     assert!(offer.contains("a=rtpmap:101 telephone-event/8000\r\n"));
     server.reply(&invite, peer, 486, &[], None);
     wait_for(&handle, Event::Ended(EndReason::Rejected(486)));
@@ -836,4 +837,91 @@ fn second_call_is_still_refused_as_busy() {
     server.send(&other, local);
     let busy = server.response(486);
     assert_eq!(busy.headers.get("call-id"), Some("another-call"));
+}
+
+#[test]
+fn caller_offering_only_pcma_is_answered_with_pcma() {
+    let server = Server::new();
+    let handle = phone(fast_timers());
+    let local = handle.local_address();
+    let address = server.address();
+
+    let sdp = "v=0\r\no=raw 1 1 IN IP4 127.0.0.1\r\ns=raw\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+               m=audio 40000 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n";
+    let invite = InviteRequest::new(
+        format!("sip:phone@{local}"),
+        format!("sip:bob@{address}"),
+        format!("sip:phone@{local}"),
+        format!("sip:bob@{address}"),
+        address.to_string(),
+        "pcma-only",
+        "z9hG4bK-pcma-only",
+        "bob-tag",
+    )
+    .body(sdp.as_bytes().to_vec())
+    .build()
+    .unwrap();
+    server.send(&invite, local);
+    wait_for(&handle, Event::Incoming { peer: address });
+    assert!(handle.send(UiCommand::Answer));
+    let ok = server.response(200);
+    let answer = text(&ok.body);
+    assert!(answer.contains(" RTP/AVP 8\r\n"), "{answer}");
+    assert!(answer.contains("a=rtpmap:8 PCMA/8000\r\n"), "{answer}");
+    assert!(!answer.contains("PCMU"), "{answer}");
+}
+
+#[test]
+fn caller_offering_no_g711_is_refused_with_488() {
+    let server = Server::new();
+    let handle = phone(fast_timers());
+    let local = handle.local_address();
+    let address = server.address();
+
+    let sdp = "v=0\r\no=raw 1 1 IN IP4 127.0.0.1\r\ns=raw\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+               m=audio 40000 RTP/AVP 18\r\na=rtpmap:18 G729/8000\r\n";
+    let invite = InviteRequest::new(
+        format!("sip:phone@{local}"),
+        format!("sip:bob@{address}"),
+        format!("sip:phone@{local}"),
+        format!("sip:bob@{address}"),
+        address.to_string(),
+        "g729-only",
+        "z9hG4bK-g729-only",
+        "bob-tag",
+    )
+    .body(sdp.as_bytes().to_vec())
+    .build()
+    .unwrap();
+    server.send(&invite, local);
+    let refused = server.response(488);
+    assert_eq!(refused.headers.get("call-id"), Some("g729-only"));
+}
+
+#[test]
+fn answer_choosing_pcma_connects_the_call() {
+    let server = Server::new();
+    let handle = phone(calm_timers());
+    server.register(&handle, PASSWORD);
+    assert!(handle.send(UiCommand::DialTarget("100".to_owned())));
+    let (invite, peer) = server.request("INVITE");
+
+    let pcma = "v=0\r\no=raw 1 1 IN IP4 127.0.0.1\r\ns=raw\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                m=audio 40000 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n";
+    let contact = format!("<sip:100@{}>", server.address());
+    server.reply(
+        &invite,
+        peer,
+        200,
+        &[("contact", contact.as_str())],
+        Some(pcma),
+    );
+    server.request("ACK");
+    wait_for(&handle, Event::Established);
+
+    // A later hold offers the codec the call is using, not the whole list.
+    assert!(handle.send(UiCommand::Hold(true)));
+    let (hold, _) = server.request("INVITE");
+    let offer = text(&hold.body);
+    assert!(offer.contains(" RTP/AVP 8\r\n"), "{offer}");
 }

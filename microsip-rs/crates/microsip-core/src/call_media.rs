@@ -2,6 +2,7 @@
 //! without sound devices.
 
 use crate::audio::{MAX_VOLUME_PERCENT, Microphone, Speaker, volume_factor};
+use crate::codec::Codec;
 use crate::gain::AutoGain;
 use crate::rtp::PCMU_CLOCK_RATE;
 use crate::rtp::session::{RtpSession, RtpSessionConfig};
@@ -88,6 +89,10 @@ pub trait Media {
     fn ring(&mut self, _tone: Option<Tone>) -> Result<(), MediaError> {
         Ok(())
     }
+
+    /// Tells the media which codec was agreed for the voice it sends.
+    /// Called before `start`; without it PCMU is used.
+    fn set_codec(&mut self, _codec: Codec) {}
 
     /// Tells the media which telephone-event payload type the other side
     /// agreed to (`None`: digits go as tones in the voice). Called before
@@ -227,6 +232,7 @@ pub struct AudioMedia {
     muted: bool,
     held: bool,
     controls: AudioControls,
+    codec: Codec,
     /// Playback reserve the last call ended with; the next call on the
     /// same connection starts from it instead of learning it again.
     reserve_ms: u32,
@@ -343,7 +349,8 @@ impl Media for AudioMedia {
         )?;
         let mut to_speaker = speaker.sink();
         let config = RtpSessionConfig::new(remote, format.sample_rate)
-            .with_dtmf_payload_type(self.dtmf_payload_type);
+            .with_dtmf_payload_type(self.dtmf_payload_type)
+            .with_codec(self.codec);
         self.next_ssrc = self.next_ssrc.wrapping_add(0x0101_0101).max(1);
         let session = RtpSession::from_socket_with_sink(
             socket,
@@ -423,6 +430,10 @@ impl Media for AudioMedia {
             None => self.ringer = None,
         }
         Ok(())
+    }
+
+    fn set_codec(&mut self, codec: Codec) {
+        self.codec = codec;
     }
 
     fn set_dtmf_payload_type(&mut self, payload_type: Option<u8>) {
