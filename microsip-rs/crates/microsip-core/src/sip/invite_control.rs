@@ -40,10 +40,14 @@ pub fn build_failure_ack(invite: &Request, response: &Response) -> Result<Reques
         return Err(problem("SIP versions do not match"));
     }
 
-    for name in ["call-id", "from"] {
-        if required(&invite.headers, name)? != required(&response.headers, name)? {
-            return Err(problem(format!("Response {name} does not match INVITE")));
-        }
+    if required(&invite.headers, "call-id")? != required(&response.headers, "call-id")? {
+        return Err(problem("Response call-id does not match INVITE"));
+    }
+    // Servers may rewrite the From address (Asterisk drops the port), so the
+    // caller is identified by the From tag, as RFC 3261 does.
+    let sent_tag = tag(required(&invite.headers, "from")?);
+    if sent_tag.is_none() || sent_tag != tag(required(&response.headers, "from")?) {
+        return Err(problem("Response from does not match INVITE"));
     }
 
     if parse_invite_cseq(required(&response.headers, "cseq")?)? != sequence {
@@ -108,6 +112,17 @@ fn validate_invite(invite: &Request) -> Result<u32> {
     required(&invite.headers, "to")?;
     required(&invite.headers, "call-id")?;
     parse_invite_cseq(required(&invite.headers, "cseq")?)
+}
+
+/// The `tag` parameter of a From or To value.
+fn tag(value: &str) -> Option<&str> {
+    let parameters = value.rsplit_once('>').map_or(value, |(_, rest)| rest);
+    parameters
+        .split(';')
+        .filter_map(|part| part.split_once('='))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("tag"))
+        .map(|(_, tag)| tag.trim())
+        .filter(|tag| !tag.is_empty())
 }
 
 fn required<'a>(headers: &'a Headers, name: &str) -> Result<&'a str> {
@@ -266,6 +281,26 @@ mod tests {
                 "header: {name}"
             );
         }
+    }
+
+    #[test]
+    fn ack_accepts_a_from_address_rewritten_by_the_server() {
+        let original = invite();
+        let mut reply = response(401);
+        // Same caller tag, different spelling of the address.
+        reply
+            .headers
+            .insert("from", "\"Alice\" <sip:alice@192.0.2.1>;tag=alice")
+            .expect("valid header");
+        let ack = build_failure_ack(&original, &reply).expect("valid ACK");
+        // The ACK repeats the From of the INVITE, not of the response.
+        assert_eq!(ack.headers.get("from"), original.headers.get("from"));
+
+        reply
+            .headers
+            .insert("from", "<sip:alice@local.test>")
+            .expect("valid header");
+        assert!(build_failure_ack(&original, &reply).is_err());
     }
 
     #[test]
