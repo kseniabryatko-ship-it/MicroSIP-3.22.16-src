@@ -1,5 +1,4 @@
 use std::io::{BufRead, BufReader, Write};
-use std::net::UdpSocket;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -15,16 +14,11 @@ struct Phone {
     seen: Vec<String>,
 }
 
-fn free_port() -> u16 {
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket.local_addr().unwrap().port()
-}
-
 impl Phone {
     fn start() -> Self {
-        let address = format!("127.0.0.1:{}", free_port());
+        // Port 0: the program picks a free port itself, so parallel tests cannot collide.
         let mut child = Command::new(env!("CARGO_BIN_EXE_phone-engine"))
-            .args([address.as_str(), "--no-audio"])
+            .args(["127.0.0.1:0", "--no-audio"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -44,9 +38,14 @@ impl Phone {
             child,
             stdin,
             lines,
-            address,
+            address: String::new(),
             seen: Vec::new(),
         };
+        let listening = phone.expect("Listening on ");
+        phone.address = listening
+            .trim_start_matches("Listening on ")
+            .trim()
+            .to_owned();
         phone.expect("Commands: call");
         phone
     }

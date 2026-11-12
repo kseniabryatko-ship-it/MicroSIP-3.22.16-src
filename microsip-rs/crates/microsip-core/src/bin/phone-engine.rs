@@ -13,6 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 const HELP: &str = "Usage: phone-engine.exe LOCAL_IP:SIP_PORT [--no-audio]\n\
+Port 0 picks a free port; the chosen address is printed on the first line.\n\
 Commands: call IP:PORT | answer | reject | hangup | status | quit\n\
 Direct UDP calls only; no registration or proxy. --no-audio runs without sound devices.";
 
@@ -179,8 +180,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let local: SocketAddr = positional[0].parse()?;
-    if local.ip().is_unspecified() || local.port() == 0 {
-        return Err("use a concrete local IP and a nonzero SIP port".into());
+    if local.ip().is_unspecified() {
+        return Err("use a concrete local IP, not 0.0.0.0".into());
     }
 
     let handle = if no_audio {
@@ -189,6 +190,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         spawn(local, "phone", AudioMedia::new)?
     };
 
+    // With port 0 the system chose the port; report the real address.
+    let local = handle.local_address();
     println!("Listening on {local}");
     println!("Commands: call IP:PORT | answer | reject | hangup | status | quit");
     if no_audio {

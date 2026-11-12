@@ -135,10 +135,7 @@ impl PhoneWindow {
     }
 
     fn poll(&mut self) {
-        loop {
-            let Some(event) = self.handle.as_ref().and_then(|handle| handle.try_event()) else {
-                break;
-            };
+        while let Some(event) = self.handle.as_ref().and_then(|handle| handle.try_event()) {
             self.view.on_event(&event);
             match event {
                 Event::Incoming { peer } => self.log(format!("Incoming call from {peer}")),
