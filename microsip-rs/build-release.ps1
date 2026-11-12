@@ -115,8 +115,7 @@ try {
 
     $binaries = @(
         'microsip-gui.exe',
-        'microsip-rs.exe',
-        'phone-console.exe'
+        'phone-engine.exe'
     )
     foreach ($name in $binaries) {
         if (-not (Test-Path -LiteralPath (Join-Path $release $name) -PathType Leaf)) {
@@ -142,56 +141,68 @@ try {
         Copy-Item -LiteralPath (Join-Path $release $name) -Destination $package
     }
 
-    Test-ConsoleHelp -Executable (Join-Path $package 'microsip-rs.exe')
-    Test-ConsoleHelp -Executable (Join-Path $package 'phone-console.exe')
+    Test-ConsoleHelp -Executable (Join-Path $package 'phone-engine.exe')
 
     $readme = @'
 MICROSIP RUST - GUI DEVELOPMENT PREVIEW
 ======================================
 
+CONTENTS
+--------
+microsip-gui.exe   - the phone with a window. It needs no other EXE.
+phone-engine.exe   - the same phone engine as a console program,
+                     for diagnostics and scripted tests.
+
 START
 -----
 Run microsip-gui.exe.
-Keep all three EXE files in the SAME directory.
-This preview uses the two console programs as child processes.
 
 LOCAL TEST WITH TWO WINDOWS
 ---------------------------
+Start microsip-gui.exe twice. Use headphones.
+
 Window A:
   Local IP:port = 127.0.0.1:5070
-  Click Listen for incoming calls.
+  Click Start phone.
 
 Window B:
   Local IP:port = 127.0.0.1:5072
+  Click Start phone.
   Remote IP:port = 127.0.0.1:5070
-  Choose call duration, then click Call.
+  Click Call.
 
 Window A:
-  Click Answer when Incoming call appears.
-  Use headphones and speak into the microphone.
-  Click Hang up, wait for Idle, then click Quit listener.
+  Click Answer (or Reject) when Incoming call appears.
+  Speak into the microphone.
 
-Outgoing calls currently finish after the selected duration
-or after a remote BYE. There is no GUI outgoing CANCEL yet.
+Either window:
+  Click Hang up to end the call. Window B can also click Hang up
+  before the answer to cancel the call.
+  Click Stop phone when finished.
 
-IMPORTANT
----------
-Do not close the GUI during an active call. Closing the window currently
-forces child-process cleanup, not a graceful SIP hangup.
+Closing a window or clicking Stop phone during a call ends the call
+with a SIP hangup; the other side reports Call ended: completed.
+
+CONSOLE PHONE
+-------------
+phone-engine.exe LOCAL_IP:SIP_PORT [--no-audio]
+Port 0 picks a free port; the chosen address is printed first.
+Commands: call IP:PORT, answer, reject, hangup, status, quit.
 
 FEATURES VERIFIED SEPARATELY BY LOCAL CALL TESTS
 -----------------------------------------------
-Direct UDP calls, manual incoming answer/rejection, PCMU/RTP audio,
-call termination and repeated incoming calls.
+Direct UDP calls with one call at a time, incoming answer and
+rejection, cancel before answer, hangup from either side,
+PCMU/RTP audio in both directions.
 
 LIMITATIONS
 -----------
-No provider registration in this GUI.
+No provider registration, proxy or account settings.
 No guarantee of NAT traversal or interoperability with third-party phones.
-No TLS/SRTP, installer, code signature or automatic updates.
-No claim of complete CANCEL or non-2xx ACK network handling.
+No TLS/SRTP, RTCP, jitter buffer, call hold or transfer.
+No installer, code signature or automatic updates.
 A successful build does not prove audio quality or a working real call.
-Do not expose the listener directly to an untrusted network.
+Do not expose the phone directly to an untrusted network.
 
 SYSTEM
 ------
