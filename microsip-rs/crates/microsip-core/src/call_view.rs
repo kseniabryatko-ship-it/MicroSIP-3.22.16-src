@@ -138,7 +138,10 @@ impl CallView {
                 self.phase = Phase::Idle;
                 self.last_end = Some(*reason);
             }
-            Event::Registration(_) | Event::Trace { .. } | Event::Error(_) => {}
+            Event::AudioQuality(_)
+            | Event::Registration(_)
+            | Event::Trace { .. }
+            | Event::Error(_) => {}
         }
     }
 }

@@ -346,6 +346,7 @@ impl PhoneWindow {
                 Event::MediaStats { sent, received } => {
                     self.log(format!("RTP sent: {sent}; RTP received: {received}"));
                 }
+                Event::AudioQuality(quality) => self.log(format!("Audio: {quality}")),
                 Event::Ended(reason) => self.log(format!("Call ended: {reason}")),
                 Event::Registration(state) => {
                     self.log(format!("Account: {state}"));

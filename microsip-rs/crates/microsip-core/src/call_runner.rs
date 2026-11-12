@@ -19,7 +19,7 @@
 //! module is not used here.
 
 use crate::call_engine::{Action, CallEngine, Command, Input, State};
-use crate::call_media::Media;
+use crate::call_media::{Media, MediaQuality};
 use crate::dialog::{DialogConfig, EstablishedDialog};
 use crate::invite_control::{build_cancel, build_failure_ack};
 use crate::registration::{Account, Output, Registration, RegistrationState, add_rport};
@@ -103,6 +103,9 @@ pub enum Event {
         sent: u64,
         received: u64,
     },
+    /// How well the received audio played, sent just before the media stops
+    /// when real audio was used.
+    AudioQuality(MediaQuality),
     Ended(EndReason),
     /// The account's registration changed state.
     Registration(RegistrationState),
@@ -771,6 +774,9 @@ impl<M: Media> Runner<M> {
                         sent: stats.sent_packets,
                         received: stats.received_packets,
                     });
+                    if let Some(quality) = self.media.quality() {
+                        self.emit(Event::AudioQuality(quality));
+                    }
                 }
                 self.media.stop();
                 self.media_running = false;

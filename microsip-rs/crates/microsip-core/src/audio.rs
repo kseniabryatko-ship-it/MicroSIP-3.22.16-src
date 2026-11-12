@@ -219,7 +219,7 @@ impl Speaker {
             channels: supported.channels(),
         };
 
-        let playout = Arc::new(Mutex::new(PlayoutBuffer::new(format.sample_rate)));
+        let playout = Arc::new(Mutex::new(PlayoutBuffer::adaptive(format.sample_rate)));
         let shared = || Arc::clone(&playout);
 
         let stream = match sample_format {
@@ -283,6 +283,14 @@ impl Speaker {
             .map_err(|_| AudioError::Channel("Speaker buffer is unusable".to_owned()))?
             .push(&converted);
         Ok(())
+    }
+
+    /// The largest playback reserve the connection has needed, in milliseconds.
+    pub fn largest_reserve_ms(&self) -> u32 {
+        self.playout
+            .lock()
+            .map(|playout| playout.largest_target_ms())
+            .unwrap_or(0)
     }
 
     /// How many times playback ran out of audio since the speaker started.

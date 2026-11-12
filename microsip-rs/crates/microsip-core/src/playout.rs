@@ -7,8 +7,14 @@
 //! starts, keeps playing from the reserve while packets are late, and when
 //! it does run dry it fades out and back in instead of cutting the sound.
 //!
-//! It is not a full jitter buffer: packets are played in arrival order, and
-//! a lost packet is a short silence, not concealed speech.
+//! Packet order and lost packets are handled before this buffer, in
+//! `rtp::order`; here only the timing is evened out.
+//!
+//! An adaptive buffer ([`PlayoutBuffer::adaptive`]) also learns from the
+//! connection: every time it runs dry it keeps a larger reserve, up to
+//! [`ADAPTIVE_LIMIT_MS`], and after a long quiet stretch it carefully shrinks
+//! the reserve again. A bad patch of network then costs one short gap
+//! instead of crackling for as long as it lasts.
 
 use std::collections::VecDeque;
 
@@ -19,10 +25,24 @@ pub const TARGET_MS: u32 = 80;
 pub const MAX_MS: u32 = 300;
 /// Length of the fade at the edges of a gap.
 const FADE_MS: u32 = 5;
+/// The largest reserve an adaptive buffer grows to.
+pub const ADAPTIVE_LIMIT_MS: u32 = 240;
+/// Growth of the reserve after each gap.
+const GROW_MS: u32 = 40;
+/// Reduction of the reserve after [`CALM_MS`] without a gap.
+const SHRINK_MS: u32 = 20;
+const CALM_MS: u32 = 30_000;
 
 #[derive(Debug)]
 pub struct PlayoutBuffer {
     queue: VecDeque<f32>,
+    sample_rate: u32,
+    adaptive: bool,
+    /// Current reserve in milliseconds; fixed unless adaptive.
+    target_ms: u32,
+    largest_target_ms: u32,
+    /// Samples played since the last gap or reserve change.
+    calm: u64,
     target: usize,
     max: usize,
     fade: usize,
@@ -41,6 +61,11 @@ impl PlayoutBuffer {
         };
         Self {
             queue: VecDeque::new(),
+            sample_rate,
+            adaptive: false,
+            target_ms: TARGET_MS,
+            largest_target_ms: TARGET_MS,
+            calm: 0,
             target: samples(TARGET_MS),
             max: samples(MAX_MS),
             fade: samples(FADE_MS),
@@ -49,6 +74,37 @@ impl PlayoutBuffer {
             underruns: 0,
             dropped: 0,
         }
+    }
+
+    /// A buffer that enlarges its reserve when the connection is uneven.
+    pub fn adaptive(sample_rate: u32) -> Self {
+        Self {
+            adaptive: true,
+            ..Self::new(sample_rate)
+        }
+    }
+
+    /// The reserve currently collected before playback starts.
+    pub fn target_ms(&self) -> u32 {
+        self.target_ms
+    }
+
+    /// The largest reserve this buffer has needed so far.
+    pub fn largest_target_ms(&self) -> u32 {
+        self.largest_target_ms
+    }
+
+    fn samples(&self, milliseconds: u32) -> usize {
+        (u64::from(self.sample_rate) * u64::from(milliseconds) / 1_000).max(1) as usize
+    }
+
+    fn set_target(&mut self, milliseconds: u32) {
+        self.target_ms = milliseconds;
+        self.largest_target_ms = self.largest_target_ms.max(milliseconds);
+        self.target = self.samples(milliseconds);
+        // The same head-room above the reserve as a fixed buffer has.
+        self.max = self.samples(milliseconds + MAX_MS - TARGET_MS);
+        self.calm = 0;
     }
 
     /// Adds received audio.
@@ -99,6 +155,19 @@ impl PlayoutBuffer {
             self.playing = false;
             self.fade_in_left = 0;
             self.underruns += 1;
+            if self.adaptive && self.target_ms < ADAPTIVE_LIMIT_MS {
+                self.set_target((self.target_ms + GROW_MS).min(ADAPTIVE_LIMIT_MS));
+            }
+            self.calm = 0;
+            return;
+        }
+
+        self.calm += output.len() as u64;
+        if self.adaptive
+            && self.target_ms > TARGET_MS
+            && self.calm >= u64::from(self.sample_rate) * u64::from(CALM_MS) / 1_000
+        {
+            self.set_target((self.target_ms - SHRINK_MS).max(TARGET_MS));
         }
     }
 
@@ -244,6 +313,78 @@ mod tests {
         let output = pull(&mut buffer, length);
         assert_eq!(output[FADE], (first_kept + FADE) as f32);
         assert_eq!(output[length - 1], (first_kept + length - 1) as f32);
+    }
+
+    /// Plays until the buffer runs dry once.
+    fn run_dry(buffer: &mut PlayoutBuffer) {
+        let before = buffer.underruns();
+        buffer.push(&vec![0.5; buffer.target_ms() as usize * 8]);
+        while buffer.underruns() == before {
+            pull(buffer, PACKET);
+        }
+    }
+
+    #[test]
+    fn fixed_buffer_never_changes_its_reserve() {
+        let mut buffer = PlayoutBuffer::new(RATE);
+        for _ in 0..5 {
+            run_dry(&mut buffer);
+        }
+        assert_eq!(buffer.target_ms(), TARGET_MS);
+        assert_eq!(buffer.largest_target_ms(), TARGET_MS);
+    }
+
+    #[test]
+    fn adaptive_buffer_grows_its_reserve_after_each_gap_up_to_the_limit() {
+        let mut buffer = PlayoutBuffer::adaptive(RATE);
+        assert_eq!(buffer.target_ms(), 80);
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            run_dry(&mut buffer);
+            seen.push(buffer.target_ms());
+        }
+        assert_eq!(seen, [120, 160, 200, 240, 240, 240]);
+
+        // The larger reserve is really waited for: 200 ms is not enough now.
+        buffer.push(&[0.5; 1_600]);
+        assert_eq!(pull(&mut buffer, PACKET), vec![0.0; PACKET]);
+        buffer.push(&[0.5; 320]);
+        assert!(
+            pull(&mut buffer, PACKET)
+                .iter()
+                .any(|sample| *sample != 0.0)
+        );
+    }
+
+    #[test]
+    fn adaptive_buffer_shrinks_slowly_after_a_long_calm_stretch() {
+        let mut buffer = PlayoutBuffer::adaptive(RATE);
+        run_dry(&mut buffer);
+        run_dry(&mut buffer);
+        assert_eq!(buffer.target_ms(), 160);
+
+        // Steady playback: one packet in, one packet out.
+        buffer.push(&[0.5; 1_280]);
+        let play = |packets: usize, buffer: &mut PlayoutBuffer| {
+            for _ in 0..packets {
+                buffer.push(&[0.5; PACKET]);
+                pull(buffer, PACKET);
+            }
+        };
+        // Just under 30 seconds: nothing changes yet.
+        play(1_499, &mut buffer);
+        assert_eq!(buffer.target_ms(), 160);
+        play(1, &mut buffer);
+        assert_eq!(buffer.target_ms(), 140);
+        play(1_500, &mut buffer);
+        assert_eq!(buffer.target_ms(), 120);
+        play(3_000, &mut buffer);
+        assert_eq!(buffer.target_ms(), 80);
+        play(3_000, &mut buffer);
+        assert_eq!(buffer.target_ms(), 80);
+
+        assert_eq!(buffer.underruns(), 2);
+        assert_eq!(buffer.largest_target_ms(), 160);
     }
 
     #[test]

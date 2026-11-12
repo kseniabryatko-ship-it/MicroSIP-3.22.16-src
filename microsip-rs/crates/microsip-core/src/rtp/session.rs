@@ -1,3 +1,4 @@
+use crate::rtp::order::{OrderStats, PacketOrderer, Released};
 use crate::rtp::{PCMU_PAYLOAD_TYPE, PcmuStream, RtpError, RtpPacket, decode_pcmu};
 use std::error::Error;
 use std::fmt;
@@ -5,7 +6,7 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     mpsc::{self, Receiver, SyncSender, TryRecvError},
 };
 use std::thread::{self, JoinHandle};
@@ -115,6 +116,7 @@ pub struct RtpSession {
     stop: Arc<AtomicBool>,
     sent_packets: Arc<AtomicU64>,
     received_packets: Arc<AtomicU64>,
+    order_stats: Arc<Mutex<OrderStats>>,
     sender_thread: Option<JoinHandle<Result<(), RtpSessionError>>>,
     receiver_thread: Option<JoinHandle<Result<(), RtpSessionError>>>,
 }
@@ -170,6 +172,8 @@ impl RtpSession {
         let receiver_stop = Arc::clone(&stop);
         let received_packets = Arc::new(AtomicU64::new(0));
         let receiver_counter = Arc::clone(&received_packets);
+        let order_stats = Arc::new(Mutex::new(OrderStats::default()));
+        let receiver_order_stats = Arc::clone(&order_stats);
 
         let receiver_thread = thread::spawn(move || {
             run_receiver(
@@ -178,6 +182,7 @@ impl RtpSession {
                 decoded_sender,
                 receiver_stop,
                 receiver_counter,
+                receiver_order_stats,
             )
         });
 
@@ -189,6 +194,7 @@ impl RtpSession {
             stop,
             sent_packets,
             received_packets,
+            order_stats,
             sender_thread: Some(sender_thread),
             receiver_thread: Some(receiver_thread),
         })
@@ -227,6 +233,14 @@ impl RtpSession {
 
     pub fn received_packets(&self) -> u64 {
         self.received_packets.load(Ordering::Acquire)
+    }
+
+    /// Lost, reordered and discarded packets of the received stream.
+    pub fn order_stats(&self) -> OrderStats {
+        self.order_stats
+            .lock()
+            .map(|stats| *stats)
+            .unwrap_or_default()
     }
 
     pub fn shutdown(&mut self) -> Result<(), RtpSessionError> {
@@ -293,8 +307,12 @@ fn run_receiver(
     decoded_sender: mpsc::Sender<Vec<f32>>,
     stop: Arc<AtomicBool>,
     received_packets: Arc<AtomicU64>,
+    order_stats: Arc<Mutex<OrderStats>>,
 ) -> Result<(), RtpSessionError> {
     let mut buffer = [0_u8; 65_535];
+    let mut orderer = PacketOrderer::<Vec<f32>>::default();
+    // The last packet played, for covering a lost one.
+    let mut previous: Option<Vec<f32>> = None;
 
     while !stop.load(Ordering::Acquire) {
         match socket.recv_from(&mut buffer) {
@@ -317,13 +335,29 @@ fn run_receiver(
                     continue;
                 }
 
-                let samples = decode_pcmu(&packet.payload);
-
                 received_packets.fetch_add(1, Ordering::Relaxed);
 
-                decoded_sender
-                    .send(samples)
-                    .map_err(|_| RtpSessionError::DecodedChannelDisconnected)?;
+                let samples = decode_pcmu(&packet.payload);
+                for released in orderer.push(packet.ssrc, packet.sequence_number, samples) {
+                    let samples = match released {
+                        Released::Packet(samples) => {
+                            previous = Some(samples.clone());
+                            samples
+                        }
+                        // Cover one lost packet with a quieter copy of the
+                        // packet before it; a longer loss becomes silence.
+                        Released::Lost => match previous.take() {
+                            Some(last) => last.iter().map(|sample| sample * 0.5).collect(),
+                            None => continue,
+                        },
+                    };
+                    decoded_sender
+                        .send(samples)
+                        .map_err(|_| RtpSessionError::DecodedChannelDisconnected)?;
+                }
+                if let Ok(mut stats) = order_stats.lock() {
+                    *stats = orderer.stats();
+                }
             }
 
             Err(error)
@@ -449,6 +483,71 @@ mod tests {
         assert_eq!(first.len(), 80);
         assert_eq!(second.len(), 240);
         assert_eq!(receiver.received_packets(), 2);
+        receiver.shutdown().expect("receiver should stop cleanly");
+    }
+
+    #[test]
+    fn swapped_duplicated_and_lost_packets_are_repaired() {
+        let config = RtpSessionConfig::new(
+            "127.0.0.1:0".parse::<SocketAddr>().expect("valid address"),
+            48_000,
+        )
+        .with_expected_source(None);
+        let mut receiver = RtpSession::bind(
+            "127.0.0.1:0".parse::<SocketAddr>().expect("valid address"),
+            config,
+            0x6666_6666,
+        )
+        .expect("receiver session should start");
+        let target = receiver.local_address().expect("address should exist");
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("peer should bind");
+
+        // Every packet carries its own constant level, so the order of the
+        // decoded audio shows the order of play.
+        let levels = [0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        let send = |sequence_number: u16| {
+            let payload = crate::rtp::encode_pcmu(&[levels[usize::from(sequence_number)]; 160]);
+            let bytes = RtpPacket {
+                marker: false,
+                payload_type: PCMU_PAYLOAD_TYPE,
+                sequence_number,
+                timestamp: u32::from(sequence_number) * 160,
+                ssrc: 9,
+                payload,
+            }
+            .serialize()
+            .expect("packet should serialize");
+            peer.send_to(&bytes, target).expect("send");
+            // Keep the arrival order of these datagrams.
+            thread::sleep(Duration::from_millis(5));
+        };
+        // 2 and 1 swapped, 3 twice, 4 lost.
+        for sequence_number in [0, 2, 1, 3, 3, 5, 6, 7] {
+            send(sequence_number);
+        }
+
+        let mut played = Vec::new();
+        while let Some(samples) = wait_for_decoded(&receiver) {
+            assert_eq!(samples.len(), 160);
+            played.push(samples[0]);
+            if played.len() == 8 {
+                break;
+            }
+        }
+        let near = |value: f32, expected: f32| (value - expected).abs() < 0.03;
+        assert_eq!(played.len(), 8, "{played:?}");
+        for (index, expected) in [0.1, 0.2, 0.3, 0.4].into_iter().enumerate() {
+            assert!(near(played[index], expected), "{played:?}");
+        }
+        // The lost packet is covered by a half-level copy of the one before.
+        assert!(near(played[4], 0.2), "{played:?}");
+        for (index, expected) in [0.6, 0.7, 0.8].into_iter().enumerate() {
+            assert!(near(played[5 + index], expected), "{played:?}");
+        }
+
+        let stats = receiver.order_stats();
+        assert_eq!(stats.lost, 1);
+        assert_eq!(stats.discarded, 1);
         receiver.shutdown().expect("receiver should stop cleanly");
     }
 

@@ -16,6 +16,31 @@ pub struct MediaStats {
     pub received_packets: u64,
 }
 
+/// How well the received audio could be played.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MediaQuality {
+    /// Times playback ran out of audio and paused.
+    pub gaps: u64,
+    /// Packets that never arrived in time.
+    pub lost: u64,
+    /// Packets that arrived out of order and were put back in place.
+    pub reordered: u64,
+    /// Duplicates and packets that arrived too late to play.
+    pub discarded: u64,
+    /// The largest playback reserve the connection needed, in milliseconds.
+    pub reserve_ms: u32,
+}
+
+impl std::fmt::Display for MediaQuality {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "gaps {}, lost packets {}, reordered {}, discarded {}, reserve {} ms",
+            self.gaps, self.lost, self.reordered, self.discarded, self.reserve_ms
+        )
+    }
+}
+
 /// Media for one call at a time.
 ///
 /// Implementations are created on the executor thread and are never moved
@@ -36,6 +61,11 @@ pub trait Media {
     /// Packet counters of the running session; zeros when none runs.
     fn stats(&self) -> MediaStats {
         MediaStats::default()
+    }
+
+    /// Quality of the received audio; `None` when this media plays nothing.
+    fn quality(&self) -> Option<MediaQuality> {
+        None
     }
 
     /// Stops audio and releases devices. Safe to call when not started.
@@ -135,6 +165,18 @@ impl Media for AudioMedia {
                 received_packets: active.session.received_packets(),
             })
             .unwrap_or_default()
+    }
+
+    fn quality(&self) -> Option<MediaQuality> {
+        let active = self.active.as_ref()?;
+        let order = active.session.order_stats();
+        Some(MediaQuality {
+            gaps: active.speaker.underruns(),
+            lost: order.lost,
+            reordered: order.reordered,
+            discarded: order.discarded,
+            reserve_ms: active.speaker.largest_reserve_ms(),
+        })
     }
 
     fn stop(&mut self) {

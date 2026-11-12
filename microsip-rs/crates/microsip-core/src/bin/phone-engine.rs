@@ -85,6 +85,7 @@ impl Phone {
             Event::MediaStats { sent, received } => {
                 println!("RTP sent: {sent}; RTP received: {received}");
             }
+            Event::AudioQuality(quality) => println!("Audio quality: {quality}"),
             Event::Ended(reason) => {
                 self.state = State::Idle;
                 println!("Call ended: {}", describe(reason));
