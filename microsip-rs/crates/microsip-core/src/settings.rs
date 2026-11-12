@@ -19,6 +19,8 @@ pub struct Settings {
     pub server: String,
     pub domain: String,
     pub user: String,
+    /// Login for authorization when it differs from `user`; usually empty.
+    pub auth_user: String,
 }
 
 impl Default for Settings {
@@ -29,6 +31,7 @@ impl Default for Settings {
             server: String::new(),
             domain: String::new(),
             user: String::new(),
+            auth_user: String::new(),
         }
     }
 }
@@ -55,6 +58,7 @@ impl Settings {
                 "server" => settings.server = value,
                 "domain" => settings.domain = value,
                 "user" => settings.user = value,
+                "auth_user" => settings.auth_user = value,
                 _ => {}
             }
         }
@@ -70,6 +74,7 @@ impl Settings {
             ("server", &self.server),
             ("domain", &self.domain),
             ("user", &self.user),
+            ("auth_user", &self.auth_user),
         ] {
             text.push_str(key);
             text.push('=');
@@ -140,6 +145,7 @@ mod tests {
             server: "pbx.example.com:5080".to_owned(),
             domain: "example.com".to_owned(),
             user: "alice".to_owned(),
+            auth_user: "alice-login".to_owned(),
         }
     }
 
@@ -168,7 +174,8 @@ mod tests {
             text,
             "# MicroSIP Rust settings. The password is never stored here.\n\
              local=192.168.1.5:5060\nremote=192.168.1.9:5060\n\
-             server=pbx.example.com:5080\ndomain=example.com\nuser=alice\n"
+             server=pbx.example.com:5080\ndomain=example.com\nuser=alice\n\
+             auth_user=alice-login\n"
         );
         assert!(!text.contains("password="));
     }
@@ -183,6 +190,8 @@ mod tests {
         assert_eq!(settings.local, "10.0.0.1:5060");
         assert_eq!(settings.remote, Settings::default().remote);
         assert_eq!(settings.domain, "");
+        // A file written before `auth_user` existed has no such line.
+        assert_eq!(settings.auth_user, "");
     }
 
     #[test]

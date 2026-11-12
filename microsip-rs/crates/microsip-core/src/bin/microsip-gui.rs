@@ -22,7 +22,9 @@ struct PhoneWindow {
     remote: String,
     server: String,
     user: String,
+    auth_user: String,
     password: String,
+    show_password: bool,
     domain: String,
     registration: Option<RegistrationState>,
     handle: Option<CallHandle>,
@@ -80,7 +82,9 @@ impl PhoneWindow {
             remote: saved.remote.clone(),
             server: saved.server.clone(),
             user: saved.user.clone(),
+            auth_user: saved.auth_user.clone(),
             password: String::new(),
+            show_password: false,
             domain: saved.domain.clone(),
             registration: None,
             handle: None,
@@ -106,6 +110,7 @@ impl PhoneWindow {
             server: self.server.trim().to_owned(),
             domain: self.domain.trim().to_owned(),
             user: self.user.trim().to_owned(),
+            auth_user: self.auth_user.trim().to_owned(),
         };
         if current == self.saved {
             return;
@@ -210,8 +215,11 @@ impl PhoneWindow {
             return self.error(error);
         }
         self.save_settings();
-        let account = Account::new(self.server.trim(), self.user.trim(), self.password.clone())
-            .with_domain(self.domain.trim());
+        // A password pasted from elsewhere often carries a stray space or
+        // line break at either end; the server would refuse it.
+        let account = Account::new(self.server.trim(), self.user.trim(), self.password.trim())
+            .with_domain(self.domain.trim())
+            .with_auth_username(self.auth_user.trim());
         // The password is never written to the log.
         self.log(format!(
             "> register {} on {}",
@@ -424,8 +432,17 @@ impl eframe::App for PhoneWindow {
                 ui.horizontal(|ui| {
                     ui.label("User");
                     ui.text_edit_singleline(&mut self.user);
+                    ui.label("Login (if different)");
+                    ui.text_edit_singleline(&mut self.auth_user);
+                });
+                ui.horizontal(|ui| {
                     ui.label("Password");
-                    ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.password)
+                            .password(!self.show_password),
+                    );
+                    ui.checkbox(&mut self.show_password, "Show");
+                    ui.label(format!("{} characters", self.password.trim().chars().count()));
                 });
             });
             ui.horizontal(|ui| {
