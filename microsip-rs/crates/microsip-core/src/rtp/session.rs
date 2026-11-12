@@ -13,6 +13,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const SAMPLE_QUEUE_CAPACITY: usize = 256;
+
+/// Receives decoded audio on the receiver thread; see
+/// [`RtpSession::from_socket_with_sink`].
+pub type DecodedSink = Box<dyn FnMut(Vec<f32>) + Send>;
 const DEFAULT_RECEIVE_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
@@ -137,6 +141,18 @@ impl RtpSession {
         config: RtpSessionConfig,
         ssrc: u32,
     ) -> Result<Self, RtpSessionError> {
+        Self::from_socket_with_sink(socket, config, ssrc, None)
+    }
+
+    /// Like [`RtpSession::from_socket`], but decoded audio is handed to
+    /// `sink` on the receiver thread the moment it is ready, instead of
+    /// waiting to be fetched with [`RtpSession::try_receive_decoded`].
+    pub fn from_socket_with_sink(
+        socket: UdpSocket,
+        config: RtpSessionConfig,
+        ssrc: u32,
+        sink: Option<DecodedSink>,
+    ) -> Result<Self, RtpSessionError> {
         let RtpSessionConfig {
             remote_address,
             expected_source,
@@ -153,6 +169,9 @@ impl RtpSession {
         let sent_packets = Arc::new(AtomicU64::new(0));
         let sender_counter = Arc::clone(&sent_packets);
 
+        let stop = Arc::new(AtomicBool::new(false));
+        let sender_stop = Arc::clone(&stop);
+
         let sender_thread = thread::spawn(move || {
             run_sender(
                 sender_socket,
@@ -160,6 +179,7 @@ impl RtpSession {
                 pcmu_stream,
                 remote_address,
                 sender_counter,
+                sender_stop,
             )
         });
 
@@ -168,7 +188,6 @@ impl RtpSession {
 
         let (decoded_sender, decoded_receiver) = mpsc::channel::<Vec<f32>>();
 
-        let stop = Arc::new(AtomicBool::new(false));
         let receiver_stop = Arc::clone(&stop);
         let received_packets = Arc::new(AtomicU64::new(0));
         let receiver_counter = Arc::clone(&received_packets);
@@ -183,6 +202,7 @@ impl RtpSession {
                 receiver_stop,
                 receiver_counter,
                 receiver_order_stats,
+                sink,
             )
         });
 
@@ -219,6 +239,13 @@ impl RtpSession {
             .map_err(|_| RtpSessionError::SampleChannelDisconnected)
     }
 
+    /// A second input for microphone samples that another thread may own,
+    /// for example the sound card's callback. Use `try_send` there so the
+    /// audio thread never waits.
+    pub fn pcm_input(&self) -> Option<SyncSender<Vec<f32>>> {
+        self.sample_sender.clone()
+    }
+
     pub fn try_receive_decoded(&self) -> Result<Option<Vec<f32>>, RtpSessionError> {
         match self.decoded_samples.try_recv() {
             Ok(samples) => Ok(Some(samples)),
@@ -245,6 +272,9 @@ impl RtpSession {
 
     pub fn shutdown(&mut self) -> Result<(), RtpSessionError> {
         drop(self.sample_sender.take());
+        // Copies of the input handed out by `pcm_input` may still exist, so
+        // the sender is told to stop instead of waiting for them to go away.
+        self.stop.store(true, Ordering::Release);
 
         let sender_result = if let Some(handle) = self.sender_thread.take() {
             match handle.join() {
@@ -285,8 +315,19 @@ fn run_sender(
     mut pcmu_stream: PcmuStream,
     remote_address: SocketAddr,
     sent_packets: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
 ) -> Result<(), RtpSessionError> {
-    while let Ok(samples) = samples.recv() {
+    loop {
+        let samples = match samples.recv_timeout(Duration::from_millis(50)) {
+            Ok(samples) => samples,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let packets = pcmu_stream.push_pcm(&samples);
 
         for packet in packets {
@@ -308,6 +349,7 @@ fn run_receiver(
     stop: Arc<AtomicBool>,
     received_packets: Arc<AtomicU64>,
     order_stats: Arc<Mutex<OrderStats>>,
+    mut sink: Option<DecodedSink>,
 ) -> Result<(), RtpSessionError> {
     let mut buffer = [0_u8; 65_535];
     let mut orderer = PacketOrderer::<Vec<f32>>::default();
@@ -351,9 +393,12 @@ fn run_receiver(
                             None => continue,
                         },
                     };
-                    decoded_sender
-                        .send(samples)
-                        .map_err(|_| RtpSessionError::DecodedChannelDisconnected)?;
+                    match sink.as_mut() {
+                        Some(sink) => sink(samples),
+                        None => decoded_sender
+                            .send(samples)
+                            .map_err(|_| RtpSessionError::DecodedChannelDisconnected)?,
+                    }
                 }
                 if let Ok(mut stats) = order_stats.lock() {
                     *stats = orderer.stats();
@@ -548,6 +593,52 @@ mod tests {
         let stats = receiver.order_stats();
         assert_eq!(stats.lost, 1);
         assert_eq!(stats.discarded, 1);
+        receiver.shutdown().expect("receiver should stop cleanly");
+    }
+
+    #[test]
+    fn sink_and_second_input_carry_audio_without_polling() {
+        let (heard_sender, heard) = mpsc::channel::<usize>();
+        let config = RtpSessionConfig::new(
+            "127.0.0.1:0".parse::<SocketAddr>().expect("valid address"),
+            48_000,
+        )
+        .with_expected_source(None);
+        let receiver_socket = UdpSocket::bind("127.0.0.1:0").expect("socket should bind");
+        let mut receiver = RtpSession::from_socket_with_sink(
+            receiver_socket,
+            config,
+            0x7777_7777,
+            Some(Box::new(move |samples| {
+                let _ = heard_sender.send(samples.len());
+            })),
+        )
+        .expect("receiver session should start");
+        let target = receiver.local_address().expect("address should exist");
+
+        let mut sender = RtpSession::bind(
+            "127.0.0.1:0".parse::<SocketAddr>().expect("valid address"),
+            RtpSessionConfig::new(target, 48_000),
+            0x8888_8888,
+        )
+        .expect("sender session should start");
+
+        // The way a sound card callback feeds the session.
+        let input = sender.pcm_input().expect("input should exist");
+        input.try_send(vec![0.25; 960]).expect("queue has room");
+
+        let length = heard
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the sink should get the packet");
+        assert_eq!(length, PCMU_SAMPLES_PER_PACKET);
+        // With a sink nothing is left to fetch.
+        assert!(matches!(receiver.try_receive_decoded(), Ok(None)));
+
+        // The extra input is still alive, yet shutdown must not hang.
+        let started = std::time::Instant::now();
+        sender.shutdown().expect("sender should stop cleanly");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(input.try_send(vec![0.0; 960]).is_err());
         receiver.shutdown().expect("receiver should stop cleanly");
     }
 

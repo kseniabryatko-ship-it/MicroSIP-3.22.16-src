@@ -3,6 +3,7 @@ pub mod call_engine;
 pub mod call_media;
 pub mod call_runner;
 pub mod call_view;
+pub mod gain;
 pub mod playout;
 pub mod registration;
 pub mod resample;

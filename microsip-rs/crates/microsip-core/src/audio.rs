@@ -4,7 +4,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::cell::RefCell;
 use std::error::Error;
 use std::fmt;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -121,11 +121,40 @@ pub struct AudioFormat {
 pub struct Microphone {
     _stream: cpal::Stream,
     format: AudioFormat,
-    receiver: Receiver<Vec<f32>>,
+    /// `None` when the samples go to a sink given to [`Microphone::start_with`].
+    receiver: Option<Receiver<Vec<f32>>>,
 }
 
 impl Microphone {
+    /// Format of the default microphone, without starting it.
+    pub fn input_format() -> Result<AudioFormat, AudioError> {
+        let supported = cpal::default_host()
+            .default_input_device()
+            .ok_or(AudioError::NoInputDevice)?
+            .default_input_config()
+            .map_err(|error| AudioError::Configuration(error.to_string()))?;
+        Ok(AudioFormat {
+            sample_rate: supported.sample_rate().0,
+            channels: supported.channels(),
+        })
+    }
+
+    /// Starts the microphone; samples are read with [`Microphone::read_chunk`].
     pub fn start() -> Result<Self, AudioError> {
+        let (sender, receiver) = mpsc::channel();
+        let mut microphone = Self::start_with(move |samples| {
+            let _ = sender.send(samples);
+        })?;
+        microphone.receiver = Some(receiver);
+        Ok(microphone)
+    }
+
+    /// Starts the microphone and hands every captured block of mono samples
+    /// to `sink`, on the sound card's own thread. The sink must not block.
+    pub fn start_with<F>(sink: F) -> Result<Self, AudioError>
+    where
+        F: FnMut(Vec<f32>) + Send + 'static,
+    {
         let host = cpal::default_host();
 
         let device = host
@@ -143,22 +172,20 @@ impl Microphone {
             channels: supported.channels(),
         };
 
-        let (sender, receiver) = mpsc::channel();
-
         let stream = match sample_format {
-            cpal::SampleFormat::I8 => build_input_stream::<i8>(&device, supported.into(), sender)?,
+            cpal::SampleFormat::I8 => build_input_stream::<i8, F>(&device, supported.into(), sink)?,
             cpal::SampleFormat::I16 => {
-                build_input_stream::<i16>(&device, supported.into(), sender)?
+                build_input_stream::<i16, F>(&device, supported.into(), sink)?
             }
             cpal::SampleFormat::I32 => {
-                build_input_stream::<i32>(&device, supported.into(), sender)?
+                build_input_stream::<i32, F>(&device, supported.into(), sink)?
             }
             cpal::SampleFormat::F32 => {
-                build_input_stream::<f32>(&device, supported.into(), sender)?
+                build_input_stream::<f32, F>(&device, supported.into(), sink)?
             }
-            cpal::SampleFormat::U8 => build_input_stream::<u8>(&device, supported.into(), sender)?,
+            cpal::SampleFormat::U8 => build_input_stream::<u8, F>(&device, supported.into(), sink)?,
             cpal::SampleFormat::U16 => {
-                build_input_stream::<u16>(&device, supported.into(), sender)?
+                build_input_stream::<u16, F>(&device, supported.into(), sink)?
             }
             _ => {
                 return Err(AudioError::UnsupportedFormat("microphone"));
@@ -172,7 +199,7 @@ impl Microphone {
         Ok(Self {
             _stream: stream,
             format,
-            receiver,
+            receiver: None,
         })
     }
 
@@ -181,7 +208,10 @@ impl Microphone {
     }
 
     pub fn read_chunk(&self) -> Result<Option<Vec<f32>>, AudioError> {
-        match self.receiver.try_recv() {
+        let Some(receiver) = self.receiver.as_ref() else {
+            return Ok(None);
+        };
+        match receiver.try_recv() {
             Ok(samples) => Ok(Some(samples)),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err(AudioError::Channel(
@@ -196,8 +226,43 @@ pub struct Speaker {
     format: AudioFormat,
     /// Shared with the sound card's callback.
     playout: Arc<Mutex<PlayoutBuffer>>,
+    /// Used by [`Speaker::play_mono`].
+    own_sink: RefCell<SpeakerSink>,
+}
+
+/// The input side of a [`Speaker`]. It can be moved to another thread, so
+/// received audio reaches the sound card without passing through anything
+/// that might be busy.
+pub struct SpeakerSink {
+    playout: Arc<Mutex<PlayoutBuffer>>,
+    device_rate: u32,
     /// Kept between calls so consecutive packets join without a click.
-    resampler: RefCell<Option<(u32, Resampler)>>,
+    resampler: Option<(u32, Resampler)>,
+}
+
+impl SpeakerSink {
+    /// Queues mono samples recorded at `source_sample_rate` for playback.
+    pub fn push(&mut self, samples: &[f32], source_sample_rate: u32) -> Result<(), AudioError> {
+        // One converter per stream; a new one only if the source rate changes.
+        if self
+            .resampler
+            .as_ref()
+            .is_none_or(|(rate, _)| *rate != source_sample_rate)
+        {
+            let created = Resampler::new(source_sample_rate, self.device_rate)
+                .ok_or_else(|| AudioError::Configuration("Invalid sample rate".to_owned()))?;
+            self.resampler = Some((source_sample_rate, created));
+        }
+        let converted = match self.resampler.as_mut() {
+            Some((_, resampler)) => resampler.push(samples),
+            None => return Ok(()),
+        };
+        self.playout
+            .lock()
+            .map_err(|_| AudioError::Channel("Speaker buffer is unusable".to_owned()))?
+            .push(&converted);
+        Ok(())
+    }
 }
 
 impl Speaker {
@@ -250,12 +315,27 @@ impl Speaker {
             .play()
             .map_err(|error| AudioError::Stream(error.to_string()))?;
 
+        let own_sink = RefCell::new(SpeakerSink {
+            playout: Arc::clone(&playout),
+            device_rate: format.sample_rate,
+            resampler: None,
+        });
         Ok(Self {
             _stream: stream,
             format,
             playout,
-            resampler: RefCell::new(None),
+            own_sink,
         })
+    }
+
+    /// A separate input for this speaker that another thread may own. Use
+    /// either it or [`Speaker::play_mono`] for one stream, not both.
+    pub fn sink(&self) -> SpeakerSink {
+        SpeakerSink {
+            playout: Arc::clone(&self.playout),
+            device_rate: self.format.sample_rate,
+            resampler: None,
+        }
     }
 
     pub fn format(&self) -> AudioFormat {
@@ -263,26 +343,7 @@ impl Speaker {
     }
 
     pub fn play_mono(&self, samples: &[f32], source_sample_rate: u32) -> Result<(), AudioError> {
-        let mut resampler = self.resampler.borrow_mut();
-        // One converter per stream; a new one only if the source rate changes.
-        if resampler
-            .as_ref()
-            .is_none_or(|(rate, _)| *rate != source_sample_rate)
-        {
-            let created = Resampler::new(source_sample_rate, self.format.sample_rate)
-                .ok_or_else(|| AudioError::Configuration("Invalid sample rate".to_owned()))?;
-            *resampler = Some((source_sample_rate, created));
-        }
-        let converted = match resampler.as_mut() {
-            Some((_, resampler)) => resampler.push(samples),
-            None => return Ok(()),
-        };
-
-        self.playout
-            .lock()
-            .map_err(|_| AudioError::Channel("Speaker buffer is unusable".to_owned()))?
-            .push(&converted);
-        Ok(())
+        self.own_sink.borrow_mut().push(samples, source_sample_rate)
     }
 
     /// The largest playback reserve the connection has needed, in milliseconds.
@@ -302,13 +363,14 @@ impl Speaker {
     }
 }
 
-fn build_input_stream<S>(
+fn build_input_stream<S, F>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
-    sender: Sender<Vec<f32>>,
+    mut sink: F,
 ) -> Result<cpal::Stream, AudioError>
 where
     S: cpal::SizedSample + AudioSample,
+    F: FnMut(Vec<f32>) + Send + 'static,
 {
     let channels = config.channels as usize;
 
@@ -322,16 +384,7 @@ where
         .build_input_stream(
             &config,
             move |data: &[S], _: &cpal::InputCallbackInfo| {
-                let mono = data
-                    .chunks_exact(channels)
-                    .map(|frame| {
-                        let sum: f32 = frame.iter().map(|sample| S::to_f32(*sample)).sum();
-
-                        sum / channels as f32
-                    })
-                    .collect::<Vec<f32>>();
-
-                let _ = sender.send(mono);
+                sink(mix_to_mono(data, channels));
             },
             move |error| {
                 eprintln!("Microphone callback error: {error}");
@@ -341,6 +394,26 @@ where
         .map_err(|error| AudioError::Stream(error.to_string()))?;
 
     Ok(stream)
+}
+
+/// One sample per frame: the channel with the strongest signal. Many
+/// "stereo" microphones carry the voice on one channel only; averaging the
+/// channels would then halve the level.
+fn mix_to_mono<S: AudioSample>(data: &[S], channels: usize) -> Vec<f32> {
+    data.chunks_exact(channels)
+        .map(|frame| {
+            frame
+                .iter()
+                .map(|sample| S::to_f32(*sample))
+                .fold(0.0_f32, |strongest, sample| {
+                    if sample.abs() > strongest.abs() {
+                        sample
+                    } else {
+                        strongest
+                    }
+                })
+        })
+        .collect()
 }
 
 fn build_output_stream<S>(
@@ -404,6 +477,19 @@ mod tests {
         let output = resample_mono(&input, 48_000, 24_000);
 
         assert_eq!(output.len(), 4);
+    }
+
+    #[test]
+    fn mono_mix_takes_the_strongest_channel_of_each_frame() {
+        // Voice on the left channel only, as many headsets deliver it.
+        let stereo = [0.5_f32, 0.0, -0.4, 0.0, 0.0, 0.0];
+        assert_eq!(mix_to_mono(&stereo, 2), [0.5, -0.4, 0.0]);
+        // Both channels alike: the level is unchanged.
+        let stereo = [0.3_f32, 0.3, -0.2, -0.2];
+        assert_eq!(mix_to_mono(&stereo, 2), [0.3, -0.2]);
+        // Mono passes through; an incomplete last frame is ignored.
+        assert_eq!(mix_to_mono(&[0.1_f32, 0.2], 1), [0.1, 0.2]);
+        assert_eq!(mix_to_mono(&[1_i16, 2, 3], 2).len(), 1);
     }
 
     #[test]
