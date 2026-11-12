@@ -1,8 +1,11 @@
+use crate::playout::PlayoutBuffer;
+use crate::resample::Resampler;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::collections::VecDeque;
+use std::cell::RefCell;
 use std::error::Error;
 use std::fmt;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub enum AudioError {
@@ -191,7 +194,10 @@ impl Microphone {
 pub struct Speaker {
     _stream: cpal::Stream,
     format: AudioFormat,
-    sender: Sender<Vec<f32>>,
+    /// Shared with the sound card's callback.
+    playout: Arc<Mutex<PlayoutBuffer>>,
+    /// Kept between calls so consecutive packets join without a click.
+    resampler: RefCell<Option<(u32, Resampler)>>,
 }
 
 impl Speaker {
@@ -213,26 +219,27 @@ impl Speaker {
             channels: supported.channels(),
         };
 
-        let (sender, receiver) = mpsc::channel();
+        let playout = Arc::new(Mutex::new(PlayoutBuffer::new(format.sample_rate)));
+        let shared = || Arc::clone(&playout);
 
         let stream = match sample_format {
             cpal::SampleFormat::I8 => {
-                build_output_stream::<i8>(&device, supported.into(), receiver)?
+                build_output_stream::<i8>(&device, supported.into(), shared())?
             }
             cpal::SampleFormat::I16 => {
-                build_output_stream::<i16>(&device, supported.into(), receiver)?
+                build_output_stream::<i16>(&device, supported.into(), shared())?
             }
             cpal::SampleFormat::I32 => {
-                build_output_stream::<i32>(&device, supported.into(), receiver)?
+                build_output_stream::<i32>(&device, supported.into(), shared())?
             }
             cpal::SampleFormat::F32 => {
-                build_output_stream::<f32>(&device, supported.into(), receiver)?
+                build_output_stream::<f32>(&device, supported.into(), shared())?
             }
             cpal::SampleFormat::U8 => {
-                build_output_stream::<u8>(&device, supported.into(), receiver)?
+                build_output_stream::<u8>(&device, supported.into(), shared())?
             }
             cpal::SampleFormat::U16 => {
-                build_output_stream::<u16>(&device, supported.into(), receiver)?
+                build_output_stream::<u16>(&device, supported.into(), shared())?
             }
             _ => {
                 return Err(AudioError::UnsupportedFormat("speaker"));
@@ -246,7 +253,8 @@ impl Speaker {
         Ok(Self {
             _stream: stream,
             format,
-            sender,
+            playout,
+            resampler: RefCell::new(None),
         })
     }
 
@@ -255,11 +263,34 @@ impl Speaker {
     }
 
     pub fn play_mono(&self, samples: &[f32], source_sample_rate: u32) -> Result<(), AudioError> {
-        let samples = resample_mono(samples, source_sample_rate, self.format.sample_rate);
+        let mut resampler = self.resampler.borrow_mut();
+        // One converter per stream; a new one only if the source rate changes.
+        if resampler
+            .as_ref()
+            .is_none_or(|(rate, _)| *rate != source_sample_rate)
+        {
+            let created = Resampler::new(source_sample_rate, self.format.sample_rate)
+                .ok_or_else(|| AudioError::Configuration("Invalid sample rate".to_owned()))?;
+            *resampler = Some((source_sample_rate, created));
+        }
+        let converted = match resampler.as_mut() {
+            Some((_, resampler)) => resampler.push(samples),
+            None => return Ok(()),
+        };
 
-        self.sender
-            .send(samples)
-            .map_err(|error| AudioError::Channel(error.to_string()))
+        self.playout
+            .lock()
+            .map_err(|_| AudioError::Channel("Speaker buffer is unusable".to_owned()))?
+            .push(&converted);
+        Ok(())
+    }
+
+    /// How many times playback ran out of audio since the speaker started.
+    pub fn underruns(&self) -> u64 {
+        self.playout
+            .lock()
+            .map(|playout| playout.underruns())
+            .unwrap_or(0)
     }
 }
 
@@ -307,7 +338,7 @@ where
 fn build_output_stream<S>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
-    receiver: Receiver<Vec<f32>>,
+    playout: Arc<Mutex<PlayoutBuffer>>,
 ) -> Result<cpal::Stream, AudioError>
 where
     S: cpal::SizedSample + AudioSample,
@@ -320,26 +351,19 @@ where
         ));
     }
 
-    let mut pending = VecDeque::<f32>::new();
+    let mut mono = Vec::<f32>::new();
 
     let stream = device
         .build_output_stream(
             &config,
             move |data: &mut [S], _: &cpal::OutputCallbackInfo| {
-                for frame in data.chunks_exact_mut(channels) {
-                    if pending.is_empty()
-                        && let Ok(samples) = receiver.try_recv()
-                    {
-                        pending.extend(samples);
-                    }
-
-                    let sample = pending.pop_front().unwrap_or(0.0);
-
-                    let converted = S::from_f32(sample);
-
-                    for output in frame.iter_mut() {
-                        *output = converted;
-                    }
+                mono.resize(data.len() / channels, 0.0);
+                match playout.lock() {
+                    Ok(mut playout) => playout.pull(&mut mono),
+                    Err(_) => mono.fill(0.0),
+                }
+                for (frame, sample) in data.chunks_exact_mut(channels).zip(&mono) {
+                    frame.fill(S::from_f32(*sample));
                 }
             },
             move |error| {
@@ -352,32 +376,13 @@ where
     Ok(stream)
 }
 
+/// One-shot conversion, kept for the tests below.
+#[cfg(test)]
 fn resample_mono(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
-    if samples.is_empty() || source_rate == target_rate || source_rate == 0 || target_rate == 0 {
-        return samples.to_vec();
+    match Resampler::new(source_rate, target_rate) {
+        Some(mut resampler) => resampler.push(samples),
+        None => samples.to_vec(),
     }
-
-    let source_step = source_rate as f64 / target_rate as f64;
-
-    let output_length = (samples.len() as f64 / source_step).floor() as usize;
-
-    let mut output = Vec::with_capacity(output_length);
-
-    for output_index in 0..output_length {
-        let source_position = output_index as f64 * source_step;
-
-        let left_index = source_position.floor() as usize;
-
-        let fraction = (source_position - left_index as f64) as f32;
-
-        let left = samples.get(left_index).copied().unwrap_or(0.0);
-
-        let right = samples.get(left_index + 1).copied().unwrap_or(left);
-
-        output.push(left + (right - left) * fraction);
-    }
-
-    output
 }
 
 #[cfg(test)]

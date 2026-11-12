@@ -1,6 +1,4 @@
-use crate::rtp::{
-    PCMU_PAYLOAD_TYPE, PCMU_SAMPLES_PER_PACKET, PcmuStream, RtpError, RtpPacket, decode_pcmu,
-};
+use crate::rtp::{PCMU_PAYLOAD_TYPE, PcmuStream, RtpError, RtpPacket, decode_pcmu};
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -307,17 +305,16 @@ fn run_receiver(
                     continue;
                 }
 
-                let packet = RtpPacket::parse(&buffer[..length])?;
+                // One odd datagram must not end the audio of the whole call:
+                // anything that is not a PCMU voice packet is skipped. Servers
+                // send DTMF events (payload 101) and comfort noise (13) on the
+                // same port, and may use 10 or 30 ms packets instead of 20.
+                let Ok(packet) = RtpPacket::parse(&buffer[..length]) else {
+                    continue;
+                };
 
-                if packet.payload_type != PCMU_PAYLOAD_TYPE {
-                    return Err(RtpSessionError::UnsupportedPayloadType(packet.payload_type));
-                }
-
-                if packet.payload.len() != PCMU_SAMPLES_PER_PACKET {
-                    return Err(RtpSessionError::InvalidPayloadLength {
-                        expected: PCMU_SAMPLES_PER_PACKET,
-                        actual: packet.payload.len(),
-                    });
+                if packet.payload_type != PCMU_PAYLOAD_TYPE || packet.payload.is_empty() {
+                    continue;
                 }
 
                 let samples = decode_pcmu(&packet.payload);
@@ -350,6 +347,7 @@ fn run_receiver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtp::PCMU_SAMPLES_PER_PACKET;
 
     #[test]
     fn transfers_pcmu_between_sessions() {
@@ -401,6 +399,57 @@ mod tests {
         sender_shutdown.expect("sender should stop cleanly");
 
         receiver_shutdown.expect("receiver should stop cleanly");
+    }
+
+    #[test]
+    fn foreign_packets_are_skipped_and_other_packet_sizes_are_played() {
+        let config = RtpSessionConfig::new(
+            "127.0.0.1:0".parse::<SocketAddr>().expect("valid address"),
+            48_000,
+        )
+        .with_expected_source(None);
+        let mut receiver = RtpSession::bind(
+            "127.0.0.1:0".parse::<SocketAddr>().expect("valid address"),
+            config,
+            0x5555_5555,
+        )
+        .expect("receiver session should start");
+        let target = receiver.local_address().expect("address should exist");
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("peer should bind");
+
+        let packet = |payload_type: u8, sequence_number: u16, payload: Vec<u8>| {
+            RtpPacket {
+                marker: false,
+                payload_type,
+                sequence_number,
+                timestamp: u32::from(sequence_number) * 160,
+                ssrc: 7,
+                payload,
+            }
+            .serialize()
+            .expect("packet should serialize")
+        };
+
+        // Not RTP at all, a DTMF event, comfort noise, an empty voice packet.
+        peer.send_to(b"junk", target).expect("send");
+        peer.send_to(&packet(101, 1, vec![1, 0, 0, 160]), target)
+            .expect("send");
+        peer.send_to(&packet(13, 2, vec![40]), target)
+            .expect("send");
+        peer.send_to(&packet(PCMU_PAYLOAD_TYPE, 3, Vec::new()), target)
+            .expect("send");
+        // Voice in 10 ms and 30 ms packets.
+        peer.send_to(&packet(PCMU_PAYLOAD_TYPE, 4, vec![0xFF; 80]), target)
+            .expect("send");
+        peer.send_to(&packet(PCMU_PAYLOAD_TYPE, 5, vec![0xFF; 240]), target)
+            .expect("send");
+
+        let first = wait_for_decoded(&receiver).expect("10 ms packet should be decoded");
+        let second = wait_for_decoded(&receiver).expect("30 ms packet should be decoded");
+        assert_eq!(first.len(), 80);
+        assert_eq!(second.len(), 240);
+        assert_eq!(receiver.received_packets(), 2);
+        receiver.shutdown().expect("receiver should stop cleanly");
     }
 
     #[test]

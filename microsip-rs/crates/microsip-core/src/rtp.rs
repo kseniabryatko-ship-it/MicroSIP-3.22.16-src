@@ -1,4 +1,5 @@
 pub mod session;
+use crate::resample::Resampler;
 use std::error::Error;
 use std::fmt;
 
@@ -190,63 +191,8 @@ impl RtpPacket {
 }
 
 #[derive(Debug)]
-struct LinearResampler {
-    step: f64,
-    next_position: f64,
-    previous: Option<f32>,
-    source_index: u64,
-}
-
-impl LinearResampler {
-    fn new(source_rate: u32, target_rate: u32) -> Result<Self, RtpError> {
-        if source_rate == 0 {
-            return Err(RtpError::InvalidSampleRate(source_rate));
-        }
-
-        if target_rate == 0 {
-            return Err(RtpError::InvalidSampleRate(target_rate));
-        }
-
-        Ok(Self {
-            step: source_rate as f64 / target_rate as f64,
-            next_position: 0.0,
-            previous: None,
-            source_index: 0,
-        })
-    }
-
-    fn push(&mut self, samples: &[f32]) -> Vec<f32> {
-        let mut output = Vec::new();
-
-        for &sample in samples {
-            let current_index = self.source_index;
-
-            if let Some(previous) = self.previous {
-                while self.next_position <= current_index as f64 {
-                    let base = current_index.saturating_sub(1) as f64;
-
-                    let fraction = (self.next_position - base).clamp(0.0, 1.0) as f32;
-
-                    output.push(previous + (sample - previous) * fraction);
-
-                    self.next_position += self.step;
-                }
-            } else {
-                output.push(sample);
-                self.next_position += self.step;
-            }
-
-            self.previous = Some(sample);
-            self.source_index = self.source_index.wrapping_add(1);
-        }
-
-        output
-    }
-}
-
-#[derive(Debug)]
 pub struct PcmuStream {
-    resampler: LinearResampler,
+    resampler: Resampler,
     pending_samples: Vec<f32>,
     next_sequence_number: u16,
     next_timestamp: u32,
@@ -257,7 +203,8 @@ pub struct PcmuStream {
 impl PcmuStream {
     pub fn new(ssrc: u32, source_sample_rate: u32) -> Result<Self, RtpError> {
         Ok(Self {
-            resampler: LinearResampler::new(source_sample_rate, PCMU_CLOCK_RATE)?,
+            resampler: Resampler::new(source_sample_rate, PCMU_CLOCK_RATE)
+                .ok_or(RtpError::InvalidSampleRate(source_sample_rate))?,
             pending_samples: Vec::new(),
             next_sequence_number: 0,
             next_timestamp: 0,
@@ -421,13 +368,24 @@ mod tests {
 
     #[test]
     fn resamples_48k_to_8k() {
+        // The plain linear converter this test used to cover picked input
+        // samples 0 and 6. It was replaced by the filtering `Resampler`, which
+        // delays the signal, so only the number of samples is the same.
         let input = (0_u8..7).map(f32::from).collect::<Vec<f32>>();
 
-        let mut resampler = LinearResampler::new(48_000, 8_000).expect("resampler should be valid");
+        let mut resampler = Resampler::new(48_000, 8_000).expect("resampler should be valid");
 
         let output = resampler.push(&input);
 
-        assert_eq!(output, vec![0.0, 6.0]);
+        assert_eq!(output.len(), 2);
+    }
+
+    #[test]
+    fn zero_source_rate_is_refused() {
+        assert_eq!(
+            PcmuStream::new(1, 0).err(),
+            Some(RtpError::InvalidSampleRate(0))
+        );
     }
 
     #[test]
