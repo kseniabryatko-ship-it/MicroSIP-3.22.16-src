@@ -1,5 +1,5 @@
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -39,4 +39,35 @@ pub fn resolve_socket_address(host: &str, port: u16) -> io::Result<SocketAddr> {
             format!("Could not resolve SIP server {host}:{port}"),
         )
     })
+}
+
+/// The local IP address the system would use to reach `remote`. Nothing is
+/// sent: connecting a UDP socket only asks the routing table.
+pub fn local_ip_towards(remote: SocketAddr) -> io::Result<IpAddr> {
+    let any = if remote.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(any)?;
+    socket.connect(remote)?;
+    Ok(socket.local_addr()?.ip())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_is_reached_from_loopback() {
+        let ip = local_ip_towards("127.0.0.1:5060".parse().unwrap()).unwrap();
+        assert!(ip.is_loopback(), "{ip}");
+    }
+
+    #[test]
+    fn a_bound_local_socket_is_reached_from_its_own_address() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let ip = local_ip_towards(peer.local_addr().unwrap()).unwrap();
+        assert_eq!(ip, peer.local_addr().unwrap().ip());
+    }
 }

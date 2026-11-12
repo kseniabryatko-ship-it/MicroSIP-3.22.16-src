@@ -519,7 +519,17 @@ impl<M: Media> Runner<M> {
                 resolve_socket_address(&host, port)
                     .map_err(|error| format!("cannot resolve {host}: {error}"))
             })
-            .and_then(|server| Registration::new(account, server, self.local, &seed));
+            .and_then(|server| {
+                // A loopback socket cannot send to another machine at all.
+                if self.local.ip().is_loopback() && !server.ip().is_loopback() {
+                    return Err(format!(
+                        "the phone listens on {}, which cannot reach {server}; \
+                         start it on this computer's network address",
+                        self.local.ip()
+                    ));
+                }
+                Registration::new(account, server, self.local, &seed)
+            });
         match created {
             Ok(mut registration) => {
                 let outputs = registration.start();

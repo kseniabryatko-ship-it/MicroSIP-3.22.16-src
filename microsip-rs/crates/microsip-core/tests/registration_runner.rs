@@ -395,6 +395,20 @@ fn invalid_account_fails_without_sending_anything() {
 }
 
 #[test]
+fn loopback_phone_refuses_a_server_on_another_machine_at_once() {
+    let handle = phone(Timers::default());
+    // 192.0.2.0/24 is reserved for documentation; nothing is sent to it.
+    let account = Account::new("192.0.2.1:5060", "alice", PASSWORD);
+    assert!(handle.send(UiCommand::Register(account)));
+    match wait_registration(&handle) {
+        RegistrationState::Failed(reason) => {
+            assert!(reason.contains("cannot reach 192.0.2.1:5060"), "{reason}");
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+#[test]
 fn second_register_while_registered_is_refused() {
     let registrar = Registrar::new();
     let handle = phone(Timers::default());

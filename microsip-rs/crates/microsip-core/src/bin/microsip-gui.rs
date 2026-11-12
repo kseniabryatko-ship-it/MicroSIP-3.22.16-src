@@ -6,6 +6,7 @@ use microsip_core::call_runner::{CallHandle, Event, UiCommand, spawn};
 use microsip_core::call_view::{CallView, Phase};
 use microsip_core::registration::{Account, RegistrationState};
 use microsip_core::settings::{self, Settings};
+use microsip_core::transport::{local_ip_towards, resolve_socket_address};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -177,6 +178,10 @@ impl PhoneWindow {
             return self.error("Enter the SIP server and the user name");
         }
         self.last_error = None;
+        let account = Account::new(self.server.trim(), self.user.trim(), "");
+        if let Err(error) = self.use_address_that_reaches(&account) {
+            return self.error(error);
+        }
         self.save_settings();
         let account = Account::new(self.server.trim(), self.user.trim(), self.password.clone())
             .with_domain(self.domain.trim());
@@ -187,6 +192,37 @@ impl PhoneWindow {
             self.server.trim()
         ));
         self.send(UiCommand::Register(account));
+    }
+
+    /// A phone started on 127.0.0.1 cannot talk to a server on another
+    /// machine. Like MicroSIP, pick the right network address automatically:
+    /// restart the phone on the address the system uses to reach the server.
+    fn use_address_that_reaches(&mut self, account: &Account) -> Result<(), String> {
+        let local = Self::address(&self.local)?;
+        if !local.ip().is_loopback() {
+            return Ok(());
+        }
+        let (host, port) = account.server_host_port()?;
+        let server = resolve_socket_address(&host, port)
+            .map_err(|error| format!("Cannot resolve {host}: {error}"))?;
+        if server.ip().is_loopback() {
+            return Ok(());
+        }
+        if !self.view.can_dial() {
+            return Err("Finish the call before registering".to_owned());
+        }
+        let ip = local_ip_towards(server)
+            .map_err(|error| format!("No network route to {server}: {error}"))?;
+        if ip.is_loopback() || ip.is_unspecified() {
+            return Err(format!("No network address can reach {server}"));
+        }
+        let address = SocketAddr::new(ip, local.port());
+        self.log(format!(
+            "Local address changed from {local} to {address} to reach the server"
+        ));
+        self.stop();
+        self.local = address.to_string();
+        self.start()
     }
 
     fn unregister(&mut self) {
@@ -364,8 +400,9 @@ impl eframe::App for PhoneWindow {
                 };
             });
             ui.label(
-                "To register, Local must be this computer's network address, not 127.0.0.1. \
-                 Once registered, a number typed into Remote is called through the server.",
+                "Register switches Local from 127.0.0.1 to this computer's network address \
+                 by itself. Once registered, a number typed into Remote is called through \
+                 the server.",
             );
             ui.separator();
 
