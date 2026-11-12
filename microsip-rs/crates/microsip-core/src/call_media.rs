@@ -5,10 +5,13 @@ use crate::audio::{Microphone, Speaker};
 use crate::gain::AutoGain;
 use crate::rtp::PCMU_CLOCK_RATE;
 use crate::rtp::session::{RtpSession, RtpSessionConfig};
+use crate::tones::{TONE_RATE, Tone, ToneGenerator};
 use std::error::Error;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 pub type MediaError = Box<dyn Error + Send + Sync>;
 
@@ -79,6 +82,13 @@ pub trait Media {
         MediaStats::default()
     }
 
+    /// Starts the ring of an incoming call or the ringback of an outgoing
+    /// one on the speaker; `None` stops it. Starting the call's own audio
+    /// stops it too.
+    fn ring(&mut self, _tone: Option<Tone>) -> Result<(), MediaError> {
+        Ok(())
+    }
+
     /// Tells the media which telephone-event payload type the other side
     /// agreed to (`None`: digits go as tones in the voice). Called before
     /// `start`.
@@ -91,6 +101,10 @@ pub trait Media {
 
     /// Stops or resumes sending the microphone. A new call starts unmuted.
     fn set_muted(&mut self, _muted: bool) {}
+
+    /// While the call is on hold nothing from the microphone is sent,
+    /// whatever the mute setting is.
+    fn set_hold(&mut self, _hold: bool) {}
 
     /// Quality of the received audio; `None` when this media plays nothing.
     fn quality(&self) -> Option<MediaQuality> {
@@ -131,6 +145,57 @@ pub struct AudioMedia {
     active: Option<ActiveAudio>,
     next_ssrc: u32,
     dtmf_payload_type: Option<u8>,
+    ringer: Option<Ringer>,
+    muted: bool,
+    held: bool,
+}
+
+/// A speaker playing a call-progress tone until it is dropped.
+struct Ringer {
+    tone: Tone,
+    // Dropped after the thread has stopped feeding it.
+    _speaker: Speaker,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Ringer {
+    fn start(tone: Tone) -> Result<Self, MediaError> {
+        let speaker = Speaker::start()?;
+        let mut sink = speaker.sink();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            let mut generator = ToneGenerator::new(tone);
+            let started = Instant::now();
+            while !stopped.load(Ordering::Acquire) {
+                // Stay a little ahead of the clock, as a network stream would.
+                let wanted = started.elapsed().as_millis() as u64 + 120;
+                while generator.produced_ms() < wanted {
+                    let block = generator.next_block(TONE_RATE as usize / 50);
+                    if sink.push(&block, TONE_RATE).is_err() {
+                        return;
+                    }
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        Ok(Self {
+            tone,
+            _speaker: speaker,
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for Ringer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 struct ActiveAudio {
@@ -162,6 +227,8 @@ impl Media for AudioMedia {
     }
 
     fn start(&mut self, remote: SocketAddr) -> Result<(), MediaError> {
+        // The call's own audio takes the speaker over from the ringing.
+        self.ringer = None;
         if self.active.is_some() {
             return Err("media is already running".into());
         }
@@ -217,6 +284,9 @@ impl Media for AudioMedia {
             session,
             mic_level,
         });
+        // Every call starts with the microphone on and not on hold.
+        self.muted = false;
+        self.held = false;
         Ok(())
     }
 
@@ -228,6 +298,25 @@ impl Media for AudioMedia {
                 received_packets: active.session.received_packets(),
             })
             .unwrap_or_default()
+    }
+
+    fn ring(&mut self, tone: Option<Tone>) -> Result<(), MediaError> {
+        match tone {
+            // Already ringing this way: keep the rhythm going.
+            Some(tone)
+                if self
+                    .ringer
+                    .as_ref()
+                    .is_some_and(|ringer| ringer.tone == tone) => {}
+            Some(tone) if self.active.is_none() => {
+                self.ringer = None;
+                self.ringer = Some(Ringer::start(tone)?);
+            }
+            // During a conversation nothing rings over it.
+            Some(_) => {}
+            None => self.ringer = None,
+        }
+        Ok(())
     }
 
     fn set_dtmf_payload_type(&mut self, payload_type: Option<u8>) {
@@ -244,8 +333,16 @@ impl Media for AudioMedia {
     }
 
     fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
         if let Some(active) = self.active.as_ref() {
-            active.session.set_muted(muted);
+            active.session.set_muted(self.muted || self.held);
+        }
+    }
+
+    fn set_hold(&mut self, hold: bool) {
+        self.held = hold;
+        if let Some(active) = self.active.as_ref() {
+            active.session.set_muted(self.muted || self.held);
         }
     }
 
@@ -265,6 +362,7 @@ impl Media for AudioMedia {
 
     fn stop(&mut self) {
         self.socket = None;
+        self.ringer = None;
         if let Some(active) = self.active.take() {
             let ActiveAudio {
                 microphone,

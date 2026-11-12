@@ -117,6 +117,41 @@ impl EstablishedDialog {
         Ok(request)
     }
 
+    /// Builds an INVITE inside the dialog (a re-INVITE, used for hold) and
+    /// reserves its CSeq and branch. The caller adds the SDP body.
+    pub fn build_reinvite(&mut self, branch: &str) -> Result<Request, DialogError> {
+        self.require_confirmed()?;
+        self.check_new_branch(branch)?;
+
+        let cseq = self
+            .local_cseq
+            .checked_add(1)
+            .filter(|number| *number <= MAX_CSEQ)
+            .ok_or(DialogError::CseqExhausted)?;
+
+        let request = self.build_request(Method::Invite, cseq, branch)?;
+
+        self.local_cseq = cseq;
+        self.used_branches.insert(branch.to_owned());
+        Ok(request)
+    }
+
+    /// Builds the ACK for a successful re-INVITE that had this CSeq.
+    pub fn build_reinvite_ack(&mut self, cseq: u32, branch: &str) -> Result<Request, DialogError> {
+        self.require_confirmed()?;
+        self.check_new_branch(branch)?;
+        if cseq <= self.config.invite_cseq || cseq > self.local_cseq {
+            return Err(DialogError::InvalidConfiguration(
+                "no re-INVITE with this CSeq was sent",
+            ));
+        }
+
+        let request = self.build_request(Method::Ack, cseq, branch)?;
+
+        self.used_branches.insert(branch.to_owned());
+        Ok(request)
+    }
+
     /// Builds BYE and reserves its CSeq and branch.
     /// Retransmissions must reuse the returned request unchanged.
     pub fn build_bye(&mut self, branch: &str) -> Result<Request, DialogError> {
@@ -332,6 +367,42 @@ mod tests {
             Message::parse(text).expect("ACK should parse"),
             Message::Request(ack)
         );
+    }
+
+    #[test]
+    fn reinvite_takes_the_next_cseq_and_bye_follows_it() {
+        let mut dialog = EstablishedDialog::new(config()).expect("valid dialog");
+        let first = dialog.local_cseq();
+
+        let reinvite = dialog
+            .build_reinvite("z9hG4bK-hold")
+            .expect("valid re-INVITE");
+        assert_eq!(reinvite.method, Method::Invite);
+        assert_eq!(
+            reinvite.headers.get("cseq"),
+            Some(format!("{} INVITE", first + 1).as_str())
+        );
+        assert!(reinvite.headers.get("contact").is_some());
+        assert_eq!(dialog.state(), DialogState::Confirmed);
+
+        let ack = dialog
+            .build_reinvite_ack(first + 1, "z9hG4bK-hold-ack")
+            .expect("valid ACK");
+        assert_eq!(
+            ack.headers.get("cseq"),
+            Some(format!("{} ACK", first + 1).as_str())
+        );
+        // Only a CSeq that a re-INVITE really used can be acknowledged.
+        assert!(dialog.build_reinvite_ack(first, "z9hG4bK-a").is_err());
+        assert!(dialog.build_reinvite_ack(first + 2, "z9hG4bK-b").is_err());
+        assert!(dialog.build_reinvite("z9hG4bK-hold").is_err());
+
+        let bye = dialog.build_bye("z9hG4bK-bye").expect("valid BYE");
+        assert_eq!(
+            bye.headers.get("cseq"),
+            Some(format!("{} BYE", first + 2).as_str())
+        );
+        assert!(dialog.build_reinvite("z9hG4bK-late").is_err());
     }
 
     #[test]

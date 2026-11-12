@@ -41,6 +41,8 @@ pub struct CallView {
     target: Option<String>,
     stats: Option<(u64, u64)>,
     last_end: Option<EndReason>,
+    held: bool,
+    remote_held: bool,
 }
 
 impl CallView {
@@ -66,6 +68,21 @@ impl CallView {
 
     pub fn last_end(&self) -> Option<EndReason> {
         self.last_end
+    }
+
+    /// The connected call is on hold by this phone.
+    pub fn is_held(&self) -> bool {
+        self.held
+    }
+
+    /// The other side put the connected call on hold.
+    pub fn is_remote_held(&self) -> bool {
+        self.remote_held
+    }
+
+    /// Hold and resume are offered for a connected call.
+    pub fn can_hold(&self) -> bool {
+        self.phase == Phase::Connected
     }
 
     pub fn can_dial(&self) -> bool {
@@ -134,9 +151,13 @@ impl CallView {
             }
             Event::Established => self.phase = Phase::Connected,
             Event::MediaStats { sent, received } => self.stats = Some((*sent, *received)),
+            Event::Hold(held) => self.held = *held,
+            Event::RemoteHold(held) => self.remote_held = *held,
             Event::Ended(reason) => {
                 self.phase = Phase::Idle;
                 self.last_end = Some(*reason);
+                self.held = false;
+                self.remote_held = false;
             }
             Event::AudioQuality(_)
             | Event::Registration(_)
@@ -243,6 +264,34 @@ mod tests {
 
         view.dialing(peer());
         assert_eq!(view.peer_label(), Some("127.0.0.1:5070".to_owned()));
+    }
+
+    #[test]
+    fn hold_state_follows_events_and_ends_with_the_call() {
+        let mut view = CallView::default();
+        assert!(!view.can_hold());
+        view.on_event(&Event::Incoming { peer: peer() });
+        assert!(!view.can_hold());
+        view.on_event(&Event::Established);
+        assert!(view.can_hold());
+        assert!(!view.is_held());
+
+        view.on_event(&Event::Hold(true));
+        view.on_event(&Event::RemoteHold(true));
+        assert!(view.is_held());
+        assert!(view.is_remote_held());
+        // A held call is still a connected call that can be hung up.
+        assert_eq!(view.phase(), Phase::Connected);
+        assert!(view.can_hangup());
+
+        view.on_event(&Event::Hold(false));
+        assert!(!view.is_held());
+        assert!(view.is_remote_held());
+
+        view.on_event(&Event::Ended(EndReason::Completed));
+        assert!(!view.is_held());
+        assert!(!view.is_remote_held());
+        assert!(!view.can_hold());
     }
 
     #[test]

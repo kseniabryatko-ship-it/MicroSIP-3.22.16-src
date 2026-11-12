@@ -25,6 +25,7 @@ use crate::invite_control::{build_cancel, build_failure_ack};
 use crate::registration::{Account, Output, Registration, RegistrationState, add_rport};
 use crate::sip::message::{Headers, InviteRequest, Message, Request, Response, ResponseBuilder};
 use crate::sip::sdp::{MediaKind, Sdp};
+use crate::tones::Tone;
 use crate::transaction_headers::TransactionHeaders;
 use crate::transport::resolve_socket_address;
 use std::collections::VecDeque;
@@ -57,6 +58,9 @@ pub enum UiCommand {
     Dtmf(char),
     /// Stops (`true`) or resumes sending the microphone during a call.
     Mute(bool),
+    /// Puts the connected call on hold (`true`) or resumes it. The result
+    /// is reported with [`Event::Hold`].
+    Hold(bool),
     /// Registers the account on its SIP server and keeps it registered.
     /// Progress is reported with [`Event::Registration`].
     Register(Account),
@@ -110,6 +114,10 @@ pub enum Event {
     /// How well the received audio played, sent just before the media stops
     /// when real audio was used.
     AudioQuality(MediaQuality),
+    /// The call is now on hold by this phone (`true`) or resumed.
+    Hold(bool),
+    /// The other side put the call on hold (`true`) or resumed it.
+    RemoteHold(bool),
     Ended(EndReason),
     /// The account's registration changed state.
     Registration(RegistrationState),
@@ -231,6 +239,7 @@ enum RetxKind {
     Bye,
     Final,
     Register,
+    ReInvite,
 }
 
 struct Retx {
@@ -280,6 +289,20 @@ struct Call {
     route_set: Vec<String>,
     /// The INVITE replaced by an authorized one, with the ACK sent for it.
     superseded: Option<(TransactionHeaders, Vec<u8>)>,
+    /// Version of our session description; raised whenever it changes.
+    sdp_version: u32,
+    /// Our hold or resume request that is waiting for its answer.
+    reinvite: Option<ReInvite>,
+    /// The last answered re-INVITE with its ACK, for a repeated answer.
+    reinvite_ack: Option<(TransactionHeaders, Vec<u8>)>,
+    local_hold: bool,
+    remote_hold: bool,
+}
+
+struct ReInvite {
+    request: Request,
+    headers: TransactionHeaders,
+    hold: bool,
 }
 
 struct ServerCall {
@@ -322,6 +345,11 @@ impl Call {
             server: None,
             route_set: Vec::new(),
             superseded: None,
+            sdp_version: 1,
+            reinvite: None,
+            reinvite_ack: None,
+            local_hold: false,
+            remote_hold: false,
         })
     }
 }
@@ -464,6 +492,7 @@ impl<M: Media> Runner<M> {
                 self.media.set_muted(muted);
                 Ok(())
             }
+            UiCommand::Hold(hold) => self.hold(hold),
             UiCommand::Register(account) => {
                 self.register(account);
                 Ok(())
@@ -489,6 +518,14 @@ impl<M: Media> Runner<M> {
     fn dispatch_reporting(&mut self, input: Input) {
         if let Err(error) = self.dispatch(input) {
             self.report(error.to_string());
+        }
+    }
+
+    /// Starts or stops the phone's own ringing. A phone that cannot ring
+    /// (no speaker) still works, so a failure is only reported.
+    fn ring(&mut self, tone: Option<Tone>) {
+        if let Err(error) = self.media.ring(tone) {
+            self.report(format!("Cannot play the ringing sound: {error}"));
         }
     }
 
@@ -717,9 +754,10 @@ impl<M: Media> Runner<M> {
                 self.send_to_peer(&bytes)?;
             }
             Action::SendInviteSuccess => {
+                self.ring(None);
                 // Answer with the telephone-event type the caller offered.
                 let call = self.call_ref()?;
-                let sdp = make_sdp(call.local_rtp, call.dtmf_payload_type);
+                let sdp = make_sdp(call.local_rtp, call.dtmf_payload_type, 1, "sendrecv");
                 let bytes = self.invite_response(200, "OK", Some(sdp))?;
                 self.send_to_peer(&bytes)?;
                 self.start_final_retx(bytes)?;
@@ -866,14 +904,13 @@ impl<M: Media> Runner<M> {
         self.send(&bytes, peer)
     }
 
-    fn send_bye(&mut self) -> Result<()> {
-        let branch = self.branch();
+    /// The called side builds its dialog from the received INVITE the first
+    /// time it has to send a request of its own.
+    fn ensure_dialog(&mut self) -> Result<()> {
         let local = self.local;
         let contact = self.contact();
         let call = self.call_mut()?;
-
         if call.dialog.is_none() {
-            // Called side: the dialog is built from the received INVITE.
             let invite = &call.invite.headers;
             call.dialog = Some(EstablishedDialog::new(DialogConfig {
                 remote_target: contact_uri(invite)?,
@@ -890,6 +927,143 @@ impl<M: Media> Runner<M> {
                 invite_branch: call.invite_headers.branch.clone(),
             })?);
         }
+        Ok(())
+    }
+
+    // ----- hold --------------------------------------------------------------
+
+    /// Asks the other side to hold or resume the call with a re-INVITE.
+    fn hold(&mut self, hold: bool) -> Result<()> {
+        if self.engine.state() != State::Established {
+            return Err("only a connected call can be put on hold".into());
+        }
+        self.ensure_dialog()?;
+        let branch = self.branch();
+        let call = self.call_mut()?;
+        if call.reinvite.is_some() {
+            return Err("the previous hold request is still waiting for an answer".into());
+        }
+        if call.local_hold == hold {
+            return Ok(());
+        }
+        call.sdp_version += 1;
+        // While we hold we still send (silence), but do not want to receive.
+        let direction = if hold { "sendonly" } else { "sendrecv" };
+        let sdp = make_sdp(
+            call.local_rtp,
+            call.dtmf_payload_type,
+            call.sdp_version,
+            direction,
+        );
+        let dialog = call.dialog.as_mut().ok_or("no dialog")?;
+        let mut request = dialog.build_reinvite(&branch)?;
+        add_routes(&mut request, &call.route_set)?;
+        request.headers.insert("content-type", "application/sdp")?;
+        request.headers.remove("content-length");
+        request
+            .headers
+            .insert("content-length", sdp.len().to_string())?;
+        request.body = sdp.into_bytes();
+
+        let headers = TransactionHeaders::from_message(&Message::Request(request.clone()))?;
+        let bytes = request.serialize()?;
+        let (peer, id) = (call.peer, call.call_id.clone());
+        call.reinvite = Some(ReInvite {
+            request,
+            headers,
+            hold,
+        });
+        self.send(&bytes, peer)?;
+        self.start_retx(RetxKind::ReInvite, id, bytes, peer, self.timers.t2);
+        Ok(())
+    }
+
+    fn on_reinvite_response(&mut self, response: &Response, status: u16) -> Result<()> {
+        let id = self.call_ref()?.call_id.clone();
+        self.stop_retx(&id, &[RetxKind::ReInvite]);
+        if status < 200 {
+            return Ok(());
+        }
+        let Some(pending) = self.call_mut()?.reinvite.take() else {
+            return Ok(());
+        };
+        let peer = self.call_ref()?.peer;
+
+        if !(200..300).contains(&status) {
+            let ack = build_failure_ack(&pending.request, response)?.serialize()?;
+            self.send(&ack, peer)?;
+            self.hold_failed(pending.hold, &format!("refused ({status})"));
+            return Ok(());
+        }
+
+        let branch = self.branch();
+        let call = self.call_mut()?;
+        let dialog = call.dialog.as_mut().ok_or("no dialog")?;
+        let mut ack = dialog.build_reinvite_ack(pending.headers.cseq, &branch)?;
+        add_routes(&mut ack, &call.route_set)?;
+        let bytes = ack.serialize()?;
+        call.reinvite_ack = Some((pending.headers, bytes.clone()));
+        call.local_hold = pending.hold;
+        self.send(&bytes, peer)?;
+        self.media.set_hold(pending.hold);
+        self.emit(Event::Hold(pending.hold));
+        Ok(())
+    }
+
+    /// The call stays as it was; the interface is told so.
+    fn hold_failed(&mut self, hold: bool, why: &str) {
+        let action = if hold { "Hold" } else { "Resume" };
+        self.report(format!("{action} did not work: {why}"));
+        let held = self.call.as_ref().is_some_and(|call| call.local_hold);
+        self.emit(Event::Hold(held));
+    }
+
+    /// An INVITE from the other side inside the connected call.
+    fn on_reinvite(&mut self, request: &Request, source: SocketAddr) -> Result<()> {
+        let contact = self.contact();
+        let call = self.call_mut()?;
+        let tag = call.local_tag.clone();
+        if call.reinvite.is_some() {
+            // Both sides asked at once; RFC 3261 has them both back off.
+            let bytes = build_response(request, 491, "Request Pending", Some(&tag), None, None)?;
+            return self.send(&bytes, source);
+        }
+
+        // What the other side says about itself decides our answer.
+        let theirs = sdp_direction(&request.body);
+        let remote_hold = matches!(theirs, Some("sendonly" | "inactive"));
+        let ours = match theirs {
+            Some("sendonly") => "recvonly",
+            Some("inactive") => "inactive",
+            Some("recvonly") => "sendonly",
+            // Both ways, or no description at all (then ours is the offer).
+            _ if call.local_hold => "sendonly",
+            _ => "sendrecv",
+        };
+        call.sdp_version += 1;
+        let sdp = make_sdp(
+            call.local_rtp,
+            call.dtmf_payload_type,
+            call.sdp_version,
+            ours,
+        );
+        let changed = call.remote_hold != remote_hold;
+        call.remote_hold = remote_hold;
+
+        let bytes = build_response(request, 200, "OK", Some(&tag), Some(&contact), Some(sdp))?;
+        // A repeated re-INVITE (our answer was lost) gets the same answer.
+        self.remember(request, bytes.clone(), source);
+        self.send(&bytes, source)?;
+        if changed {
+            self.emit(Event::RemoteHold(remote_hold));
+        }
+        Ok(())
+    }
+
+    fn send_bye(&mut self) -> Result<()> {
+        self.ensure_dialog()?;
+        let branch = self.branch();
+        let call = self.call_mut()?;
         let dialog = call.dialog.as_mut().ok_or("no dialog")?;
         let mut request = dialog.build_bye(&branch)?;
         add_rport(&mut request.headers)?;
@@ -1007,6 +1181,13 @@ impl<M: Media> Runner<M> {
                 .call
                 .as_ref()
                 .is_some_and(|call| call.call_id == call_id);
+            if kind == RetxKind::ReInvite {
+                if current && let Some(pending) = self.call.as_mut().and_then(|c| c.reinvite.take())
+                {
+                    self.hold_failed(pending.hold, "no answer");
+                }
+                continue;
+            }
             let fire = current
                 && matches!(
                     (kind, self.engine.state()),
@@ -1160,6 +1341,15 @@ impl<M: Media> Runner<M> {
 
     fn on_invite(&mut self, request: &Request, source: SocketAddr) -> Result<()> {
         if self.engine.state() != State::Idle {
+            // An INVITE inside the current call changes that call (hold,
+            // resume, session refresh); any other one finds the phone busy.
+            let same_call = request
+                .headers
+                .get("call-id")
+                .is_some_and(|call_id| self.is_current(call_id, source));
+            if same_call && self.engine.state() == State::Established {
+                return self.on_reinvite(request, source);
+            }
             return self.reply_stateless(request, source, 486, "Busy Here");
         }
         let remote_rtp = match media_address(&request.body) {
@@ -1191,6 +1381,7 @@ impl<M: Media> Runner<M> {
         self.send(&trying, source)?;
         self.dispatch(Input::IncomingInvite)?;
         self.emit(Event::Incoming { peer: source });
+        self.ring(Some(Tone::Ringtone));
         Ok(())
     }
 
@@ -1268,6 +1459,27 @@ impl<M: Media> Runner<M> {
                 self.on_invite_response(response, status)
             }
             "INVITE"
+                if call
+                    .reinvite
+                    .as_ref()
+                    .is_some_and(|sent| sent.headers.matches_response(&headers)) =>
+            {
+                self.on_reinvite_response(response, status)
+            }
+            "INVITE"
+                if status >= 200
+                    && call
+                        .reinvite_ack
+                        .as_ref()
+                        .is_some_and(|(sent, _)| sent.matches_response(&headers)) =>
+            {
+                // Our ACK for the hold request was lost; repeat it.
+                if let Some((_, ack)) = call.reinvite_ack.as_ref() {
+                    self.send(ack, source)?;
+                }
+                Ok(())
+            }
+            "INVITE"
                 if status >= 300
                     && call
                         .superseded
@@ -1336,6 +1548,7 @@ impl<M: Media> Runner<M> {
             if (180..=183).contains(&status) && !call.ringing_reported {
                 call.ringing_reported = true;
                 self.emit(Event::Ringing);
+                self.ring(Some(Tone::Ringback));
             }
             return Ok(());
         }
@@ -1434,7 +1647,7 @@ impl<M: Media> Runner<M> {
             branch,
             from_tag.clone(),
         )
-        .body(make_sdp(local_rtp, Some(OFFERED_DTMF_PAYLOAD_TYPE)).into_bytes())
+        .body(make_sdp(local_rtp, Some(OFFERED_DTMF_PAYLOAD_TYPE), 1, "sendrecv").into_bytes())
         .build()?;
         add_rport(&mut invite.headers)?;
 
@@ -1492,7 +1705,15 @@ impl<M: Media> Runner<M> {
             server.from_tag.clone(),
         )
         .cseq(old_headers.cseq + 1)
-        .body(make_sdp(call.local_rtp, Some(OFFERED_DTMF_PAYLOAD_TYPE)).into_bytes())
+        .body(
+            make_sdp(
+                call.local_rtp,
+                Some(OFFERED_DTMF_PAYLOAD_TYPE),
+                1,
+                "sendrecv",
+            )
+            .into_bytes(),
+        )
         .build()?;
         invite.headers.insert(name, value)?;
         add_rport(&mut invite.headers)?;
@@ -1695,8 +1916,10 @@ fn server_target(text: &str, domain: &str) -> Result<String> {
 const OFFERED_DTMF_PAYLOAD_TYPE: u8 = 101;
 
 /// PCMU audio, plus telephone-event with the given payload type when the
-/// digits may be sent as RFC 4733 events.
-fn make_sdp(address: SocketAddr, dtmf: Option<u8>) -> String {
+/// digits may be sent as RFC 4733 events. `version` must grow whenever the
+/// description changes; `direction` is `sendrecv`, `sendonly` (hold),
+/// `recvonly` or `inactive`.
+fn make_sdp(address: SocketAddr, dtmf: Option<u8>, version: u32, direction: &str) -> String {
     let family = if address.is_ipv4() { "IP4" } else { "IP6" };
     let ip = address.ip();
     let port = address.port();
@@ -1708,10 +1931,32 @@ fn make_sdp(address: SocketAddr, dtmf: Option<u8>) -> String {
         None => (String::new(), String::new()),
     };
     format!(
-        "v=0\r\no=phone 1 1 IN {family} {ip}\r\ns=Rust direct call\r\n\
+        "v=0\r\no=phone 1 {version} IN {family} {ip}\r\ns=Rust direct call\r\n\
          c=IN {family} {ip}\r\nt=0 0\r\nm=audio {port} RTP/AVP 0{dtmf_format}\r\n\
-         a=rtpmap:0 PCMU/8000\r\n{dtmf_lines}a=sendrecv\r\n"
+         a=rtpmap:0 PCMU/8000\r\n{dtmf_lines}a={direction}\r\n"
     )
+}
+
+/// Direction of the audio in an SDP body, as the sender of the body sees it:
+/// `sendrecv`, `sendonly`, `recvonly` or `inactive`. An address of 0.0.0.0
+/// is the old way of saying "on hold" and reads as `sendonly`.
+fn sdp_direction(body: &[u8]) -> Option<&'static str> {
+    let sdp = Sdp::parse(std::str::from_utf8(body).ok()?).ok()?;
+    let audio = sdp.media(&MediaKind::Audio)?;
+    let unspecified = audio
+        .connection
+        .as_ref()
+        .or(sdp.connection.as_ref())
+        .and_then(|connection| connection.address.parse::<IpAddr>().ok())
+        .is_some_and(|ip| ip.is_unspecified());
+    let named = ["sendonly", "recvonly", "inactive", "sendrecv"]
+        .into_iter()
+        .find(|name| audio.attribute(name).is_some() || sdp.attribute(name).is_some());
+    match named {
+        Some("sendrecv") | None if unspecified => Some("sendonly"),
+        Some(name) => Some(name),
+        None => Some("sendrecv"),
+    }
 }
 
 /// Payload type of 8 kHz telephone-event in an SDP body, if it is offered.
@@ -1759,12 +2004,32 @@ fn media_address(body: &[u8]) -> Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{make_sdp, media_address, redact, telephone_event_payload_type};
+    use super::{make_sdp, media_address, redact, sdp_direction, telephone_event_payload_type};
+
+    #[test]
+    fn direction_and_version_are_written_and_read_back() {
+        let address = "192.0.2.5:40000".parse().unwrap();
+        for direction in ["sendrecv", "sendonly", "recvonly", "inactive"] {
+            let sdp = make_sdp(address, Some(101), 7, direction);
+            assert!(sdp.contains("o=phone 1 7 IN IP4 192.0.2.5\r\n"));
+            assert_eq!(sdp_direction(sdp.as_bytes()), Some(direction));
+        }
+        // No direction line means both ways; 0.0.0.0 is the old hold.
+        let plain = "v=0\r\no=x 1 1 IN IP4 192.0.2.1\r\ns=x\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n\
+                     m=audio 4000 RTP/AVP 0\r\n";
+        assert_eq!(sdp_direction(plain.as_bytes()), Some("sendrecv"));
+        let old_hold = plain.replace("c=IN IP4 192.0.2.1", "c=IN IP4 0.0.0.0");
+        assert_eq!(sdp_direction(old_hold.as_bytes()), Some("sendonly"));
+        // A session-level direction applies to the audio.
+        let session = plain.replace("t=0 0\r\n", "t=0 0\r\na=inactive\r\n");
+        assert_eq!(sdp_direction(session.as_bytes()), Some("inactive"));
+        assert_eq!(sdp_direction(b""), None);
+    }
 
     #[test]
     fn offer_lists_telephone_event_and_stays_valid_pcmu() {
         let address = "192.0.2.5:40000".parse().unwrap();
-        let offer = make_sdp(address, Some(101));
+        let offer = make_sdp(address, Some(101), 1, "sendrecv");
         assert!(offer.contains("m=audio 40000 RTP/AVP 0 101\r\n"));
         assert!(offer.contains("a=rtpmap:101 telephone-event/8000\r\n"));
         assert!(offer.contains("a=fmtp:101 0-16\r\n"));
@@ -1772,7 +2037,7 @@ mod tests {
         assert_eq!(media_address(offer.as_bytes()).unwrap(), address);
         assert_eq!(telephone_event_payload_type(offer.as_bytes()), Some(101));
 
-        let plain = make_sdp(address, None);
+        let plain = make_sdp(address, None, 1, "sendrecv");
         assert!(plain.contains("m=audio 40000 RTP/AVP 0\r\n"));
         assert!(!plain.contains("telephone-event"));
         assert_eq!(telephone_event_payload_type(plain.as_bytes()), None);

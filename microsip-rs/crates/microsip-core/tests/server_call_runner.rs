@@ -618,3 +618,222 @@ fn hangup_with_no_call_is_quietly_ignored_but_a_digit_is_refused() {
     );
     assert!(handle.wait_event(Duration::from_millis(200)).is_none());
 }
+
+/// Registers, dials `100` and answers it. Returns the INVITE and its source.
+fn connect(server: &Server, handle: &CallHandle) -> (Request, SocketAddr) {
+    server.register(handle, PASSWORD);
+    assert!(handle.send(UiCommand::DialTarget("100".to_owned())));
+    let (invite, peer) = server.request("INVITE");
+    let contact = format!("<sip:100@{}>", server.address());
+    server.reply(
+        &invite,
+        peer,
+        200,
+        &[("contact", contact.as_str())],
+        Some(SDP),
+    );
+    server.request("ACK");
+    wait_for(handle, Event::Established);
+    (invite, peer)
+}
+
+fn text(body: &[u8]) -> &str {
+    std::str::from_utf8(body).unwrap()
+}
+
+#[test]
+fn hold_and_resume_are_requested_inside_the_call() {
+    let server = Server::new();
+    let handle = phone(calm_timers());
+    let (invite, _) = connect(&server, &handle);
+    let recvonly = SDP.to_owned() + "a=recvonly\r\n";
+
+    assert!(handle.send(UiCommand::Hold(true)));
+    let (hold, peer) = server.request("INVITE");
+    assert_eq!(hold.headers.get("call-id"), invite.headers.get("call-id"));
+    assert_eq!(hold.headers.get("cseq"), Some("2 INVITE"));
+    assert_eq!(hold.target, format!("sip:100@{}", server.address()));
+    assert_eq!(hold.headers.get("from"), invite.headers.get("from"));
+    assert!(hold.headers.get("to").unwrap().ends_with(";tag=server-tag"));
+    assert_eq!(hold.headers.get("content-type"), Some("application/sdp"));
+    assert!(hold.headers.get("contact").is_some());
+    let offer = text(&hold.body);
+    assert!(offer.contains("a=sendonly\r\n"), "{offer}");
+    // The description changed, so its version is higher than the first one.
+    assert!(text(&invite.body).contains("o=phone 1 1 "));
+    assert!(offer.contains("o=phone 1 2 "), "{offer}");
+    // Same audio port as before. The answer had no telephone-event, so the
+    // new offer no longer lists it.
+    let audio_port = |body: &str| {
+        let line = body
+            .lines()
+            .find(|line| line.starts_with("m=audio"))
+            .unwrap();
+        line.split(' ').nth(1).unwrap().to_owned()
+    };
+    assert_eq!(audio_port(offer), audio_port(text(&invite.body)));
+    assert!(offer.contains(" RTP/AVP 0\r\n"), "{offer}");
+
+    server.reply(&hold, peer, 200, &[], Some(&recvonly));
+    let (ack, _) = server.request("ACK");
+    assert_eq!(ack.headers.get("cseq"), Some("2 ACK"));
+    assert_ne!(branch(&ack), branch(&hold));
+    wait_for(&handle, Event::Hold(true));
+
+    // A repeated answer gets the same ACK again and no second report.
+    server.reply(&hold, peer, 200, &[], Some(&recvonly));
+    let (again, _) = server.request("ACK");
+    assert_eq!(again.headers.get("via"), ack.headers.get("via"));
+
+    assert!(handle.send(UiCommand::Hold(false)));
+    let (resume, peer) = server.request("INVITE");
+    assert_eq!(resume.headers.get("cseq"), Some("3 INVITE"));
+    let offer = text(&resume.body);
+    assert!(offer.contains("a=sendrecv\r\n"), "{offer}");
+    assert!(offer.contains("o=phone 1 3 "), "{offer}");
+    server.reply(&resume, peer, 200, &[], Some(SDP));
+    let (ack, _) = server.request("ACK");
+    assert_eq!(ack.headers.get("cseq"), Some("3 ACK"));
+    wait_for(&handle, Event::Hold(false));
+
+    // The call goes on with the next sequence number.
+    assert!(handle.send(UiCommand::Hangup));
+    let (bye, peer) = server.request("BYE");
+    assert_eq!(bye.headers.get("cseq"), Some("4 BYE"));
+    server.reply(&bye, peer, 200, &[], None);
+    wait_for(&handle, Event::Ended(EndReason::Completed));
+}
+
+#[test]
+fn refused_hold_is_acknowledged_and_the_call_stays_connected() {
+    let server = Server::new();
+    let handle = phone(calm_timers());
+    connect(&server, &handle);
+
+    assert!(handle.send(UiCommand::Hold(true)));
+    let (hold, peer) = server.request("INVITE");
+    server.reply(&hold, peer, 488, &[], None);
+    let (ack, _) = server.request("ACK");
+    assert_eq!(ack.headers.get("cseq"), Some("2 ACK"));
+    assert_eq!(branch(&ack), branch(&hold));
+    assert_eq!(wait_error(&handle), "Hold did not work: refused (488)");
+    wait_for(&handle, Event::Hold(false));
+
+    assert!(handle.send(UiCommand::Hangup));
+    let (bye, peer) = server.request("BYE");
+    assert_eq!(bye.headers.get("cseq"), Some("3 BYE"));
+    server.reply(&bye, peer, 200, &[], None);
+    wait_for(&handle, Event::Ended(EndReason::Completed));
+}
+
+#[test]
+fn unanswered_hold_is_given_up_and_reported() {
+    let server = Server::new();
+    let handle = phone(fast_timers());
+    connect(&server, &handle);
+
+    assert!(handle.send(UiCommand::Hold(true)));
+    let (hold, _) = server.request("INVITE");
+    // The request is repeated while nobody answers.
+    let (copy, _) = server.request("INVITE");
+    assert_eq!(copy.headers.get("via"), hold.headers.get("via"));
+    assert_eq!(wait_error(&handle), "Hold did not work: no answer");
+    wait_for(&handle, Event::Hold(false));
+}
+
+#[test]
+fn hold_without_a_connected_call_is_refused() {
+    let handle = phone(fast_timers());
+    assert!(handle.send(UiCommand::Hold(true)));
+    assert_eq!(
+        wait_error(&handle),
+        "only a connected call can be put on hold"
+    );
+}
+
+#[test]
+fn hold_by_the_other_side_is_answered_and_reported() {
+    let server = Server::new();
+    let handle = phone(calm_timers());
+    let (invite, _) = connect(&server, &handle);
+    let local = handle.local_address();
+    let address = server.address();
+    let our_from = invite.headers.get("from").unwrap();
+    let our_tag = our_from.rsplit_once("tag=").unwrap().1;
+
+    // An INVITE from the other side of the same call.
+    let reinvite = |cseq: u32, direction: &str| {
+        let sdp = format!("{SDP}a={direction}\r\n");
+        InviteRequest::new(
+            format!("sip:alice@{local}"),
+            format!("sip:100@{}", address.ip()),
+            format!("sip:alice@{}", address.ip()),
+            format!("sip:100@{address}"),
+            address.to_string(),
+            invite.headers.get("call-id").unwrap(),
+            format!("z9hG4bK-reinvite-{cseq}"),
+            "server-tag",
+        )
+        .to_tag(our_tag)
+        .cseq(cseq)
+        .body(sdp.into_bytes())
+        .build()
+        .unwrap()
+    };
+
+    let hold = reinvite(1, "sendonly");
+    server.send(&hold, local);
+    let ok = server.response(200);
+    assert_eq!(ok.headers.get("cseq"), Some("1 INVITE"));
+    assert!(ok.headers.get("contact").is_some());
+    let answer = text(&ok.body);
+    // They only send, so we only receive.
+    assert!(answer.contains("a=recvonly\r\n"), "{answer}");
+    assert!(answer.contains("o=phone 1 2 "), "{answer}");
+    wait_for(&handle, Event::RemoteHold(true));
+
+    // Our answer was lost and the request comes again: same answer, no
+    // second change of the description.
+    server.send(&hold, local);
+    let again = server.response(200);
+    assert_eq!(again.body, ok.body);
+
+    server.send(&reinvite(2, "sendrecv"), local);
+    let ok = server.response(200);
+    let answer = text(&ok.body);
+    assert!(answer.contains("a=sendrecv\r\n"), "{answer}");
+    assert!(answer.contains("o=phone 1 3 "), "{answer}");
+    wait_for(&handle, Event::RemoteHold(false));
+
+    // The call itself was never disturbed.
+    assert!(handle.send(UiCommand::Hangup));
+    let (bye, peer) = server.request("BYE");
+    server.reply(&bye, peer, 200, &[], None);
+    wait_for(&handle, Event::Ended(EndReason::Completed));
+}
+
+#[test]
+fn second_call_is_still_refused_as_busy() {
+    let server = Server::new();
+    let handle = phone(calm_timers());
+    connect(&server, &handle);
+    let local = handle.local_address();
+    let address = server.address();
+
+    let other = InviteRequest::new(
+        format!("sip:alice@{local}"),
+        format!("sip:carol@{address}"),
+        format!("sip:alice@{address}"),
+        format!("sip:carol@{address}"),
+        address.to_string(),
+        "another-call",
+        "z9hG4bK-another-call",
+        "carol-tag",
+    )
+    .body(SDP.as_bytes().to_vec())
+    .build()
+    .unwrap();
+    server.send(&other, local);
+    let busy = server.response(486);
+    assert_eq!(busy.headers.get("call-id"), Some("another-call"));
+}

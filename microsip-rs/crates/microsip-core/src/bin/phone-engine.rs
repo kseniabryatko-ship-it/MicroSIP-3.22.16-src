@@ -17,7 +17,7 @@ const HELP: &str = "Usage: phone-engine.exe LOCAL_IP:SIP_PORT [--no-audio] [--tr
 Port 0 picks a free port; the chosen address is printed on the first line.\n\
 Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit\n\
           register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister\n\
-          dtmf DIGITS | mute | unmute\n\
+          dtmf DIGITS | mute | unmute | hold | resume\n\
 call IP:PORT dials directly. register keeps the account registered on a SIP\n\
 server; after that the server can send calls here and call NUMBER (or\n\
 USER@DOMAIN) dials through it.\n\
@@ -25,7 +25,7 @@ USER@DOMAIN) dials through it.\n\
 (the Digest response value is hidden).";
 
 const COMMANDS: &str = "Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit | \
-register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister | dtmf DIGITS | mute | unmute";
+register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister | dtmf DIGITS | mute | unmute | hold | resume";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -87,6 +87,10 @@ impl Phone {
                 println!("RTP sent: {sent}; RTP received: {received}");
             }
             Event::AudioQuality(quality) => println!("Audio quality: {quality}"),
+            Event::Hold(true) => println!("Call is on hold."),
+            Event::Hold(false) => println!("Call resumed."),
+            Event::RemoteHold(true) => println!("The other side put the call on hold."),
+            Event::RemoteHold(false) => println!("The other side resumed the call."),
             Event::Ended(reason) => {
                 self.state = State::Idle;
                 println!("Call ended: {}", describe(reason));
@@ -167,6 +171,13 @@ impl Phone {
                 let muted = word == "mute";
                 self.handle.send(UiCommand::Mute(muted));
                 println!("Microphone {}.", if muted { "off" } else { "on" });
+            }
+            Some(word @ ("hold" | "resume")) => {
+                if self.state == State::Connected {
+                    self.handle.send(UiCommand::Hold(word == "hold"));
+                } else {
+                    println!("Only a connected call can be put on hold.");
+                }
             }
             Some("unregister") => {
                 self.handle.send(UiCommand::Unregister);

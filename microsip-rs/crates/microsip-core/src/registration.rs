@@ -656,11 +656,18 @@ impl Registration {
 }
 
 /// Asks the server to answer to the source port of the request and to report
-/// it (RFC 3581). The Via must have no `rport` yet.
+/// it (RFC 3581). A Via that already asks is left as it is.
 pub fn add_rport(headers: &mut Headers) -> Result<(), crate::sip::message::SipMessageError> {
     let Some(via) = headers.get("via").map(str::to_owned) else {
         return Ok(());
     };
+    let asked = via.split(';').skip(1).any(|parameter| {
+        let name = parameter.split('=').next().unwrap_or_default();
+        name.trim().eq_ignore_ascii_case("rport")
+    });
+    if asked {
+        return Ok(());
+    }
     headers.insert("via", format!("{via};rport"))
 }
 
@@ -1226,6 +1233,16 @@ mod tests {
             .replace(";rport", &format!(";rport={port};received={ip}"));
         response.headers.insert("via", via).unwrap();
         response
+    }
+
+    #[test]
+    fn rport_is_added_once() {
+        let mut registration = registration();
+        let mut request = sent(&registration.start());
+        let before = request.headers.get("via").unwrap().to_owned();
+        add_rport(&mut request.headers).unwrap();
+        assert_eq!(request.headers.get("via"), Some(before.as_str()));
+        assert_eq!(before.matches("rport").count(), 1);
     }
 
     #[test]

@@ -351,6 +351,14 @@ impl PhoneWindow {
         self.send(UiCommand::Mute(self.muted));
     }
 
+    fn toggle_hold(&mut self) {
+        if self.view.can_hold() {
+            let hold = !self.view.is_held();
+            self.log(if hold { "> hold" } else { "> resume" });
+            self.send(UiCommand::Hold(hold));
+        }
+    }
+
     fn dtmf(&mut self, digit: char) {
         if self.view.phase() == Phase::Connected {
             self.log(format!("> digit {digit}"));
@@ -369,6 +377,10 @@ impl PhoneWindow {
                     self.log(format!("RTP sent: {sent}; RTP received: {received}"));
                 }
                 Event::AudioQuality(quality) => self.log(format!("Audio: {quality}")),
+                Event::Hold(true) => self.log("Call is on hold"),
+                Event::Hold(false) => self.log("Call resumed"),
+                Event::RemoteHold(true) => self.log("The other side put the call on hold"),
+                Event::RemoteHold(false) => self.log("The other side resumed the call"),
                 Event::Ended(reason) => {
                     // Every call starts with the microphone on.
                     self.muted = false;
@@ -541,8 +553,21 @@ impl eframe::App for PhoneWindow {
                 {
                     self.toggle_mute();
                 }
+                let label = if view.is_held() { "Resume" } else { "Hold" };
+                if ui
+                    .add_enabled(running && view.can_hold(), egui::Button::new(label))
+                    .clicked()
+                {
+                    self.toggle_hold();
+                }
                 if self.muted {
                     ui.colored_label(egui::Color32::YELLOW, "Microphone is off");
+                }
+                if view.is_held() {
+                    ui.colored_label(egui::Color32::YELLOW, "On hold");
+                }
+                if view.is_remote_held() {
+                    ui.colored_label(egui::Color32::YELLOW, "Held by the other side");
                 }
             });
 

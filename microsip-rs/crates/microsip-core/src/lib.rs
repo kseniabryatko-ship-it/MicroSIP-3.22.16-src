@@ -10,6 +10,7 @@ pub mod resample;
 pub mod rtp;
 pub mod settings;
 pub mod sip;
+pub mod tones;
 pub mod transport;
 
 #[path = "sip/transaction_headers.rs"]
