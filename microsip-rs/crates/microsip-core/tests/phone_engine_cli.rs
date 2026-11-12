@@ -167,3 +167,67 @@ fn bad_destinations_are_reported_without_a_call() {
     a.expect("State: Idle");
     a.quit();
 }
+
+#[test]
+fn register_and_quit_talk_to_the_server() {
+    use microsip_core::sip::message::{Message, Request, ResponseBuilder};
+    use std::net::{SocketAddr, UdpSocket};
+
+    fn receive(server: &UdpSocket) -> (Request, SocketAddr) {
+        let mut buffer = [0_u8; 65_535];
+        let (length, peer) = server.recv_from(&mut buffer).expect("expected a REGISTER");
+        let text = std::str::from_utf8(&buffer[..length]).unwrap();
+        match Message::parse(text).unwrap() {
+            Message::Request(request) => (request, peer),
+            Message::Response(_) => panic!("expected a request"),
+        }
+    }
+
+    fn accept(server: &UdpSocket, request: &Request, peer: SocketAddr) {
+        let mut builder = ResponseBuilder::new(200, "OK");
+        for name in ["via", "from", "to", "call-id", "cseq"] {
+            builder = builder
+                .header(name, request.headers.get(name).unwrap())
+                .unwrap();
+        }
+        let response = builder.header("expires", "60").unwrap().build().unwrap();
+        let bytes = Message::Response(response).serialize().unwrap();
+        server.send_to(&bytes, peer).unwrap();
+    }
+
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    server.set_read_timeout(Some(WAIT)).unwrap();
+    let address = server.local_addr().unwrap();
+
+    let mut phone = Phone::start();
+    phone.command("register");
+    phone.expect("Usage: register");
+    phone.command(&format!("register {address} alice secret example.com"));
+
+    let (request, peer) = receive(&server);
+    assert_eq!(request.target, "sip:example.com");
+    assert_eq!(request.headers.get("to"), Some("<sip:alice@example.com>"));
+    accept(&server, &request, peer);
+    phone.expect("Registration: registered (60 s)");
+    phone.command("status");
+    phone.expect("registration: registered (60 s)");
+    assert!(
+        phone.seen.iter().all(|line| !line.contains("secret")),
+        "the password must not be printed"
+    );
+
+    // Quitting removes the registration before the program exits.
+    phone.command("quit");
+    let (removal, peer) = receive(&server);
+    assert_eq!(removal.headers.get("expires"), Some("0"));
+    accept(&server, &removal, peer);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Some(status) = phone.child.try_wait().unwrap() {
+            assert!(status.success(), "phone-engine exited with {status}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "phone-engine did not exit");
+        thread::sleep(Duration::from_millis(20));
+    }
+}

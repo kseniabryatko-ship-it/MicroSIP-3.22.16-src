@@ -117,7 +117,7 @@ impl CallView {
                 self.phase = Phase::Idle;
                 self.last_end = Some(*reason);
             }
-            Event::Error(_) => {}
+            Event::Registration(_) | Event::Error(_) => {}
         }
     }
 }

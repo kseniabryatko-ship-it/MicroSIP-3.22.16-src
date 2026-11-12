@@ -5,17 +5,21 @@
 //! come out. Incoming datagrams are classified here, before the engine, so a
 //! retransmitted INVITE or a stray request never becomes an engine input.
 //!
-//! Scope: direct UDP, one call, no proxy routing (no Route/Record-Route), no
-//! registration. Retransmission timers follow the RFC 3261 doubling scheme
-//! with fixed constants; the older `transaction` module is not used here.
+//! Scope: direct UDP, one call, no proxy routing (no Route/Record-Route).
+//! One account can be registered on a SIP server through the same socket;
+//! the REGISTER logic lives in `registration`. Retransmission timers follow
+//! the RFC 3261 doubling scheme with fixed constants; the older `transaction`
+//! module is not used here.
 
 use crate::call_engine::{Action, CallEngine, Command, Input, State};
 use crate::call_media::Media;
 use crate::dialog::{DialogConfig, EstablishedDialog};
 use crate::invite_control::{build_cancel, build_failure_ack};
+use crate::registration::{Account, Output, Registration, RegistrationState};
 use crate::sip::message::{Headers, InviteRequest, Message, Request, Response, ResponseBuilder};
 use crate::sip::sdp::{MediaKind, Sdp};
 use crate::transaction_headers::TransactionHeaders;
+use crate::transport::resolve_socket_address;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::io;
@@ -31,12 +35,17 @@ const TICK: Duration = Duration::from_millis(10);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// Commands from the user interface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
     Dial(SocketAddr),
     Answer,
     Reject,
     Hangup,
+    /// Registers the account on its SIP server and keeps it registered.
+    /// Progress is reported with [`Event::Registration`].
+    Register(Account),
+    /// Removes the registration made by [`UiCommand::Register`].
+    Unregister,
     Shutdown,
 }
 
@@ -81,6 +90,8 @@ pub enum Event {
         received: u64,
     },
     Ended(EndReason),
+    /// The account's registration changed state.
+    Registration(RegistrationState),
     Error(String),
 }
 
@@ -191,6 +202,7 @@ enum RetxKind {
     Cancel,
     Bye,
     Final,
+    Register,
 }
 
 struct Retx {
@@ -275,6 +287,7 @@ struct Runner<M: Media> {
     engine: CallEngine,
     events: Sender<Event>,
     call: Option<Call>,
+    registration: Option<Registration>,
     retx: Vec<Retx>,
     retained: Vec<Retained>,
     pending: VecDeque<Input>,
@@ -301,6 +314,7 @@ impl<M: Media> Runner<M> {
             engine: CallEngine::new(),
             events,
             call: None,
+            registration: None,
             retx: Vec::new(),
             retained: Vec::new(),
             pending: VecDeque::new(),
@@ -336,8 +350,9 @@ impl<M: Media> Runner<M> {
             self.tick_timers();
             self.drain_pending();
 
+            let settled = self.engine.state() == State::Idle && self.registration.is_none();
             if let Some(deadline) = shutdown
-                && (self.engine.state() == State::Idle || Instant::now() >= deadline)
+                && (settled || Instant::now() >= deadline)
             {
                 break;
             }
@@ -346,6 +361,7 @@ impl<M: Media> Runner<M> {
     }
 
     fn begin_shutdown(&mut self) {
+        self.unregister();
         let input = match self.engine.state() {
             State::Outgoing | State::Established => Input::Command(Command::Hangup),
             State::Incoming => Input::Command(Command::Reject),
@@ -372,6 +388,17 @@ impl<M: Media> Runner<M> {
             UiCommand::Answer => self.dispatch(Input::Command(Command::Answer)),
             UiCommand::Reject => self.dispatch(Input::Command(Command::Reject)),
             UiCommand::Hangup => self.dispatch(Input::Command(Command::Hangup)),
+            UiCommand::Register(account) => {
+                self.register(account);
+                Ok(())
+            }
+            UiCommand::Unregister => {
+                if self.registration.is_none() {
+                    self.emit(Event::Registration(RegistrationState::Unregistered));
+                }
+                self.unregister();
+                Ok(())
+            }
             UiCommand::Shutdown => Ok(()),
         };
         if let Err(error) = result {
@@ -414,7 +441,118 @@ impl<M: Media> Runner<M> {
     }
 
     fn contact(&self) -> String {
-        format!("<sip:{}@{}>", self.user, self.local)
+        // While registered, calls use the account's user name.
+        let user = self
+            .registration
+            .as_ref()
+            .map_or(self.user.as_str(), Registration::username);
+        format!("<sip:{user}@{}>", self.local)
+    }
+
+    // ----- registration ----------------------------------------------------
+
+    fn register(&mut self, account: Account) {
+        if self
+            .registration
+            .as_ref()
+            .is_some_and(Registration::is_bound)
+        {
+            self.report("already registered; unregister first".to_owned());
+            return;
+        }
+        // An attempt that never succeeded is simply replaced.
+        if let Some(old) = self.registration.take() {
+            let id = old.call_id().to_owned();
+            self.stop_retx(&id, &[RetxKind::Register]);
+        }
+
+        let seed = self.unique();
+        let created = account
+            .server_host_port()
+            .and_then(|(host, port)| {
+                // Name resolution blocks this thread; it happens once per command.
+                resolve_socket_address(&host, port)
+                    .map_err(|error| format!("cannot resolve {host}: {error}"))
+            })
+            .and_then(|server| Registration::new(account, server, self.local, &seed));
+        match created {
+            Ok(mut registration) => {
+                let outputs = registration.start();
+                self.registration = Some(registration);
+                self.apply_registration(outputs);
+            }
+            Err(reason) => self.emit(Event::Registration(RegistrationState::Failed(reason))),
+        }
+    }
+
+    fn unregister(&mut self) {
+        if let Some(registration) = self.registration.as_mut() {
+            let outputs = registration.unregister();
+            self.apply_registration(outputs);
+        }
+    }
+
+    fn apply_registration(&mut self, outputs: Vec<Output>) {
+        let Some((server, id)) = self
+            .registration
+            .as_ref()
+            .map(|registration| (registration.server(), registration.call_id().to_owned()))
+        else {
+            return;
+        };
+        for output in outputs {
+            match output {
+                Output::Send(bytes) => {
+                    self.stop_retx(&id, &[RetxKind::Register]);
+                    if let Err(error) = self.send(&bytes, server) {
+                        // The retransmission below repeats the attempt.
+                        self.report(format!("Cannot send REGISTER: {error}"));
+                    }
+                    self.start_retx(
+                        RetxKind::Register,
+                        id.clone(),
+                        bytes,
+                        server,
+                        self.timers.t2,
+                    );
+                }
+                Output::State(state) => self.emit(Event::Registration(state)),
+            }
+        }
+        if self
+            .registration
+            .as_ref()
+            .is_some_and(Registration::is_finished)
+        {
+            self.stop_retx(&id, &[RetxKind::Register]);
+            self.registration = None;
+        }
+    }
+
+    /// Returns true when the response belonged to the registration.
+    fn on_register_response(
+        &mut self,
+        response: &Response,
+        headers: &TransactionHeaders,
+        source: SocketAddr,
+    ) -> bool {
+        let Some(registration) = self.registration.as_mut() else {
+            return false;
+        };
+        if headers.method != "REGISTER"
+            || source != registration.server()
+            || headers.call_id != registration.call_id()
+        {
+            return false;
+        }
+        if let Some(outputs) = registration.on_response(response, headers, Instant::now()) {
+            if response.status_code >= 200 {
+                let id = headers.call_id.clone();
+                self.stop_retx(&id, &[RetxKind::Register]);
+            }
+            self.apply_registration(outputs);
+        }
+        true
     }
 
     // ----- engine plumbing -------------------------------------------------
@@ -713,7 +851,23 @@ impl<M: Media> Runner<M> {
         self.retx.retain(|retx| now < retx.deadline);
         self.retained.retain(|entry| now < entry.expires);
 
+        if let Some(registration) = self.registration.as_mut() {
+            let outputs = registration.poll(now);
+            self.apply_registration(outputs);
+        }
+
         for (kind, call_id) in expired {
+            if kind == RetxKind::Register {
+                if let Some(registration) = self
+                    .registration
+                    .as_mut()
+                    .filter(|registration| registration.call_id() == call_id)
+                {
+                    let outputs = registration.on_timeout(now);
+                    self.apply_registration(outputs);
+                }
+                continue;
+            }
             let current = self
                 .call
                 .as_ref()
@@ -956,6 +1110,9 @@ impl<M: Media> Runner<M> {
         let Ok(headers) = TransactionHeaders::from_message(message) else {
             return Ok(());
         };
+        if self.on_register_response(response, &headers, source) {
+            return Ok(());
+        }
         let Some(call) = self.call.as_ref() else {
             return Ok(());
         };

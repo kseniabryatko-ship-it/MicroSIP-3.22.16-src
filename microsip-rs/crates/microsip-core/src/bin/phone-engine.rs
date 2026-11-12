@@ -5,6 +5,7 @@
 
 use microsip_core::call_media::{AudioMedia, NullMedia};
 use microsip_core::call_runner::{CallHandle, EndReason, Event, UiCommand, spawn};
+use microsip_core::registration::Account;
 use std::error::Error;
 use std::io::{self, BufRead};
 use std::net::SocketAddr;
@@ -15,7 +16,13 @@ use std::time::Duration;
 const HELP: &str = "Usage: phone-engine.exe LOCAL_IP:SIP_PORT [--no-audio]\n\
 Port 0 picks a free port; the chosen address is printed on the first line.\n\
 Commands: call IP:PORT | answer | reject | hangup | status | quit\n\
-Direct UDP calls only; no registration or proxy. --no-audio runs without sound devices.";
+          register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister\n\
+Direct UDP calls only. register keeps the account registered on a SIP server\n\
+so that the server can send calls here; outgoing calls still go to IP:PORT.\n\
+--no-audio runs without sound devices.";
+
+const COMMANDS: &str = "Commands: call IP:PORT | answer | reject | hangup | status | quit | \
+register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -42,6 +49,7 @@ struct Phone {
     handle: CallHandle,
     local: SocketAddr,
     state: State,
+    registration: String,
     quitting: bool,
 }
 
@@ -78,6 +86,10 @@ impl Phone {
                 self.state = State::Idle;
                 println!("Call ended: {}", describe(reason));
             }
+            Event::Registration(state) => {
+                self.registration = state.to_string();
+                println!("Registration: {state}");
+            }
             Event::Error(message) => println!("Error: {message}"),
         }
     }
@@ -109,11 +121,27 @@ impl Phone {
                     self.handle.send(UiCommand::Hangup);
                 }
             }
-            Some("status") => println!("State: {}; local: {}", self.state.name(), self.local),
-            Some("quit") => self.begin_quit(),
-            Some(_) => {
-                println!("Commands: call IP:PORT | answer | reject | hangup | status | quit")
+            Some("status") => println!(
+                "State: {}; local: {}; registration: {}",
+                self.state.name(),
+                self.local,
+                self.registration
+            ),
+            Some("register") => {
+                let (server, user, password) = (parts.next(), parts.next(), parts.next());
+                let (Some(server), Some(user), Some(password)) = (server, user, password) else {
+                    println!("Usage: register SERVER[:PORT] USER PASSWORD [DOMAIN]");
+                    return;
+                };
+                let account =
+                    Account::new(server, user, password).with_domain(parts.next().unwrap_or(""));
+                self.handle.send(UiCommand::Register(account));
             }
+            Some("unregister") => {
+                self.handle.send(UiCommand::Unregister);
+            }
+            Some("quit") => self.begin_quit(),
+            Some(_) => println!("{COMMANDS}"),
         }
     }
 
@@ -193,7 +221,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // With port 0 the system chose the port; report the real address.
     let local = handle.local_address();
     println!("Listening on {local}");
-    println!("Commands: call IP:PORT | answer | reject | hangup | status | quit");
+    println!("{COMMANDS}");
     if no_audio {
         println!("Audio is disabled (--no-audio).");
     } else {
@@ -218,6 +246,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         handle,
         local,
         state: State::Idle,
+        registration: "not registered".to_owned(),
         quitting: false,
     };
     let mut input_open = true;

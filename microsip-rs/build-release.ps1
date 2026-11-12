@@ -197,7 +197,10 @@ PCMU/RTP audio in both directions.
 
 LIMITATIONS
 -----------
-No provider registration, proxy or account settings.
+Registration on a SIP server (Register button) is new: it was tested only
+against a scripted test server, not against a real provider or PBX.
+Outgoing calls through a server are not supported yet; Call still
+dials Remote IP:port directly. Account settings are not saved.
 No guarantee of NAT traversal or interoperability with third-party phones.
 No TLS/SRTP, RTCP, jitter buffer, call hold or transfer.
 No installer, code signature or automatic updates.

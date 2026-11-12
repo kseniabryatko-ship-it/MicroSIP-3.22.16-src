@@ -4,6 +4,7 @@ use eframe::egui;
 use microsip_core::call_media::AudioMedia;
 use microsip_core::call_runner::{CallHandle, Event, UiCommand, spawn};
 use microsip_core::call_view::{CallView, Phase};
+use microsip_core::registration::{Account, RegistrationState};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -13,6 +14,11 @@ const LOG_LIMIT: usize = 1_000;
 struct PhoneWindow {
     local: String,
     remote: String,
+    server: String,
+    user: String,
+    password: String,
+    domain: String,
+    registration: Option<RegistrationState>,
     handle: Option<CallHandle>,
     view: CallView,
     logs: VecDeque<String>,
@@ -24,6 +30,11 @@ impl PhoneWindow {
         Self {
             local: "127.0.0.1:5070".to_owned(),
             remote: "127.0.0.1:5072".to_owned(),
+            server: String::new(),
+            user: String::new(),
+            password: String::new(),
+            domain: String::new(),
+            registration: None,
             handle: None,
             view: CallView::default(),
             logs: VecDeque::new(),
@@ -75,6 +86,7 @@ impl PhoneWindow {
             // Dropping the handle ends any call properly and joins the thread.
             drop(handle);
             self.view = CallView::default();
+            self.registration = None;
             self.log("Phone stopped.");
         }
     }
@@ -88,6 +100,47 @@ impl PhoneWindow {
             self.error("The phone has stopped unexpectedly; start it again.");
             self.handle = None;
             self.view = CallView::default();
+            self.registration = None;
+        }
+    }
+
+    fn can_register(&self) -> bool {
+        !matches!(
+            self.registration,
+            Some(RegistrationState::Registering | RegistrationState::Registered { .. })
+        )
+    }
+
+    fn can_unregister(&self) -> bool {
+        !matches!(
+            self.registration,
+            None | Some(RegistrationState::Unregistered)
+        )
+    }
+
+    fn register(&mut self) {
+        if !self.can_register() {
+            return;
+        }
+        if self.server.trim().is_empty() || self.user.trim().is_empty() {
+            return self.error("Enter the SIP server and the user name");
+        }
+        self.last_error = None;
+        let account = Account::new(self.server.trim(), self.user.trim(), self.password.clone())
+            .with_domain(self.domain.trim());
+        // The password is never written to the log.
+        self.log(format!(
+            "> register {} on {}",
+            self.user.trim(),
+            self.server.trim()
+        ));
+        self.send(UiCommand::Register(account));
+    }
+
+    fn unregister(&mut self) {
+        if self.can_unregister() {
+            self.log("> unregister");
+            self.send(UiCommand::Unregister);
         }
     }
 
@@ -145,6 +198,10 @@ impl PhoneWindow {
                     self.log(format!("RTP sent: {sent}; RTP received: {received}"));
                 }
                 Event::Ended(reason) => self.log(format!("Call ended: {reason}")),
+                Event::Registration(state) => {
+                    self.log(format!("Account: {state}"));
+                    self.registration = Some(state);
+                }
                 Event::Error(message) => self.error(message),
             }
         }
@@ -159,7 +216,7 @@ impl eframe::App for PhoneWindow {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("MicroSIP Rust — direct-call preview");
-            ui.label("Direct UDP / PCMU. No provider registration, NAT or encryption yet.");
+            ui.label("Direct UDP / PCMU. Registration on a SIP server; no NAT or encryption yet.");
             ui.separator();
 
             ui.add_enabled_ui(!running, |ui| {
@@ -183,6 +240,49 @@ impl eframe::App for PhoneWindow {
                     self.stop();
                 }
             });
+
+            ui.separator();
+            let editable = running && self.can_register();
+            ui.add_enabled_ui(editable, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("SIP server");
+                    ui.text_edit_singleline(&mut self.server);
+                    ui.label("Domain (optional)");
+                    ui.text_edit_singleline(&mut self.domain);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("User");
+                    ui.text_edit_singleline(&mut self.user);
+                    ui.label("Password");
+                    ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                });
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(editable, egui::Button::new("Register"))
+                    .clicked()
+                {
+                    self.register();
+                }
+                if ui
+                    .add_enabled(
+                        running && self.can_unregister(),
+                        egui::Button::new("Unregister"),
+                    )
+                    .clicked()
+                {
+                    self.unregister();
+                }
+                match self.registration.as_ref() {
+                    Some(state) => ui.label(format!("Account: {state}")),
+                    None => ui.label("Account: not registered"),
+                };
+            });
+            ui.label(
+                "To register, Local must be this computer's network address, not 127.0.0.1. \
+                 The server can then send calls here; outgoing calls still go to Remote IP:port.",
+            );
+            ui.separator();
 
             ui.add_enabled_ui(running && self.view.can_dial(), |ui| {
                 ui.horizontal(|ui| {
@@ -235,7 +335,7 @@ impl eframe::App for PhoneWindow {
             } else {
                 ui.label("The phone is not running.");
             }
-            ui.label("Closing the window ends an active call with a proper BYE.");
+            ui.label("Closing the window ends an active call with a proper BYE and removes the registration.");
             if let Some(error) = self.last_error.as_ref() {
                 ui.colored_label(egui::Color32::RED, error);
             }
