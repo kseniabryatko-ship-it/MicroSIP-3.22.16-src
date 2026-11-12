@@ -275,6 +275,36 @@ impl Registration {
         &self.username
     }
 
+    /// The SIP domain of the address of record.
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    /// Answers a 401/407 challenge for another request of this account, for
+    /// example INVITE. Returns the header name and value to add.
+    pub fn authorize(
+        &self,
+        response: &Response,
+        method: &str,
+        uri: &str,
+    ) -> Result<(&'static str, String), String> {
+        let (challenge_name, answer_name) = challenge_headers(response.status_code);
+        let value = response
+            .headers
+            .get(challenge_name)
+            .ok_or("the SIP server asked for a password without a Digest challenge")?;
+        let challenge = DigestChallenge::parse(value).map_err(|error| error.to_string())?;
+        let answer = authorization_header(
+            &challenge,
+            self.account.effective_auth_username(),
+            &self.account.password,
+            method,
+            uri,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok((answer_name, answer))
+    }
+
     /// True while the server may hold a binding that should be removed.
     pub fn is_bound(&self) -> bool {
         self.bound
@@ -373,7 +403,7 @@ impl Registration {
         if transaction.removing {
             // Removal is best effort, except that a challenge is answered.
             if matches!(status, 401 | 407) && transaction.challenges == 0 {
-                match self.authorization(response, status) {
+                match self.authorization(response) {
                     Ok(authorization) => {
                         self.send(true, Some(authorization), 1, false, &mut outputs);
                     }
@@ -415,7 +445,7 @@ impl Registration {
                         &mut outputs,
                     );
                 } else {
-                    match self.authorization(response, status) {
+                    match self.authorization(response) {
                         Ok(authorization) => self.send(
                             false,
                             Some(authorization),
@@ -540,26 +570,8 @@ impl Registration {
         format!("sip:{}@{}", self.username, self.local)
     }
 
-    fn authorization(
-        &self,
-        response: &Response,
-        status: u16,
-    ) -> Result<(&'static str, String), String> {
-        let (challenge_name, answer_name) = challenge_headers(status);
-        let value = response
-            .headers
-            .get(challenge_name)
-            .ok_or("the SIP server asked for a password without a Digest challenge")?;
-        let challenge = DigestChallenge::parse(value).map_err(|error| error.to_string())?;
-        let answer = authorization_header(
-            &challenge,
-            self.account.effective_auth_username(),
-            &self.account.password,
-            "REGISTER",
-            &self.target(),
-        )
-        .map_err(|error| error.to_string())?;
-        Ok((answer_name, answer))
+    fn authorization(&self, response: &Response) -> Result<(&'static str, String), String> {
+        self.authorize(response, "REGISTER", &self.target())
     }
 
     fn fail(&mut self, reason: String, retry: Option<Instant>, outputs: &mut Vec<Output>) {

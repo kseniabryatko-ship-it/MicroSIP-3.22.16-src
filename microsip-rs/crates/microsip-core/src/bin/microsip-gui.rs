@@ -197,6 +197,10 @@ impl PhoneWindow {
     }
 
     fn call(&mut self) {
+        let target = self.remote.trim().to_owned();
+        if target.parse::<SocketAddr>().is_err() {
+            return self.call_number(target);
+        }
         let local = match Self::address(&self.local) {
             Ok(local) => local,
             Err(error) => return self.error(error),
@@ -216,6 +220,27 @@ impl PhoneWindow {
         self.view.dialing(remote);
         self.log(format!("Calling {remote}"));
         self.send(UiCommand::Dial(remote));
+    }
+
+    /// Anything that is not `IP:port` is a number on the SIP server.
+    fn call_number(&mut self, target: String) {
+        if target.is_empty() {
+            return self.error("Enter IP:port or a number");
+        }
+        if !matches!(
+            self.registration,
+            Some(RegistrationState::Registered { .. })
+        ) {
+            return self.error("Register on a SIP server to call a number, or enter IP:port");
+        }
+        if !self.view.can_dial() {
+            return;
+        }
+        self.last_error = None;
+        self.save_settings();
+        self.view.dialing_target(&target);
+        self.log(format!("Calling {target} through the SIP server"));
+        self.send(UiCommand::DialTarget(target));
     }
 
     fn answer(&mut self) {
@@ -276,7 +301,7 @@ impl eframe::App for PhoneWindow {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("MicroSIP Rust — direct-call preview");
-            ui.label("Direct UDP / PCMU. Registration on a SIP server; no NAT or encryption yet.");
+            ui.label("UDP / PCMU. Direct calls and calls through a SIP server; no NAT or encryption yet.");
             ui.separator();
 
             ui.add_enabled_ui(!running, |ui| {
@@ -340,13 +365,13 @@ impl eframe::App for PhoneWindow {
             });
             ui.label(
                 "To register, Local must be this computer's network address, not 127.0.0.1. \
-                 The server can then send calls here; outgoing calls still go to Remote IP:port.",
+                 Once registered, a number typed into Remote is called through the server.",
             );
             ui.separator();
 
             ui.add_enabled_ui(running && self.view.can_dial(), |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Remote IP:port");
+                    ui.label("Remote IP:port or number");
                     ui.text_edit_singleline(&mut self.remote);
                 });
             });
@@ -381,7 +406,7 @@ impl eframe::App for PhoneWindow {
 
             if running {
                 let phase = self.view.phase();
-                match (phase, self.view.peer()) {
+                match (phase, self.view.peer_label()) {
                     (Phase::Idle, _) | (_, None) => {
                         ui.label(format!("Status: {}", phase.label()));
                     }

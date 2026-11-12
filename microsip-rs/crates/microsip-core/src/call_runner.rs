@@ -5,9 +5,11 @@
 //! come out. Incoming datagrams are classified here, before the engine, so a
 //! retransmitted INVITE or a stray request never becomes an engine input.
 //!
-//! Scope: direct UDP, one call, no proxy routing (no Route/Record-Route).
-//! One account can be registered on a SIP server through the same socket;
-//! the REGISTER logic lives in `registration`. Retransmission timers follow
+//! Scope: UDP, one call. One account can be registered on a SIP server through
+//! the same socket; the REGISTER logic lives in `registration`. While it is
+//! registered, a number can be called through that server: the INVITE answers
+//! one 401/407 challenge, and the Record-Route set of a loose-routing proxy is
+//! used for ACK and BYE (every request still goes to the first hop). Retransmission timers follow
 //! the RFC 3261 doubling scheme with fixed constants; the older `transaction`
 //! module is not used here.
 
@@ -38,6 +40,9 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
     Dial(SocketAddr),
+    /// Calls `IP:port` directly, or a number (`100`, `100@domain`) through
+    /// the SIP server the account is registered on.
+    DialTarget(String),
     Answer,
     Reject,
     Hangup,
@@ -244,6 +249,20 @@ struct Call {
     incoming_bye: Option<Request>,
     reason: Option<EndReason>,
     ringing_reported: bool,
+    /// Set for a call placed through the registrar.
+    server: Option<ServerCall>,
+    /// Route header values for requests inside the dialog.
+    route_set: Vec<String>,
+    /// The INVITE replaced by an authorized one, with the ACK sent for it.
+    superseded: Option<(TransactionHeaders, Vec<u8>)>,
+}
+
+struct ServerCall {
+    target: String,
+    from_uri: String,
+    contact_uri: String,
+    from_tag: String,
+    authorized: bool,
 }
 
 impl Call {
@@ -274,6 +293,9 @@ impl Call {
             incoming_bye: None,
             reason: None,
             ringing_reported: false,
+            server: None,
+            route_set: Vec::new(),
+            superseded: None,
         })
     }
 }
@@ -377,6 +399,18 @@ impl<M: Media> Runner<M> {
                 let result = self.dial(peer);
                 if result.is_err() && was_idle && self.engine.state() == State::Idle {
                     // Tell the interface the attempt is over, not just why.
+                    if let Err(error) = &result {
+                        self.report(error.to_string());
+                    }
+                    self.emit(Event::Ended(EndReason::Failed));
+                    return;
+                }
+                result
+            }
+            UiCommand::DialTarget(target) => {
+                let was_idle = self.engine.state() == State::Idle;
+                let result = self.dial_target(&target);
+                if result.is_err() && was_idle && self.engine.state() == State::Idle {
                     if let Err(error) = &result {
                         self.report(error.to_string());
                     }
@@ -738,6 +772,9 @@ impl<M: Media> Runner<M> {
             .ok_or("no 2xx response to acknowledge")?;
 
         call.remote_rtp = media_address(&response.body).ok();
+        // The caller uses the recorded route in reverse order.
+        call.route_set = record_routes(&response.headers);
+        call.route_set.reverse();
         let mut dialog = EstablishedDialog::new(DialogConfig {
             remote_target: contact_uri(&response.headers)?,
             local_from: tagged(header(&call.invite.headers, "from")?)?,
@@ -748,7 +785,9 @@ impl<M: Media> Runner<M> {
             invite_cseq: call.invite_headers.cseq,
             invite_branch: call.invite_headers.branch.clone(),
         })?;
-        let bytes = dialog.build_success_ack(&branch)?.serialize()?;
+        let mut ack = dialog.build_success_ack(&branch)?;
+        add_routes(&mut ack, &call.route_set)?;
+        let bytes = ack.serialize()?;
         call.dialog = Some(dialog);
         call.ack_bytes = Some(bytes.clone());
         let peer = call.peer;
@@ -780,7 +819,8 @@ impl<M: Media> Runner<M> {
             })?);
         }
         let dialog = call.dialog.as_mut().ok_or("no dialog")?;
-        let request = dialog.build_bye(&branch)?;
+        let mut request = dialog.build_bye(&branch)?;
+        add_routes(&mut request, &call.route_set)?;
         let headers = TransactionHeaders::from_message(&Message::Request(request.clone()))?;
         let bytes = request.serialize()?;
         call.bye_request = Some(request);
@@ -1043,6 +1083,8 @@ impl<M: Media> Runner<M> {
         let tag = format!("rs-{}", self.unique());
         let mut call = Call::new(source, request.clone(), local_rtp, tag)?;
         call.remote_rtp = Some(remote_rtp);
+        // The called side uses the recorded route in the order received.
+        call.route_set = record_routes(&request.headers);
         self.call = Some(call);
 
         let trying = self.invite_response(100, "Trying", None)?;
@@ -1125,6 +1167,19 @@ impl<M: Media> Runner<M> {
             "INVITE" if call.invite_headers.matches_response(&headers) => {
                 self.on_invite_response(response, status)
             }
+            "INVITE"
+                if status >= 300
+                    && call
+                        .superseded
+                        .as_ref()
+                        .is_some_and(|(sent, _)| sent.matches_response(&headers)) =>
+            {
+                // The ACK for the challenged INVITE was lost; repeat it.
+                if let Some((_, ack)) = call.superseded.as_ref() {
+                    self.send(ack, source)?;
+                }
+                Ok(())
+            }
             "CANCEL"
                 if call
                     .cancel_headers
@@ -1185,6 +1240,13 @@ impl<M: Media> Runner<M> {
             return Ok(());
         }
 
+        if matches!(status, 401 | 407)
+            && state == State::Outgoing
+            && self.retry_with_credentials(response)?
+        {
+            return Ok(());
+        }
+
         self.stop_retx(&id, &[RetxKind::Invite, RetxKind::Cancel]);
         match state {
             State::Outgoing => {
@@ -1209,36 +1271,138 @@ impl<M: Media> Runner<M> {
     // ----- outgoing call ---------------------------------------------------
 
     fn dial(&mut self, peer: SocketAddr) -> Result<()> {
-        if self.engine.state() != State::Idle {
-            return Err("a call is already in progress".into());
-        }
         if peer.port() == 0 || peer.ip().is_unspecified() || peer.is_ipv4() != self.local.is_ipv4()
         {
             return Err("invalid destination address".into());
         }
+        let (user, local) = (self.user.clone(), self.local);
+        self.start_call(
+            peer,
+            format!("sip:{user}@{peer}"),
+            format!("sip:{user}@{local}"),
+            format!("sip:{user}@{local}"),
+            false,
+        )
+    }
 
+    /// `IP:port` is called directly; anything else is a number or user on the
+    /// SIP server the account is registered on.
+    fn dial_target(&mut self, text: &str) -> Result<()> {
+        let text = text.trim();
+        if let Ok(peer) = text.parse::<SocketAddr>() {
+            return self.dial(peer);
+        }
+        let registration = self
+            .registration
+            .as_ref()
+            .filter(|registration| registration.is_bound())
+            .ok_or("register on a SIP server before calling a number")?;
+        let target = server_target(text, registration.domain())?;
+        let peer = registration.server();
+        let from_uri = format!("sip:{}@{}", registration.username(), registration.domain());
+        let contact_uri = format!("sip:{}@{}", registration.username(), self.local);
+        self.start_call(peer, target, from_uri, contact_uri, true)
+    }
+
+    fn start_call(
+        &mut self,
+        peer: SocketAddr,
+        target: String,
+        from_uri: String,
+        contact_uri: String,
+        through_server: bool,
+    ) -> Result<()> {
+        if self.engine.state() != State::Idle {
+            return Err("a call is already in progress".into());
+        }
         let local_rtp = self.media.prepare(self.local.ip())?;
-        let user = self.user.clone();
         let local = self.local;
         let call_id = format!("{}@{}", self.unique(), local.ip());
         let branch = self.branch();
-        let tag = self.unique();
+        let from_tag = self.unique();
         let invite = InviteRequest::new(
-            format!("sip:{user}@{peer}"),
-            format!("sip:{user}@{local}"),
-            format!("sip:{user}@{peer}"),
-            format!("sip:{user}@{local}"),
+            target.clone(),
+            from_uri.clone(),
+            target.clone(),
+            contact_uri.clone(),
             local.to_string(),
             call_id,
             branch,
-            tag,
+            from_tag.clone(),
         )
         .body(make_sdp(local_rtp).into_bytes())
         .build()?;
 
         let local_tag = format!("rs-{}", self.unique());
-        self.call = Some(Call::new(peer, invite, local_rtp, local_tag)?);
+        let mut call = Call::new(peer, invite, local_rtp, local_tag)?;
+        if through_server {
+            call.server = Some(ServerCall {
+                target,
+                from_uri,
+                contact_uri,
+                from_tag,
+                authorized: false,
+            });
+        }
+        self.call = Some(call);
         self.dispatch(Input::Command(Command::Dial))
+    }
+
+    /// Answers a 401/407 to an INVITE sent through the server: acknowledges
+    /// it and sends the INVITE again with credentials, once per call. Returns
+    /// false when the response must end the call instead.
+    fn retry_with_credentials(&mut self, response: &Response) -> Result<bool> {
+        let Some(call) = self.call.as_ref() else {
+            return Ok(false);
+        };
+        let Some(server) = call.server.as_ref() else {
+            return Ok(false);
+        };
+        // A second challenge means wrong credentials; a hang-up already given
+        // must not be overtaken by a new INVITE.
+        if server.authorized || call.reason.is_some() || call.cancel_request.is_some() {
+            return Ok(false);
+        }
+        let Some(registration) = self.registration.as_ref() else {
+            return Ok(false);
+        };
+        let Ok((name, value)) = registration.authorize(response, "INVITE", &server.target) else {
+            return Ok(false);
+        };
+
+        let ack = build_failure_ack(&call.invite, response)?.serialize()?;
+        let (peer, id) = (call.peer, call.call_id.clone());
+        let old_headers = call.invite_headers.clone();
+        let mut invite = InviteRequest::new(
+            server.target.clone(),
+            server.from_uri.clone(),
+            server.target.clone(),
+            server.contact_uri.clone(),
+            self.local.to_string(),
+            id.clone(),
+            format!(
+                "z9hG4bK-{}-auth",
+                old_headers.branch.trim_start_matches("z9hG4bK-")
+            ),
+            server.from_tag.clone(),
+        )
+        .cseq(old_headers.cseq + 1)
+        .body(make_sdp(call.local_rtp).into_bytes())
+        .build()?;
+        invite.headers.insert(name, value)?;
+        let invite_headers = TransactionHeaders::from_message(&Message::Request(invite.clone()))?;
+
+        self.send(&ack, peer)?;
+        self.stop_retx(&id, &[RetxKind::Invite]);
+        let call = self.call_mut()?;
+        call.superseded = Some((old_headers, ack));
+        call.invite = invite;
+        call.invite_headers = invite_headers;
+        if let Some(server) = call.server.as_mut() {
+            server.authorized = true;
+        }
+        self.execute(Action::SendInvite)?;
+        Ok(true)
     }
 }
 
@@ -1295,6 +1459,12 @@ fn build_response(
         .header("to", to)?
         .header("call-id", header(&request.headers, "call-id")?)?
         .header("cseq", header(&request.headers, "cseq")?)?;
+    if request.method.as_str() == "INVITE" {
+        // A proxy that recorded itself must see its route in the answer.
+        for route in request.headers.get_all("record-route") {
+            builder = builder.append_header("record-route", route)?;
+        }
+    }
     if let Some(contact) = contact {
         builder = builder.header("contact", contact)?;
     }
@@ -1337,6 +1507,56 @@ fn contact_uri(headers: &Headers) -> Result<String> {
         return Err("unsupported Contact".into());
     }
     Ok(uri)
+}
+
+/// Record-Route entries in header order; one header may list several.
+fn record_routes(headers: &Headers) -> Vec<String> {
+    let mut routes = Vec::new();
+    for value in headers.get_all("record-route") {
+        let mut depth = 0_u32;
+        let mut start = 0;
+        for (index, character) in value.char_indices() {
+            match character {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    routes.push(value[start..index].trim().to_owned());
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        routes.push(value[start..].trim().to_owned());
+    }
+    routes.retain(|route| !route.is_empty());
+    routes
+}
+
+fn add_routes(request: &mut Request, routes: &[String]) -> Result<()> {
+    for route in routes {
+        request.headers.append("route", route.as_str())?;
+    }
+    Ok(())
+}
+
+/// Request-URI for a number or user typed by the user: `100`, `100@host`
+/// or `sip:100@host`.
+fn server_target(text: &str, domain: &str) -> Result<String> {
+    let text = text.strip_prefix("sip:").unwrap_or(text);
+    let (user, host) = match text.split_once('@') {
+        Some((user, host)) => (user, host),
+        None => (text, domain),
+    };
+    let bad = |part: &str| {
+        part.is_empty()
+            || part.contains(|character: char| {
+                character.is_whitespace() || matches!(character, '@' | '<' | '>' | ';' | ',')
+            })
+    };
+    if bad(user) || bad(host) || user.contains(':') {
+        return Err("invalid number or SIP address".into());
+    }
+    Ok(format!("sip:{user}@{host}"))
 }
 
 fn make_sdp(address: SocketAddr) -> String {

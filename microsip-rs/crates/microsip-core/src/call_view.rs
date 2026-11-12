@@ -38,6 +38,7 @@ impl Phase {
 pub struct CallView {
     phase: Phase,
     peer: Option<SocketAddr>,
+    target: Option<String>,
     stats: Option<(u64, u64)>,
     last_end: Option<EndReason>,
 }
@@ -49,6 +50,13 @@ impl CallView {
 
     pub fn peer(&self) -> Option<SocketAddr> {
         self.peer
+    }
+
+    /// Who the call is with: the dialled number, or else the peer address.
+    pub fn peer_label(&self) -> Option<String> {
+        self.target
+            .clone()
+            .or_else(|| self.peer.map(|peer| peer.to_string()))
     }
 
     /// RTP packets (sent, received) of the call that just ended.
@@ -86,6 +94,18 @@ impl CallView {
         if self.can_dial() {
             self.phase = Phase::Calling;
             self.peer = Some(peer);
+            self.target = None;
+            self.stats = None;
+            self.last_end = None;
+        }
+    }
+
+    /// Call right after sending `UiCommand::DialTarget` with a number.
+    pub fn dialing_target(&mut self, target: &str) {
+        if self.can_dial() {
+            self.phase = Phase::Calling;
+            self.peer = None;
+            self.target = Some(target.trim().to_owned());
             self.stats = None;
             self.last_end = None;
         }
@@ -103,6 +123,7 @@ impl CallView {
             Event::Incoming { peer } => {
                 self.phase = Phase::Incoming;
                 self.peer = Some(*peer);
+                self.target = None;
                 self.stats = None;
                 self.last_end = None;
             }
@@ -200,6 +221,25 @@ mod tests {
         view.dialing("127.0.0.1:6000".parse().unwrap());
         assert_eq!(view.phase(), Phase::Incoming);
         assert_eq!(view.peer(), Some(peer()));
+    }
+
+    #[test]
+    fn dialled_number_is_the_label_until_another_call_replaces_it() {
+        let mut view = CallView::default();
+        assert_eq!(view.peer_label(), None);
+
+        view.dialing_target(" 100 ");
+        assert_eq!(view.phase(), Phase::Calling);
+        assert!(view.can_hangup());
+        assert_eq!(view.peer_label(), Some("100".to_owned()));
+        view.on_event(&Event::Ended(EndReason::Rejected(486)));
+
+        view.on_event(&Event::Incoming { peer: peer() });
+        assert_eq!(view.peer_label(), Some("127.0.0.1:5070".to_owned()));
+        view.on_event(&Event::Ended(EndReason::Cancelled));
+
+        view.dialing(peer());
+        assert_eq!(view.peer_label(), Some("127.0.0.1:5070".to_owned()));
     }
 
     #[test]

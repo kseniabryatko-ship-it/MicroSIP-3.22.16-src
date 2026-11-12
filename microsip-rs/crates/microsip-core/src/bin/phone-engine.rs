@@ -5,7 +5,7 @@
 
 use microsip_core::call_media::{AudioMedia, NullMedia};
 use microsip_core::call_runner::{CallHandle, EndReason, Event, UiCommand, spawn};
-use microsip_core::registration::Account;
+use microsip_core::registration::{Account, RegistrationState};
 use std::error::Error;
 use std::io::{self, BufRead};
 use std::net::SocketAddr;
@@ -15,13 +15,14 @@ use std::time::Duration;
 
 const HELP: &str = "Usage: phone-engine.exe LOCAL_IP:SIP_PORT [--no-audio]\n\
 Port 0 picks a free port; the chosen address is printed on the first line.\n\
-Commands: call IP:PORT | answer | reject | hangup | status | quit\n\
+Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit\n\
           register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister\n\
-Direct UDP calls only. register keeps the account registered on a SIP server\n\
-so that the server can send calls here; outgoing calls still go to IP:PORT.\n\
+call IP:PORT dials directly. register keeps the account registered on a SIP\n\
+server; after that the server can send calls here and call NUMBER (or\n\
+USER@DOMAIN) dials through it.\n\
 --no-audio runs without sound devices.";
 
-const COMMANDS: &str = "Commands: call IP:PORT | answer | reject | hangup | status | quit | \
+const COMMANDS: &str = "Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit | \
 register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,7 @@ struct Phone {
     local: SocketAddr,
     state: State,
     registration: String,
+    registered: bool,
     quitting: bool,
 }
 
@@ -88,6 +90,7 @@ impl Phone {
             }
             Event::Registration(state) => {
                 self.registration = state.to_string();
+                self.registered = matches!(state, RegistrationState::Registered { .. });
                 println!("Registration: {state}");
             }
             Event::Error(message) => println!("Error: {message}"),
@@ -151,23 +154,26 @@ impl Phone {
             return;
         }
         let Some(text) = argument else {
-            println!("Usage: call IP:PORT");
+            println!("Usage: call IP:PORT or call NUMBER");
             return;
         };
-        let peer = match text.parse::<SocketAddr>() {
-            Ok(peer) if !peer.ip().is_unspecified() && peer.port() != 0 => peer,
-            Ok(_) => {
-                println!("Error: use a concrete IP and a nonzero port.");
-                return;
+        match text.parse::<SocketAddr>() {
+            Ok(peer) if !peer.ip().is_unspecified() && peer.port() != 0 => {
+                self.state = State::Calling;
+                println!("Calling {peer}");
+                self.handle.send(UiCommand::Dial(peer));
             }
-            Err(error) => {
-                println!("Error: invalid IP:port: {error}");
-                return;
+            Ok(_) => println!("Error: use a concrete IP and a nonzero port."),
+            Err(error) if !self.registered => {
+                println!("Error: invalid IP:port: {error}. Register to call a number.");
             }
-        };
-        self.state = State::Calling;
-        println!("Calling {peer}");
-        self.handle.send(UiCommand::Dial(peer));
+            // Not an address: a number or user on the SIP server.
+            Err(_) => {
+                self.state = State::Calling;
+                println!("Calling {text}");
+                self.handle.send(UiCommand::DialTarget(text.to_owned()));
+            }
+        }
     }
 
     fn begin_quit(&mut self) {
@@ -247,6 +253,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         local,
         state: State::Idle,
         registration: "not registered".to_owned(),
+        registered: false,
         quitting: false,
     };
     let mut input_open = true;

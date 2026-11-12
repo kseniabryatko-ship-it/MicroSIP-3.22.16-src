@@ -187,7 +187,8 @@ CONSOLE PHONE
 -------------
 phone-engine.exe LOCAL_IP:SIP_PORT [--no-audio]
 Port 0 picks a free port; the chosen address is printed first.
-Commands: call IP:PORT, answer, reject, hangup, status, quit.
+Commands: call IP:PORT, call NUMBER, answer, reject, hangup, status,
+quit, register SERVER[:PORT] USER PASSWORD [DOMAIN], unregister.
 
 FEATURES VERIFIED SEPARATELY BY LOCAL CALL TESTS
 -----------------------------------------------
@@ -197,10 +198,11 @@ PCMU/RTP audio in both directions.
 
 LIMITATIONS
 -----------
-Registration on a SIP server (Register button) is new: it was tested only
-against a scripted test server, not against a real provider or PBX.
-Outgoing calls through a server are not supported yet; Call still
-dials Remote IP:port directly.
+Registration on a SIP server (Register button) and calls through it are
+new: they were tested only against a scripted test server, not against
+a real provider or PBX. Once registered, type a number into Remote and
+click Call; IP:port in Remote still dials directly.
+The phone must be reachable from the server: no NAT traversal.
 
 SETTINGS
 --------
