@@ -8,7 +8,7 @@ use microsip_core::audio::{input_device_names, output_device_names};
 use microsip_core::call_media::{AudioControls, AudioMedia};
 use microsip_core::call_runner::{CallHandle, EndReason, Event, TransferState, UiCommand, spawn};
 use microsip_core::call_view::{CallView, Phase};
-use microsip_core::contacts::Contacts;
+use microsip_core::contacts::{Contacts, dialable};
 use microsip_core::history::{CallRecord, Direction, History};
 use microsip_core::localtime::{
     DateTime, format_duration, format_timestamp, now_unix, utc_offset_seconds,
@@ -53,6 +53,10 @@ enum Action {
     ToggleRecording,
     Transfer(String),
     DoNotDisturb(bool),
+    /// Puts the clipboard's text into the number field.
+    Paste,
+    /// Removes the last character of the number.
+    Erase,
     /// Opens a file or folder with the program Windows uses for it.
     Open(PathBuf),
 }
@@ -114,6 +118,10 @@ struct PhoneWindow {
     transfer_to: String,
     /// A change of the do-not-disturb box, applied after drawing.
     pending_dnd: Option<bool>,
+    /// The number was changed by a button: the typing cursor must follow.
+    number_changed: bool,
+    focus_number: bool,
+    paste_requested: bool,
 
     // The phone.
     handle: Option<CallHandle>,
@@ -221,6 +229,9 @@ impl PhoneWindow {
             answer_at: None,
             transfer_to: String::new(),
             pending_dnd: None,
+            number_changed: false,
+            focus_number: true,
+            paste_requested: false,
             handle: None,
             local: None,
             registration: None,
@@ -456,7 +467,8 @@ impl PhoneWindow {
     // ----- calls ---------------------------------------------------------
 
     fn call(&mut self, target: String) {
-        let target = target.trim().to_owned();
+        // Brackets, spaces and dashes of a pasted number are not dialled.
+        let target = dialable(&target);
         if target.is_empty() || !self.view.can_dial() {
             return;
         }
@@ -574,6 +586,7 @@ impl PhoneWindow {
             self.send(UiCommand::Dtmf(digit));
         } else if self.view.can_dial() {
             self.number.push(digit);
+            self.number_changed = true;
         }
     }
 
@@ -771,6 +784,16 @@ impl PhoneWindow {
                     self.send(UiCommand::Transfer(target.trim().to_owned()));
                 }
             }
+            Action::Paste => {
+                // The field is focused and the system is asked to paste; the
+                // text arrives in the next frame like a Ctrl+V would.
+                self.focus_number = true;
+                self.paste_requested = true;
+            }
+            Action::Erase => {
+                self.number.pop();
+                self.number_changed = true;
+            }
             Action::DoNotDisturb(on) => {
                 self.do_not_disturb = on;
                 self.save_settings();
@@ -838,13 +861,49 @@ impl PhoneWindow {
         let phase = self.view.phase();
         let idle = phase == Phase::Idle;
 
+        let number_id = egui::Id::new("number-field");
         let field = egui::TextEdit::singleline(&mut self.number)
+            .id(number_id)
             .hint_text("Номер")
             .font(egui::TextStyle::Heading)
             .desired_width(f32::INFINITY);
         let response = ui.add_enabled(idle, field);
         if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
             actions.push(Action::Call(self.number.clone()));
+        }
+        // Like a telephone, the number field is where typing and pasting go:
+        // it takes the focus back after a button was pressed, unless another
+        // text field (search, contact, settings) is being typed into.
+        let windows_open = self.settings_open || self.log_open;
+        let typing_elsewhere = ui.ctx().wants_keyboard_input() && !response.has_focus();
+        let button_has_focus =
+            ui.memory(|memory| memory.focused().is_some()) && !ui.ctx().wants_keyboard_input();
+        if idle
+            && !windows_open
+            && !typing_elsewhere
+            && (self.focus_number || self.number_changed || button_has_focus)
+        {
+            response.request_focus();
+        }
+        if idle && !windows_open && ui.memory(|memory| memory.focused().is_none()) {
+            response.request_focus();
+        }
+        self.focus_number = false;
+        if self.number_changed {
+            // Keep the typing cursor at the end after a keypad button.
+            self.number_changed = false;
+            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), number_id) {
+                let end = egui::text::CCursor::new(self.number.chars().count());
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(end)));
+                state.store(ui.ctx(), number_id);
+            }
+        }
+        if self.paste_requested && response.has_focus() {
+            self.paste_requested = false;
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
         }
         if idle && let Some(name) = self.contacts.name_of(&self.number) {
             ui.label(name.to_owned());
@@ -880,8 +939,18 @@ impl PhoneWindow {
                     if ui.add_sized(half, call).clicked() {
                         actions.push(Action::Call(self.number.clone()));
                     }
-                    if ui.add_sized(half, egui::Button::new("Стереть")).clicked() {
-                        self.number.pop();
+                    let quarter = egui::vec2((half.x - 8.0) / 2.0, half.y);
+                    if ui
+                        .add_sized(quarter, egui::Button::new("Вставить"))
+                        .clicked()
+                    {
+                        actions.push(Action::Paste);
+                    }
+                    if ui
+                        .add_sized(quarter, egui::Button::new("Стереть"))
+                        .clicked()
+                    {
+                        actions.push(Action::Erase);
                     }
                 });
             }

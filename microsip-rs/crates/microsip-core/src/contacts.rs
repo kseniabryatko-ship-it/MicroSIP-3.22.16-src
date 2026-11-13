@@ -113,6 +113,23 @@ impl Contacts {
     }
 }
 
+/// What to dial for a number as people write or paste it. A telephone
+/// number loses its spaces, brackets and dashes (`+7 (495) 123-45-67`
+/// becomes `+74951234567`); an address (`ip:port`, `user@host`, `sip:...`)
+/// or a name with letters only loses the spaces around and inside it.
+pub fn dialable(text: &str) -> String {
+    let text = text.trim();
+    let is_address = text.contains('@')
+        || text.to_ascii_lowercase().starts_with("sip:")
+        || text.parse::<std::net::SocketAddr>().is_ok();
+    if is_address || text.chars().any(char::is_alphabetic) {
+        return text.chars().filter(|c| !c.is_whitespace()).collect();
+    }
+    text.chars()
+        .filter(|c| c.is_ascii_digit() || matches!(c, '+' | '*' | '#'))
+        .collect()
+}
+
 /// The dialable characters of a number: digits, `*` and `#`. Letters stay,
 /// so a SIP user name such as `alice` is still a key.
 fn digits(number: &str) -> String {
@@ -180,6 +197,22 @@ mod tests {
         assert!(contacts.remove("40-10"));
         assert!(!contacts.remove("4010"));
         assert_eq!(contacts.list().len(), 2);
+    }
+
+    #[test]
+    fn pasted_numbers_are_cleaned_for_dialling() {
+        assert_eq!(dialable(" +7 (495) 123-45-67 "), "+74951234567");
+        assert_eq!(dialable("8 901 075.06.27"), "89010750627");
+        assert_eq!(dialable("4010"), "4010");
+        assert_eq!(dialable("*72#"), "*72#");
+        assert_eq!(dialable("\t4010\r\n"), "4010");
+        // Addresses and names are kept as they are, apart from spaces.
+        assert_eq!(dialable(" 192.168.1.10:5060 "), "192.168.1.10:5060");
+        assert_eq!(dialable("alice@example.com"), "alice@example.com");
+        assert_eq!(dialable("sip:100@pbx.local"), "sip:100@pbx.local");
+        assert_eq!(dialable("reception desk"), "receptiondesk");
+        assert_eq!(dialable(""), "");
+        assert_eq!(dialable("()- "), "");
     }
 
     #[test]
