@@ -102,6 +102,13 @@ impl std::fmt::Display for EndReason {
 /// Notifications for the user interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// Who is calling: sent just before [`Event::Incoming`]. `number` is the
+    /// user part of the caller's address, `name` the display name (may be
+    /// empty).
+    Caller {
+        number: String,
+        name: String,
+    },
     Incoming {
         peer: SocketAddr,
     },
@@ -1403,6 +1410,8 @@ impl<M: Media> Runner<M> {
         let trying = self.invite_response(100, "Trying", None)?;
         self.send(&trying, source)?;
         self.dispatch(Input::IncomingInvite)?;
+        let (number, name) = caller_identity(header(&request.headers, "from")?);
+        self.emit(Event::Caller { number, name });
         self.emit(Event::Incoming { peer: source });
         self.ring(Some(Tone::Ringtone));
         Ok(())
@@ -1862,6 +1871,24 @@ fn split_address(value: &str) -> (String, Option<String>) {
     (uri.trim().to_owned(), tag)
 }
 
+/// Number (user part of the URI) and display name from a From value such as
+/// `"Ivan Petrov" <sip:4010@pbx.example.com>;tag=1`.
+fn caller_identity(from: &str) -> (String, String) {
+    let (uri, _) = split_address(from);
+    let address = uri
+        .strip_prefix("sips:")
+        .or_else(|| uri.strip_prefix("sip:"))
+        .unwrap_or(&uri);
+    let number = address.split(['@', ';']).next().unwrap_or("").to_owned();
+    let name = match from.find('<') {
+        Some(start) => from[..start].trim().trim_matches('"').trim().to_owned(),
+        None => String::new(),
+    };
+    // A name that only repeats the number says nothing.
+    let name = if name == number { String::new() } else { name };
+    (number, name)
+}
+
 /// Rewrites an address as `<uri>;tag=value`, the form the dialog requires.
 fn tagged(value: &str) -> Result<String> {
     let (uri, tag) = split_address(value);
@@ -2054,9 +2081,28 @@ fn negotiate(body: &[u8], is_offer: bool) -> Result<(SocketAddr, Codec)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Codec, make_sdp, media_address, negotiate, offer_sdp, redact, sdp_direction,
-        telephone_event_payload_type,
+        Codec, caller_identity, make_sdp, media_address, negotiate, offer_sdp, redact,
+        sdp_direction, telephone_event_payload_type,
     };
+
+    #[test]
+    fn caller_number_and_name_are_read_from_the_from_header() {
+        let identity = |from: &str| caller_identity(from);
+        let pair = |number: &str, name: &str| (number.to_owned(), name.to_owned());
+        assert_eq!(
+            identity("\"Иван Петров\" <sip:4010@pbx.example.com>;tag=1"),
+            pair("4010", "Иван Петров")
+        );
+        assert_eq!(
+            identity("Taxi <sip:+74959999999@80.74.27.49:1560;user=phone>;tag=a"),
+            pair("+74959999999", "Taxi")
+        );
+        assert_eq!(identity("<sip:4010@pbx>;tag=1"), pair("4010", ""));
+        assert_eq!(identity("sip:alice@pbx;tag=1"), pair("alice", ""));
+        // A display name equal to the number is dropped.
+        assert_eq!(identity("\"4010\" <sip:4010@pbx>;tag=1"), pair("4010", ""));
+        assert_eq!(identity("<sips:bob@pbx>"), pair("bob", ""));
+    }
 
     #[test]
     fn first_offer_lists_both_codecs_and_an_answer_names_one() {

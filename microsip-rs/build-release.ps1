@@ -155,33 +155,36 @@ phone-engine.exe   - the same phone engine as a console program,
 
 START
 -----
-Run microsip-gui.exe.
+Run microsip-gui.exe. The window is in Russian.
 
-LOCAL TEST WITH TWO WINDOWS
----------------------------
-Start microsip-gui.exe twice. Use headphones.
+FIRST START
+-----------
+The settings window opens by itself. Fill in the first three fields:
+  1. SIP server   the server address from your provider, with the port
+                  if it is not 5060 (host:port)
+  2. Number       your extension or account name
+  3. Password
+Leave the other fields empty unless the provider says otherwise, then
+click the left button under the fields (save and connect). The top line
+of the window turns green when the phone is registered. At later starts
+the phone connects by itself.
 
-Window A:
-  Local IP:port = 127.0.0.1:5070
-  Click Start phone.
+The password is remembered only while the "remember password" box is
+ticked, and it is stored encrypted for the current Windows user: the
+settings file is useless on another computer or Windows account.
 
-Window B:
-  Local IP:port = 127.0.0.1:5072
-  Click Start phone.
-  Remote IP:port = 127.0.0.1:5070
-  Click Call.
+USING THE PHONE
+---------------
+First tab   dial pad: type or click a number and press the green button.
+            During a call the keypad sends tones, and there are buttons
+            for the microphone and for hold.
+Second tab  the list of calls, missed ones marked in red, with redial.
+Third tab   contacts: names for numbers; a saved name is shown for calls.
+An incoming call rings on the speaker and brings the window forward.
+Closing the window ends a call properly and takes the phone offline.
 
-Window A:
-  Click Answer (or Reject) when Incoming call appears.
-  Speak into the microphone.
-
-Either window:
-  Click Hang up to end the call. Window B can also click Hang up
-  before the answer to cancel the call.
-  Click Stop phone when finished.
-
-Closing a window or clicking Stop phone during a call ends the call
-with a SIP hangup; the other side reports Call ended: completed.
+Settings, call list, contacts and the SIP trace are kept in
+%APPDATA%\MicroSIP-Rust.
 
 CONSOLE PHONE
 -------------
@@ -198,25 +201,11 @@ PCMU/RTP audio in both directions.
 
 LIMITATIONS
 -----------
-Registration on a SIP server (Register button) and calls through it are
-new: they were tested only against a scripted test server, not against
-a real provider or PBX. Once registered, type a number into Remote and
-click Call; IP:port in Remote still dials directly.
-Behind a home router the phone registers the public address the server
+UDP only; one call at a time; one account. Codecs: G.711 (PCMU, PCMA).
+Behind a router the phone registers the public address the server
 reports and sends keep-alives, but it uses no STUN: audio works only if
 the server sends it back to where the phone's audio comes from.
-
-SETTINGS
---------
-The address and account fields are remembered in
-%APPDATA%\MicroSIP-Rust\settings.ini. The password is never saved;
-type it again after each start.
-NAT handling is basic and untested on a real network; no guarantee of
-interoperability with third-party phones or servers.
-No TLS/SRTP, RTCP, jitter buffer, call hold or transfer.
-No installer, code signature or automatic updates.
-A successful build does not prove audio quality or a working real call.
-Do not expose the phone directly to an untrusted network.
+No call transfer, conference, TLS/SRTP, installer or code signature.
 
 SYSTEM
 ------

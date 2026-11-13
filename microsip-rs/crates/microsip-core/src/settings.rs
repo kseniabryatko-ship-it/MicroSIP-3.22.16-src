@@ -1,14 +1,15 @@
 //! Settings the interface remembers between runs.
 //!
 //! A small `key=value` text file in the user's profile, outside the source
-//! tree. The password is deliberately NOT part of it: nothing secret is ever
-//! written to disk, so the file can be shown or copied safely.
+//! tree. The password is never written in the clear: it is either left out,
+//! or stored encrypted for the current Windows user (see `secret`).
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const HEADER: &str = "# MicroSIP Rust settings. The password is never stored here.";
+const HEADER: &str =
+    "# MicroSIP Rust settings. The password is kept only encrypted for this Windows user.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -28,6 +29,12 @@ pub struct Settings {
     /// Volumes in percent, 0 to 200; 100 is unchanged.
     pub speaker_volume: u32,
     pub microphone_volume: u32,
+    /// Local SIP port; 0 lets the system pick a free one at every start.
+    pub local_port: u16,
+    /// Whether the password is remembered (encrypted) between runs.
+    pub save_password: bool,
+    /// The password as produced by `secret::protect`; empty when not saved.
+    pub password_protected: String,
 }
 
 impl Default for Settings {
@@ -43,6 +50,9 @@ impl Default for Settings {
             speaker: String::new(),
             speaker_volume: 100,
             microphone_volume: 100,
+            local_port: 0,
+            save_password: true,
+            password_protected: String::new(),
         }
     }
 }
@@ -70,6 +80,13 @@ impl Settings {
                 "domain" => settings.domain = value,
                 "user" => settings.user = value,
                 "auth_user" => settings.auth_user = value,
+                "local_port" => {
+                    if let Ok(port) = value.parse() {
+                        settings.local_port = port;
+                    }
+                }
+                "save_password" => settings.save_password = value != "0",
+                "password_protected" => settings.password_protected = value,
                 "microphone" => settings.microphone = value,
                 "speaker" => settings.speaker = value,
                 // A value that is not a sensible volume keeps the default.
@@ -94,6 +111,14 @@ impl Settings {
         text.push('\n');
         let speaker_volume = self.speaker_volume.to_string();
         let microphone_volume = self.microphone_volume.to_string();
+        let local_port = self.local_port.to_string();
+        let save_password = if self.save_password { "1" } else { "0" }.to_owned();
+        // Without permission to remember it, no form of the password is written.
+        let password_protected = if self.save_password {
+            self.password_protected.clone()
+        } else {
+            String::new()
+        };
         for (key, value) in [
             ("local", &self.local),
             ("remote", &self.remote),
@@ -105,6 +130,9 @@ impl Settings {
             ("speaker", &self.speaker),
             ("speaker_volume", &speaker_volume),
             ("microphone_volume", &microphone_volume),
+            ("local_port", &local_port),
+            ("save_password", &save_password),
+            ("password_protected", &password_protected),
         ] {
             text.push_str(key);
             text.push('=');
@@ -126,15 +154,20 @@ impl Settings {
     /// Writes the file through a temporary one, so a crash while saving does
     /// not leave a half-written settings file.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        if let Some(directory) = path.parent() {
-            fs::create_dir_all(directory)?;
-        }
-        let mut temporary = path.as_os_str().to_owned();
-        temporary.push(".tmp");
-        let temporary = PathBuf::from(temporary);
-        fs::write(&temporary, self.serialize())?;
-        fs::rename(&temporary, path)
+        write_through_temporary(path, &self.serialize())
     }
+}
+
+/// Writes `text` to `path` through a temporary file, creating the folder.
+pub(crate) fn write_through_temporary(path: &Path, text: &str) -> io::Result<()> {
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory)?;
+    }
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    fs::write(&temporary, text)?;
+    fs::rename(&temporary, path)
 }
 
 fn parse_volume(value: &str) -> Option<u32> {
@@ -184,6 +217,9 @@ mod tests {
             speaker: "Headset Earphone (USB Audio)".to_owned(),
             speaker_volume: 80,
             microphone_volume: 150,
+            local_port: 5062,
+            save_password: true,
+            password_protected: "0a1b2c".to_owned(),
         }
     }
 
@@ -210,15 +246,18 @@ mod tests {
         let text = sample().serialize();
         assert_eq!(
             text,
-            "# MicroSIP Rust settings. The password is never stored here.\n\
+            "# MicroSIP Rust settings. The password is kept only encrypted for this Windows user.\n\
              local=192.168.1.5:5060\nremote=192.168.1.9:5060\n\
              server=pbx.example.com:5080\ndomain=example.com\nuser=alice\n\
              auth_user=alice-login\n\
              microphone=Headset Microphone (USB Audio)\n\
              speaker=Headset Earphone (USB Audio)\n\
-             speaker_volume=80\nmicrophone_volume=150\n"
+             speaker_volume=80\nmicrophone_volume=150\n\
+             local_port=5062\nsave_password=1\npassword_protected=0a1b2c\n"
         );
-        assert!(!text.contains("password="));
+        // No line holds the password itself; `save_password` and
+        // `password_protected` are different keys.
+        assert!(text.lines().all(|line| !line.starts_with("password=")));
     }
 
     #[test]
@@ -261,6 +300,29 @@ mod tests {
         let settings = Settings::parse("speaker_volume=0\nmicrophone_volume=200\n");
         assert_eq!(settings.speaker_volume, 0);
         assert_eq!(settings.microphone_volume, 200);
+    }
+
+    #[test]
+    fn password_is_written_only_encrypted_and_only_when_allowed() {
+        let mut settings = sample();
+        settings.save_password = false;
+        let text = settings.serialize();
+        assert!(
+            text.contains("save_password=0\npassword_protected=\n"),
+            "{text}"
+        );
+        assert!(!text.contains("0a1b2c"));
+        let parsed = Settings::parse(&text);
+        assert!(!parsed.save_password);
+        assert_eq!(parsed.password_protected, "");
+
+        // Old files have none of these lines.
+        let old = Settings::parse("user=bob\n");
+        assert!(old.save_password);
+        assert_eq!(old.password_protected, "");
+        assert_eq!(old.local_port, 0);
+        // A port that is not a port keeps the automatic choice.
+        assert_eq!(Settings::parse("local_port=70000\n").local_port, 0);
     }
 
     #[test]

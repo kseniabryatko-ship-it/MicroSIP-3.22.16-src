@@ -160,6 +160,7 @@ impl CallView {
                 self.remote_held = false;
             }
             Event::AudioQuality(_)
+            | Event::Caller { .. }
             | Event::Registration(_)
             | Event::Trace { .. }
             | Event::Error(_) => {}

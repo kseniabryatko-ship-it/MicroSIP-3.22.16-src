@@ -87,6 +87,7 @@ impl Phone {
                 println!("RTP sent: {sent}; RTP received: {received}");
             }
             Event::AudioQuality(quality) => println!("Audio quality: {quality}"),
+            Event::Caller { number, name } => println!("Caller: {number} {name}"),
             Event::Hold(true) => println!("Call is on hold."),
             Event::Hold(false) => println!("Call resumed."),
             Event::RemoteHold(true) => println!("The other side put the call on hold."),

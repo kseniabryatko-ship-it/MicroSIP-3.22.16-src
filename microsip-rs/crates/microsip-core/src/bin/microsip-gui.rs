@@ -1,11 +1,18 @@
 #![windows_subsystem = "windows"]
 
+//! The phone's window: dial pad, call list, contacts and settings, in the
+//! manner of MicroSIP. The phone connects to its account by itself at start.
+
 use eframe::egui;
 use microsip_core::audio::{input_device_names, output_device_names};
 use microsip_core::call_media::{AudioControls, AudioMedia};
-use microsip_core::call_runner::{CallHandle, Event, UiCommand, spawn};
+use microsip_core::call_runner::{CallHandle, EndReason, Event, UiCommand, spawn};
 use microsip_core::call_view::{CallView, Phase};
+use microsip_core::contacts::Contacts;
+use microsip_core::history::{CallRecord, Direction, History};
+use microsip_core::localtime::{format_duration, format_timestamp, now_unix, utc_offset_seconds};
 use microsip_core::registration::{Account, RegistrationState};
+use microsip_core::secret;
 use microsip_core::settings::{self, Settings};
 use microsip_core::transport::{local_ip_towards, resolve_socket_address};
 use std::collections::VecDeque;
@@ -13,20 +20,67 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const LOG_LIMIT: usize = 1_000;
+const KEYPAD: [&str; 4] = ["123", "456", "789", "*0#"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Dialpad,
+    Calls,
+    Contacts,
+}
+
+/// What the user asked for in this frame; carried out after drawing.
+enum Action {
+    Call(String),
+    Answer,
+    Reject,
+    Hangup,
+    ToggleMute,
+    ToggleHold,
+    Digit(char),
+    Connect,
+    Disconnect,
+    SaveContact(String, String),
+    RemoveContact(String),
+    ClearHistory,
+    AudioChanged,
+}
+
+/// The call in progress, for the call list.
+struct CurrentCall {
+    incoming: bool,
+    number: String,
+    name: String,
+    started: u64,
+    connected: Option<Instant>,
+}
 
 struct PhoneWindow {
-    local: String,
-    remote: String,
+    // Files.
+    settings_path: Option<PathBuf>,
+    history_path: Option<PathBuf>,
+    contacts_path: Option<PathBuf>,
+    trace_file: Option<File>,
+    saved: Settings,
+    history: History,
+    contacts: Contacts,
+    utc_offset: i64,
+    started: Instant,
+
+    // Account, as edited in the settings window.
     server: String,
+    domain: String,
     user: String,
     auth_user: String,
     password: String,
     show_password: bool,
-    /// Device names as saved; empty means the system default.
+    save_password: bool,
+    local_port: String,
+
+    // Sound.
     microphone: String,
     speaker: String,
     speaker_volume: u32,
@@ -34,45 +88,59 @@ struct PhoneWindow {
     microphones: Vec<String>,
     speakers: Vec<String>,
     controls: AudioControls,
-    muted: bool,
-    domain: String,
-    registration: Option<RegistrationState>,
+
+    // The phone.
     handle: Option<CallHandle>,
+    local: Option<SocketAddr>,
+    registration: Option<RegistrationState>,
     view: CallView,
+    muted: bool,
+    current: Option<CurrentCall>,
+    caller: Option<(String, String)>,
+
+    // The window.
+    tab: Tab,
+    number: String,
+    contact_search: String,
+    new_contact_name: String,
+    new_contact_number: String,
+    settings_open: bool,
+    log_open: bool,
     logs: VecDeque<String>,
     last_error: Option<String>,
-    settings_path: Option<PathBuf>,
-    saved: Settings,
-    /// SIP messages go here, next to the settings file, for diagnostics.
-    trace_file: Option<File>,
-    started: Instant,
+    /// Missed calls older than this have been seen.
+    missed_seen: u64,
 }
 
 impl PhoneWindow {
     fn new() -> Self {
         let settings_path = settings::default_path();
+        let sibling = |name: &str| settings_path.as_ref().map(|path| path.with_file_name(name));
+        let history_path = sibling("history.tsv");
+        let contacts_path = sibling("contacts.tsv");
+        let trace_path = sibling("sip-trace.log");
+
         let mut notes = Vec::new();
         let saved = match settings_path.as_deref().map(Settings::load) {
             Some(Ok(saved)) => saved,
             Some(Err(error)) => {
-                notes.push(format!("Cannot read the settings file: {error}"));
+                notes.push(format!("Не удалось прочитать настройки: {error}"));
                 Settings::default()
             }
             None => {
-                notes.push("No profile folder was found; settings are not saved.".to_owned());
+                notes.push("Папка профиля не найдена; настройки не сохраняются.".to_owned());
                 Settings::default()
             }
         };
-        if let Some(path) = settings_path.as_ref() {
-            notes.push(format!(
-                "Settings file (the password is never saved): {}",
-                path.display()
-            ));
-        }
-        // A fresh trace for every run; the file never holds the password.
-        let trace_path = settings_path
-            .as_ref()
-            .map(|path| path.with_file_name("sip-trace.log"));
+        let history = history_path
+            .as_deref()
+            .and_then(|path| History::load(path).ok())
+            .unwrap_or_default();
+        let contacts = contacts_path
+            .as_deref()
+            .and_then(|path| Contacts::load(path).ok())
+            .unwrap_or_default();
+        // A fresh trace for every run; it never holds the password.
         let trace_file = trace_path.as_ref().and_then(|path| {
             std::fs::create_dir_all(path.parent()?).ok()?;
             OpenOptions::new()
@@ -82,19 +150,35 @@ impl PhoneWindow {
                 .open(path)
                 .ok()
         });
-        match (trace_path.as_ref(), trace_file.is_some()) {
-            (Some(path), true) => notes.push(format!("SIP trace file: {}", path.display())),
-            (Some(path), false) => notes.push(format!("Cannot write {}", path.display())),
-            (None, _) => {}
+        if let Some(path) = settings_path.as_ref() {
+            notes.push(format!("Файл настроек: {}", path.display()));
         }
+        if let (Some(path), true) = (trace_path.as_ref(), trace_file.is_some()) {
+            notes.push(format!("Журнал SIP: {}", path.display()));
+        }
+
+        let password = if saved.save_password && !saved.password_protected.is_empty() {
+            secret::unprotect(&saved.password_protected).unwrap_or_else(|| {
+                notes.push("Сохранённый пароль не подходит этому пользователю Windows.".to_owned());
+                String::new()
+            })
+        } else {
+            String::new()
+        };
+
         let mut window = Self {
-            local: saved.local.clone(),
-            remote: saved.remote.clone(),
             server: saved.server.clone(),
+            domain: saved.domain.clone(),
             user: saved.user.clone(),
             auth_user: saved.auth_user.clone(),
-            password: String::new(),
+            password,
             show_password: false,
+            save_password: saved.save_password,
+            local_port: if saved.local_port == 0 {
+                String::new()
+            } else {
+                saved.local_port.to_string()
+            },
             microphone: saved.microphone.clone(),
             speaker: saved.speaker.clone(),
             speaker_volume: saved.speaker_volume,
@@ -102,334 +186,61 @@ impl PhoneWindow {
             microphones: input_device_names(),
             speakers: output_device_names(),
             controls: AudioControls::default(),
-            muted: false,
-            domain: saved.domain.clone(),
-            registration: None,
             handle: None,
+            local: None,
+            registration: None,
             view: CallView::default(),
+            muted: false,
+            current: None,
+            caller: None,
+            tab: Tab::Dialpad,
+            number: String::new(),
+            contact_search: String::new(),
+            new_contact_name: String::new(),
+            new_contact_number: String::new(),
+            settings_open: false,
+            log_open: false,
             logs: VecDeque::new(),
             last_error: None,
+            missed_seen: now_unix(),
             settings_path,
-            saved,
+            history_path,
+            contacts_path,
             trace_file,
+            saved,
+            history,
+            contacts,
+            utc_offset: utc_offset_seconds(),
             started: Instant::now(),
         };
         for note in notes {
             window.log(note);
         }
         window.apply_audio_settings();
+
+        // Like MicroSIP: go online at once when an account is set up.
+        if window.account_is_set() && !window.password.is_empty() {
+            window.connect();
+        } else {
+            window.settings_open = true;
+        }
         window
     }
 
-    /// Hands the chosen devices and volumes to the phone's audio. Volumes
-    /// act at once; a device is used from the next call on.
-    fn apply_audio_settings(&mut self) {
-        self.controls.set_speaker_volume(self.speaker_volume);
-        self.controls.set_microphone_volume(self.microphone_volume);
-        self.controls
-            .set_input_device(Some(self.microphone.clone()));
-        self.controls.set_output_device(Some(self.speaker.clone()));
-    }
-
-    /// Remembers the address and account fields; the password is left out.
-    fn save_settings(&mut self) {
-        let current = Settings {
-            local: self.local.trim().to_owned(),
-            remote: self.remote.trim().to_owned(),
-            server: self.server.trim().to_owned(),
-            domain: self.domain.trim().to_owned(),
-            user: self.user.trim().to_owned(),
-            auth_user: self.auth_user.trim().to_owned(),
-            microphone: self.microphone.clone(),
-            speaker: self.speaker.clone(),
-            speaker_volume: self.speaker_volume,
-            microphone_volume: self.microphone_volume,
-        };
-        if current == self.saved {
-            return;
-        }
-        let Some(path) = self.settings_path.clone() else {
-            return;
-        };
-        match current.save(&path) {
-            Ok(()) => self.saved = current,
-            Err(error) => self.log(format!("Cannot save the settings: {error}")),
-        }
-    }
+    // ----- log and files -------------------------------------------------
 
     fn log(&mut self, text: impl Into<String>) {
         if self.logs.len() >= LOG_LIMIT {
             self.logs.pop_front();
         }
-        self.logs.push_back(text.into());
+        let stamp = format_timestamp(now_unix(), self.utc_offset);
+        self.logs.push_back(format!("{stamp}  {}", text.into()));
     }
 
     fn error(&mut self, text: impl Into<String>) {
         let text = text.into();
-        self.log(format!("ERROR: {text}"));
+        self.log(format!("ОШИБКА: {text}"));
         self.last_error = Some(text);
-    }
-
-    fn address(text: &str) -> Result<SocketAddr, String> {
-        let address = text
-            .trim()
-            .parse::<SocketAddr>()
-            .map_err(|error| format!("Invalid IP:port: {error}"))?;
-        if address.ip().is_unspecified() || address.port() == 0 {
-            return Err("Use a concrete IP and a nonzero port".to_owned());
-        }
-        Ok(address)
-    }
-
-    fn start(&mut self) -> Result<(), String> {
-        if self.handle.is_some() {
-            return Err("The phone is already running".to_owned());
-        }
-        let local = Self::address(&self.local)?;
-        let controls = self.controls.clone();
-        let handle = spawn(local, "phone", move || AudioMedia::with_controls(controls))
-            .map_err(|error| format!("Cannot listen on {local}: {error}"))?;
-        self.log(format!("Phone listening on {}", handle.local_address()));
-        handle.send(UiCommand::Trace(self.trace_file.is_some()));
-        self.handle = Some(handle);
-        self.view = CallView::default();
-        self.last_error = None;
-        self.save_settings();
-        Ok(())
-    }
-
-    fn stop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            self.log("Stopping the phone; an active call is ended with BYE.");
-            // Dropping the handle ends any call properly and joins the thread.
-            drop(handle);
-            self.view = CallView::default();
-            self.registration = None;
-            self.log("Phone stopped.");
-        }
-    }
-
-    fn send(&mut self, command: UiCommand) {
-        let delivered = self
-            .handle
-            .as_ref()
-            .is_some_and(|handle| handle.send(command));
-        if !delivered {
-            self.error("The phone has stopped unexpectedly; start it again.");
-            self.handle = None;
-            self.view = CallView::default();
-            self.registration = None;
-        }
-    }
-
-    fn can_register(&self) -> bool {
-        !matches!(
-            self.registration,
-            Some(RegistrationState::Registering | RegistrationState::Registered { .. })
-        )
-    }
-
-    fn can_unregister(&self) -> bool {
-        !matches!(
-            self.registration,
-            None | Some(RegistrationState::Unregistered)
-        )
-    }
-
-    fn register(&mut self) {
-        if !self.can_register() {
-            return;
-        }
-        if self.server.trim().is_empty() || self.user.trim().is_empty() {
-            return self.error("Enter the SIP server and the user name");
-        }
-        self.last_error = None;
-        let account = Account::new(self.server.trim(), self.user.trim(), "");
-        if let Err(error) = self.use_address_that_reaches(&account) {
-            return self.error(error);
-        }
-        self.save_settings();
-        // A password pasted from elsewhere often carries a stray space or
-        // line break at either end; the server would refuse it.
-        let account = Account::new(self.server.trim(), self.user.trim(), self.password.trim())
-            .with_domain(self.domain.trim())
-            .with_auth_username(self.auth_user.trim());
-        // The password is never written to the log.
-        self.log(format!(
-            "> register {} on {}",
-            self.user.trim(),
-            self.server.trim()
-        ));
-        self.send(UiCommand::Register(account));
-    }
-
-    /// A phone started on 127.0.0.1 cannot talk to a server on another
-    /// machine. Like MicroSIP, pick the right network address automatically:
-    /// restart the phone on the address the system uses to reach the server.
-    fn use_address_that_reaches(&mut self, account: &Account) -> Result<(), String> {
-        let local = Self::address(&self.local)?;
-        if !local.ip().is_loopback() {
-            return Ok(());
-        }
-        let (host, port) = account.server_host_port()?;
-        let server = resolve_socket_address(&host, port)
-            .map_err(|error| format!("Cannot resolve {host}: {error}"))?;
-        if server.ip().is_loopback() {
-            return Ok(());
-        }
-        if !self.view.can_dial() {
-            return Err("Finish the call before registering".to_owned());
-        }
-        let ip = local_ip_towards(server)
-            .map_err(|error| format!("No network route to {server}: {error}"))?;
-        if ip.is_loopback() || ip.is_unspecified() {
-            return Err(format!("No network address can reach {server}"));
-        }
-        let address = SocketAddr::new(ip, local.port());
-        self.log(format!(
-            "Local address changed from {local} to {address} to reach the server"
-        ));
-        self.stop();
-        self.local = address.to_string();
-        self.start()
-    }
-
-    fn unregister(&mut self) {
-        if self.can_unregister() {
-            self.log("> unregister");
-            self.send(UiCommand::Unregister);
-        }
-    }
-
-    fn call(&mut self) {
-        let target = self.remote.trim().to_owned();
-        if target.parse::<SocketAddr>().is_err() {
-            return self.call_number(target);
-        }
-        let local = match Self::address(&self.local) {
-            Ok(local) => local,
-            Err(error) => return self.error(error),
-        };
-        let remote = match Self::address(&self.remote) {
-            Ok(remote) => remote,
-            Err(error) => return self.error(error),
-        };
-        if remote.is_ipv4() != local.is_ipv4() {
-            return self.error("Local and remote addresses must use the same IP family");
-        }
-        if !self.view.can_dial() {
-            return;
-        }
-        self.last_error = None;
-        self.save_settings();
-        self.view.dialing(remote);
-        self.log(format!("Calling {remote}"));
-        self.send(UiCommand::Dial(remote));
-    }
-
-    /// Anything that is not `IP:port` is a number on the SIP server.
-    fn call_number(&mut self, target: String) {
-        if target.is_empty() {
-            return self.error("Enter IP:port or a number");
-        }
-        if !matches!(
-            self.registration,
-            Some(RegistrationState::Registered { .. })
-        ) {
-            return self.error("Register on a SIP server to call a number, or enter IP:port");
-        }
-        if !self.view.can_dial() {
-            return;
-        }
-        self.last_error = None;
-        self.save_settings();
-        self.view.dialing_target(&target);
-        self.log(format!("Calling {target} through the SIP server"));
-        self.send(UiCommand::DialTarget(target));
-    }
-
-    fn answer(&mut self) {
-        if self.view.can_answer() {
-            self.view.answering();
-            self.log("> answer");
-            self.send(UiCommand::Answer);
-        }
-    }
-
-    fn reject(&mut self) {
-        if self.view.can_reject() {
-            self.log("> reject");
-            self.send(UiCommand::Reject);
-        }
-    }
-
-    fn hangup(&mut self) {
-        if self.view.can_hangup() {
-            self.log("> hang up");
-            self.send(UiCommand::Hangup);
-        }
-    }
-
-    fn toggle_mute(&mut self) {
-        if self.view.phase() != Phase::Connected {
-            return;
-        }
-        self.muted = !self.muted;
-        self.log(if self.muted {
-            "> mute: the other side does not hear you"
-        } else {
-            "> unmute"
-        });
-        self.send(UiCommand::Mute(self.muted));
-    }
-
-    fn toggle_hold(&mut self) {
-        if self.view.can_hold() {
-            let hold = !self.view.is_held();
-            self.log(if hold { "> hold" } else { "> resume" });
-            self.send(UiCommand::Hold(hold));
-        }
-    }
-
-    fn dtmf(&mut self, digit: char) {
-        if self.view.phase() == Phase::Connected {
-            self.log(format!("> digit {digit}"));
-            self.send(UiCommand::Dtmf(digit));
-        }
-    }
-
-    fn poll(&mut self) {
-        while let Some(event) = self.handle.as_ref().and_then(|handle| handle.try_event()) {
-            self.view.on_event(&event);
-            match event {
-                Event::Incoming { peer } => self.log(format!("Incoming call from {peer}")),
-                Event::Ringing => self.log("Remote is ringing"),
-                Event::Established => self.log("Connected"),
-                Event::MediaStats { sent, received } => {
-                    self.log(format!("RTP sent: {sent}; RTP received: {received}"));
-                }
-                Event::AudioQuality(quality) => self.log(format!("Audio: {quality}")),
-                Event::Hold(true) => self.log("Call is on hold"),
-                Event::Hold(false) => self.log("Call resumed"),
-                Event::RemoteHold(true) => self.log("The other side put the call on hold"),
-                Event::RemoteHold(false) => self.log("The other side resumed the call"),
-                Event::Ended(reason) => {
-                    // Every call starts with the microphone on.
-                    self.muted = false;
-                    self.log(format!("Call ended: {reason}"));
-                }
-                Event::Registration(state) => {
-                    self.log(format!("Account: {state}"));
-                    self.registration = Some(state);
-                }
-                Event::Trace {
-                    outgoing,
-                    peer,
-                    text,
-                } => self.trace(outgoing, peer, &text),
-                Event::Error(message) => self.error(message),
-            }
-        }
     }
 
     fn trace(&mut self, outgoing: bool, peer: SocketAddr, text: &str) {
@@ -446,27 +257,854 @@ impl PhoneWindow {
         .and_then(|()| file.flush());
         if written.is_err() {
             self.trace_file = None;
-            self.log("Cannot write the SIP trace file; tracing stopped.");
+            self.log("Не удалось записать журнал SIP; запись остановлена.");
         }
+    }
+
+    fn apply_audio_settings(&mut self) {
+        self.controls.set_speaker_volume(self.speaker_volume);
+        self.controls.set_microphone_volume(self.microphone_volume);
+        self.controls
+            .set_input_device(Some(self.microphone.clone()));
+        self.controls.set_output_device(Some(self.speaker.clone()));
+    }
+
+    fn port(&self) -> u16 {
+        self.local_port.trim().parse().unwrap_or(0)
+    }
+
+    /// Remembers everything typed. The password goes in encrypted, and only
+    /// when the user allows it.
+    fn save_settings(&mut self) {
+        let password_protected = if self.save_password && !self.password.is_empty() {
+            // Keep the stored form while the password is unchanged, so the
+            // file is not rewritten at every start.
+            match secret::unprotect(&self.saved.password_protected) {
+                Some(stored) if stored == self.password.trim() => {
+                    self.saved.password_protected.clone()
+                }
+                _ => secret::protect(self.password.trim()).unwrap_or_default(),
+            }
+        } else {
+            String::new()
+        };
+        let current = Settings {
+            local: self.saved.local.clone(),
+            remote: self.number.trim().to_owned(),
+            server: self.server.trim().to_owned(),
+            domain: self.domain.trim().to_owned(),
+            user: self.user.trim().to_owned(),
+            auth_user: self.auth_user.trim().to_owned(),
+            microphone: self.microphone.clone(),
+            speaker: self.speaker.clone(),
+            speaker_volume: self.speaker_volume,
+            microphone_volume: self.microphone_volume,
+            local_port: self.port(),
+            save_password: self.save_password,
+            password_protected,
+        };
+        if current == self.saved {
+            return;
+        }
+        let Some(path) = self.settings_path.clone() else {
+            return;
+        };
+        match current.save(&path) {
+            Ok(()) => self.saved = current,
+            Err(error) => self.log(format!("Не удалось сохранить настройки: {error}")),
+        }
+    }
+
+    fn save_history(&mut self) {
+        if let Some(path) = self.history_path.clone()
+            && let Err(error) = self.history.save(&path)
+        {
+            self.log(format!("Не удалось сохранить список звонков: {error}"));
+        }
+    }
+
+    fn save_contacts(&mut self) {
+        if let Some(path) = self.contacts_path.clone()
+            && let Err(error) = self.contacts.save(&path)
+        {
+            self.log(format!("Не удалось сохранить контакты: {error}"));
+        }
+    }
+
+    // ----- connecting ----------------------------------------------------
+
+    fn account_is_set(&self) -> bool {
+        !self.server.trim().is_empty() && !self.user.trim().is_empty()
+    }
+
+    /// Starts the phone on the network address that reaches the server and
+    /// registers the account.
+    fn connect(&mut self) {
+        self.disconnect();
+        self.last_error = None;
+        if !self.account_is_set() {
+            self.settings_open = true;
+            return self.error("Укажите сервер и номер в настройках");
+        }
+        self.save_settings();
+        let account = Account::new(self.server.trim(), self.user.trim(), self.password.trim())
+            .with_domain(self.domain.trim())
+            .with_auth_username(self.auth_user.trim());
+        let server = match account.server_host_port().and_then(|(host, port)| {
+            resolve_socket_address(&host, port)
+                .map_err(|error| format!("сервер {host} не найден: {error}"))
+        }) {
+            Ok(server) => server,
+            Err(error) => return self.error(format!("Не удалось подключиться: {error}")),
+        };
+        let ip = match local_ip_towards(server) {
+            Ok(ip) if !ip.is_unspecified() => ip,
+            Ok(_) | Err(_) => return self.error("Нет сети: сервер недоступен с этого компьютера"),
+        };
+        let local = SocketAddr::new(ip, self.port());
+        let controls = self.controls.clone();
+        let handle = match spawn(local, "phone", move || AudioMedia::with_controls(controls)) {
+            Ok(handle) => handle,
+            Err(error) => {
+                return self.error(format!("Не удалось открыть порт {local}: {error}"));
+            }
+        };
+        let local = handle.local_address();
+        self.log(format!("Телефон запущен на {local}"));
+        handle.send(UiCommand::Trace(self.trace_file.is_some()));
+        handle.send(UiCommand::Register(account));
+        self.local = Some(local);
+        self.handle = Some(handle);
+        self.view = CallView::default();
+        self.registration = Some(RegistrationState::Registering);
+    }
+
+    fn disconnect(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            // Dropping the handle ends a call and removes the registration.
+            drop(handle);
+            self.log("Телефон отключён");
+        }
+        self.finish_call(EndReason::Completed, false);
+        self.local = None;
+        self.registration = None;
+        self.view = CallView::default();
+        self.muted = false;
+    }
+
+    fn send(&mut self, command: UiCommand) {
+        let delivered = self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.send(command));
+        if !delivered {
+            self.handle = None;
+            self.registration = None;
+            self.view = CallView::default();
+            self.error("Телефон не подключён. Нажмите «Сохранить и подключить» в настройках.");
+        }
+    }
+
+    fn is_online(&self) -> bool {
+        matches!(
+            self.registration,
+            Some(RegistrationState::Registered { .. })
+        )
+    }
+
+    // ----- calls ---------------------------------------------------------
+
+    fn call(&mut self, target: String) {
+        let target = target.trim().to_owned();
+        if target.is_empty() || !self.view.can_dial() {
+            return;
+        }
+        if self.handle.is_none() {
+            return self.error("Телефон не подключён");
+        }
+        let direct = target.parse::<SocketAddr>().is_ok();
+        if !direct && !self.is_online() {
+            return self.error("Нет регистрации на сервере — позвонить на номер нельзя");
+        }
+        self.last_error = None;
+        self.number = target.clone();
+        self.save_settings();
+        let name = self.contacts.name_of(&target).unwrap_or("").to_owned();
+        self.log(format!("Вызов {target}"));
+        self.current = Some(CurrentCall {
+            incoming: false,
+            number: target.clone(),
+            name,
+            started: now_unix(),
+            connected: None,
+        });
+        self.view.dialing_target(&target);
+        self.send(UiCommand::DialTarget(target));
+        self.tab = Tab::Dialpad;
+    }
+
+    fn answer(&mut self) {
+        if self.view.can_answer() {
+            self.view.answering();
+            self.send(UiCommand::Answer);
+        }
+    }
+
+    fn reject(&mut self) {
+        if self.view.can_reject() {
+            self.send(UiCommand::Reject);
+        }
+    }
+
+    fn hangup(&mut self) {
+        if self.view.can_hangup() {
+            self.send(UiCommand::Hangup);
+        }
+    }
+
+    fn toggle_mute(&mut self) {
+        if self.view.phase() == Phase::Connected {
+            self.muted = !self.muted;
+            self.send(UiCommand::Mute(self.muted));
+        }
+    }
+
+    fn toggle_hold(&mut self) {
+        if self.view.can_hold() {
+            self.send(UiCommand::Hold(!self.view.is_held()));
+        }
+    }
+
+    /// A keypad press: a tone during a call, a digit of the number otherwise.
+    fn digit(&mut self, digit: char) {
+        if self.view.phase() == Phase::Connected {
+            self.send(UiCommand::Dtmf(digit));
+        } else if self.view.can_dial() {
+            self.number.push(digit);
+        }
+    }
+
+    /// Ends the bookkeeping of the current call and, when `record` is set,
+    /// writes it to the call list.
+    fn finish_call(&mut self, reason: EndReason, record: bool) {
+        self.muted = false;
+        let Some(call) = self.current.take() else {
+            return;
+        };
+        if !record {
+            return;
+        }
+        let seconds = call
+            .connected
+            .map_or(0, |connected| connected.elapsed().as_secs());
+        let direction = match (call.incoming, call.connected.is_some(), reason) {
+            (false, _, _) => Direction::Outgoing,
+            (true, true, _) => Direction::Incoming,
+            // Declined by the user: seen, so not a missed call.
+            (true, false, EndReason::Rejected(_)) => Direction::Incoming,
+            (true, false, _) => Direction::Missed,
+        };
+        self.history.add(CallRecord {
+            time: call.started,
+            direction,
+            seconds,
+            number: call.number,
+            name: call.name,
+        });
+        self.save_history();
+    }
+
+    fn poll(&mut self, ctx: &egui::Context) {
+        while let Some(event) = self.handle.as_ref().and_then(|handle| handle.try_event()) {
+            self.view.on_event(&event);
+            match event {
+                Event::Caller { number, name } => self.caller = Some((number, name)),
+                Event::Incoming { peer } => {
+                    let (number, name) = self
+                        .caller
+                        .take()
+                        .unwrap_or_else(|| (peer.to_string(), String::new()));
+                    // A saved contact name wins over what the network sent.
+                    let name = self
+                        .contacts
+                        .name_of(&number)
+                        .map(str::to_owned)
+                        .unwrap_or(name);
+                    self.log(format!("Входящий вызов: {number} {name}"));
+                    self.current = Some(CurrentCall {
+                        incoming: true,
+                        number,
+                        name,
+                        started: now_unix(),
+                        connected: None,
+                    });
+                    self.tab = Tab::Dialpad;
+                    // Bring the window to the user's attention.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Critical,
+                    ));
+                }
+                Event::Ringing => self.log("У абонента звонит телефон"),
+                Event::Established => {
+                    self.log("Соединено");
+                    if let Some(call) = self.current.as_mut() {
+                        call.connected = Some(Instant::now());
+                    }
+                }
+                Event::MediaStats { sent, received } => {
+                    self.log(format!("RTP: отправлено {sent}, принято {received}"));
+                }
+                Event::AudioQuality(quality) => self.log(format!("Звук: {quality}")),
+                Event::Hold(true) => self.log("Вызов на удержании"),
+                Event::Hold(false) => self.log("Вызов возобновлён"),
+                Event::RemoteHold(true) => self.log("Собеседник поставил вызов на удержание"),
+                Event::RemoteHold(false) => self.log("Собеседник возобновил вызов"),
+                Event::Ended(reason) => {
+                    self.log(format!("Вызов завершён: {}", end_reason_text(reason)));
+                    self.finish_call(reason, true);
+                }
+                Event::Registration(state) => {
+                    self.log(format!("Аккаунт: {}", registration_text(&state)));
+                    self.registration = Some(state);
+                }
+                Event::Trace {
+                    outgoing,
+                    peer,
+                    text,
+                } => self.trace(outgoing, peer, &text),
+                Event::Error(message) => self.error(error_text(&message)),
+            }
+        }
+    }
+
+    fn apply(&mut self, action: Action) {
+        match action {
+            Action::Call(target) => self.call(target),
+            Action::Answer => self.answer(),
+            Action::Reject => self.reject(),
+            Action::Hangup => self.hangup(),
+            Action::ToggleMute => self.toggle_mute(),
+            Action::ToggleHold => self.toggle_hold(),
+            Action::Digit(digit) => self.digit(digit),
+            Action::Connect => self.connect(),
+            Action::Disconnect => {
+                self.save_settings();
+                self.disconnect();
+            }
+            Action::SaveContact(name, number) => {
+                if self.contacts.set(&name, &number) {
+                    self.save_contacts();
+                    self.new_contact_name.clear();
+                    self.new_contact_number.clear();
+                } else {
+                    self.error("Укажите имя и номер контакта");
+                }
+            }
+            Action::RemoveContact(number) => {
+                if self.contacts.remove(&number) {
+                    self.save_contacts();
+                }
+            }
+            Action::ClearHistory => {
+                self.history.clear();
+                self.save_history();
+            }
+            Action::AudioChanged => {
+                self.apply_audio_settings();
+                self.save_settings();
+            }
+        }
+    }
+
+    // ----- drawing -------------------------------------------------------
+
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let (color, text) = match self.registration.as_ref() {
+                Some(RegistrationState::Registered { .. }) => {
+                    (egui::Color32::from_rgb(60, 180, 75), "В сети".to_owned())
+                }
+                Some(RegistrationState::Registering) => {
+                    (egui::Color32::YELLOW, "Подключение…".to_owned())
+                }
+                Some(state @ RegistrationState::Failed(_)) => {
+                    (egui::Color32::RED, registration_text(state))
+                }
+                Some(RegistrationState::Unregistered) | None => {
+                    (egui::Color32::GRAY, "Не в сети".to_owned())
+                }
+            };
+            // A drawn dot: the fonts have no glyph for a round bullet.
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter().circle_filled(dot.center(), 5.0, color);
+            let user = self.user.trim();
+            let status = if user.is_empty() {
+                text
+            } else {
+                format!("{user} — {text}")
+            };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Журнал").clicked() {
+                    self.log_open = !self.log_open;
+                }
+                if ui.button("Настройки").clicked() {
+                    self.settings_open = !self.settings_open;
+                }
+                // The status takes the room that is left and is cut short
+                // rather than running under the buttons.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(status).truncate());
+                });
+            });
+        });
+    }
+
+    fn dialpad_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let phase = self.view.phase();
+        let idle = phase == Phase::Idle;
+
+        let field = egui::TextEdit::singleline(&mut self.number)
+            .hint_text("Номер")
+            .font(egui::TextStyle::Heading)
+            .desired_width(f32::INFINITY);
+        let response = ui.add_enabled(idle, field);
+        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            actions.push(Action::Call(self.number.clone()));
+        }
+        if idle && let Some(name) = self.contacts.name_of(&self.number) {
+            ui.label(name.to_owned());
+        }
+        ui.add_space(6.0);
+
+        let size = egui::vec2((ui.available_width() - 16.0) / 3.0, 44.0);
+        for row in KEYPAD {
+            ui.horizontal(|ui| {
+                for digit in row.chars() {
+                    let label = egui::RichText::new(digit.to_string()).size(22.0);
+                    if ui.add_sized(size, egui::Button::new(label)).clicked() {
+                        actions.push(Action::Digit(digit));
+                    }
+                }
+            });
+        }
+        ui.add_space(6.0);
+
+        let wide = egui::vec2(ui.available_width(), 40.0);
+        let half = egui::vec2((ui.available_width() - 8.0) / 2.0, 40.0);
+        let green = egui::Color32::from_rgb(40, 140, 60);
+        let red = egui::Color32::from_rgb(170, 50, 50);
+        let big = |text: &str| {
+            egui::RichText::new(text)
+                .size(18.0)
+                .color(egui::Color32::WHITE)
+        };
+        match phase {
+            Phase::Idle => {
+                ui.horizontal(|ui| {
+                    let call = egui::Button::new(big("Позвонить")).fill(green);
+                    if ui.add_sized(half, call).clicked() {
+                        actions.push(Action::Call(self.number.clone()));
+                    }
+                    if ui.add_sized(half, egui::Button::new("Стереть")).clicked() {
+                        self.number.pop();
+                    }
+                });
+            }
+            Phase::Incoming => {
+                ui.horizontal(|ui| {
+                    let answer = egui::Button::new(big("Ответить")).fill(green);
+                    if ui.add_sized(half, answer).clicked() {
+                        actions.push(Action::Answer);
+                    }
+                    let reject = egui::Button::new(big("Отклонить")).fill(red);
+                    if ui.add_sized(half, reject).clicked() {
+                        actions.push(Action::Reject);
+                    }
+                });
+            }
+            _ => {
+                let hangup = egui::Button::new(big("Завершить")).fill(red);
+                let pressed = ui
+                    .add_enabled_ui(self.view.can_hangup(), |ui| ui.add_sized(wide, hangup))
+                    .inner
+                    .clicked();
+                if pressed {
+                    actions.push(Action::Hangup);
+                }
+                let connected = phase == Phase::Connected;
+                let mute = if self.muted {
+                    "Включить микрофон"
+                } else {
+                    "Выключить микрофон"
+                };
+                let hold = if self.view.is_held() {
+                    "Продолжить"
+                } else {
+                    "Удержание"
+                };
+                ui.add_enabled_ui(connected, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.add_sized(half, egui::Button::new(mute)).clicked() {
+                            actions.push(Action::ToggleMute);
+                        }
+                        if ui.add_sized(half, egui::Button::new(hold)).clicked() {
+                            actions.push(Action::ToggleHold);
+                        }
+                    });
+                });
+            }
+        }
+
+        ui.add_space(6.0);
+        if let Some(call) = self.current.as_ref() {
+            let who = if call.name.is_empty() {
+                call.number.clone()
+            } else {
+                format!("{} ({})", call.name, call.number)
+            };
+            let state = match (phase, call.connected) {
+                (Phase::Connected, Some(connected)) => {
+                    format!(
+                        "Разговор {}",
+                        format_duration(connected.elapsed().as_secs())
+                    )
+                }
+                _ => phase_text(phase).to_owned(),
+            };
+            ui.label(egui::RichText::new(who).size(18.0));
+            ui.label(state);
+            if self.muted {
+                ui.colored_label(egui::Color32::YELLOW, "Микрофон выключен");
+            }
+            if self.view.is_held() {
+                ui.colored_label(egui::Color32::YELLOW, "Вызов на удержании");
+            }
+            if self.view.is_remote_held() {
+                ui.colored_label(egui::Color32::YELLOW, "Собеседник поставил на удержание");
+            }
+        }
+        if let Some(error) = self.last_error.as_ref() {
+            ui.colored_label(egui::Color32::RED, error);
+        }
+
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            let before = (self.speaker_volume, self.microphone_volume);
+            ui.horizontal(|ui| {
+                ui.label("Микрофон");
+                ui.add(egui::Slider::new(&mut self.microphone_volume, 0..=200).suffix("%"));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Динамик   ");
+                ui.add(egui::Slider::new(&mut self.speaker_volume, 0..=200).suffix("%"));
+            });
+            if before != (self.speaker_volume, self.microphone_volume) {
+                // Volumes act at once; they are saved when the window closes.
+                self.apply_audio_settings();
+            }
+        });
+    }
+
+    fn calls_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        self.missed_seen = now_unix();
+        ui.horizontal(|ui| {
+            ui.label(format!("Звонков: {}", self.history.records().len()));
+            if !self.history.is_empty() && ui.button("Очистить").clicked() {
+                actions.push(Action::ClearHistory);
+            }
+        });
+        ui.separator();
+        let can_dial = self.view.can_dial();
+        let mut to_contacts = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (index, record) in self.history.records().iter().enumerate() {
+                let (mark, color) = match record.direction {
+                    Direction::Outgoing => ("Исх.", egui::Color32::LIGHT_BLUE),
+                    Direction::Incoming => ("Вх.", egui::Color32::LIGHT_GREEN),
+                    Direction::Missed => ("Проп.", egui::Color32::RED),
+                };
+                // A contact saved later names old calls too.
+                let name = self
+                    .contacts
+                    .name_of(&record.number)
+                    .unwrap_or(&record.name);
+                let who = if name.is_empty() {
+                    record.number.clone()
+                } else {
+                    format!("{name} ({})", record.number)
+                };
+                ui.push_id(index, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(color, mark);
+                        ui.label(who);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(can_dial, egui::Button::new("Позвонить"))
+                                .clicked()
+                            {
+                                actions.push(Action::Call(record.number.clone()));
+                            }
+                            if name.is_empty() && ui.button("В контакты").clicked() {
+                                to_contacts = Some(record.number.clone());
+                            }
+                        });
+                    });
+                    let length = if record.seconds > 0 {
+                        format!(", {}", format_duration(record.seconds))
+                    } else {
+                        String::new()
+                    };
+                    ui.weak(format!(
+                        "{}{length}",
+                        format_timestamp(record.time, self.utc_offset)
+                    ));
+                    ui.separator();
+                });
+            }
+        });
+        if let Some(number) = to_contacts {
+            self.new_contact_number = number;
+            self.tab = Tab::Contacts;
+        }
+    }
+
+    fn contacts_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            ui.label("Имя");
+            ui.add(egui::TextEdit::singleline(&mut self.new_contact_name).desired_width(120.0));
+            ui.label("Номер");
+            ui.add(egui::TextEdit::singleline(&mut self.new_contact_number).desired_width(110.0));
+        });
+        if ui.button("Сохранить контакт").clicked() {
+            actions.push(Action::SaveContact(
+                self.new_contact_name.clone(),
+                self.new_contact_number.clone(),
+            ));
+        }
+        ui.separator();
+        ui.add(
+            egui::TextEdit::singleline(&mut self.contact_search)
+                .hint_text("Поиск")
+                .desired_width(f32::INFINITY),
+        );
+        let can_dial = self.view.can_dial();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let found = self.contacts.matching(&self.contact_search);
+            if found.is_empty() {
+                ui.weak("Контактов нет");
+            }
+            for (index, contact) in found.into_iter().enumerate() {
+                ui.push_id(index, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(&contact.name);
+                        ui.weak(&contact.number);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Удалить").clicked() {
+                                actions.push(Action::RemoveContact(contact.number.clone()));
+                            }
+                            if ui
+                                .add_enabled(can_dial, egui::Button::new("Позвонить"))
+                                .clicked()
+                            {
+                                actions.push(Action::Call(contact.number.clone()));
+                            }
+                        });
+                    });
+                    ui.separator();
+                });
+            }
+        });
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let mut open = self.settings_open;
+        egui::Window::new("Настройки")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.heading("Аккаунт");
+                egui::Grid::new("account").num_columns(2).show(ui, |ui| {
+                    ui.label("SIP-сервер");
+                    ui.text_edit_singleline(&mut self.server);
+                    ui.end_row();
+                    ui.label("Номер (пользователь)");
+                    ui.text_edit_singleline(&mut self.user);
+                    ui.end_row();
+                    ui.label("Пароль");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.password)
+                                .password(!self.show_password)
+                                .desired_width(150.0),
+                        );
+                        ui.checkbox(&mut self.show_password, "Показать");
+                    });
+                    ui.end_row();
+                    ui.label("Домен (если отличается)");
+                    ui.text_edit_singleline(&mut self.domain);
+                    ui.end_row();
+                    ui.label("Логин (если отличается)");
+                    ui.text_edit_singleline(&mut self.auth_user);
+                    ui.end_row();
+                    ui.label("Локальный порт");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.local_port)
+                            .hint_text("автоматически")
+                            .desired_width(100.0),
+                    );
+                    ui.end_row();
+                });
+                if secret::is_available() {
+                    ui.checkbox(&mut self.save_password, "Запомнить пароль");
+                    ui.weak("Пароль хранится зашифрованным для этого пользователя Windows.");
+                } else {
+                    ui.weak("На этой системе пароль не сохраняется.");
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Сохранить и подключить").clicked() {
+                        actions.push(Action::Connect);
+                    }
+                    if ui
+                        .add_enabled(self.handle.is_some(), egui::Button::new("Отключить"))
+                        .clicked()
+                    {
+                        actions.push(Action::Disconnect);
+                    }
+                });
+                if let Some(local) = self.local {
+                    ui.weak(format!("Адрес телефона: {local}"));
+                }
+
+                ui.separator();
+                ui.heading("Звук");
+                let before = (self.microphone.clone(), self.speaker.clone());
+                device_picker(ui, "Микрофон", &mut self.microphone, &self.microphones);
+                device_picker(ui, "Динамик", &mut self.speaker, &self.speakers);
+                if ui.button("Обновить список устройств").clicked() {
+                    self.microphones = input_device_names();
+                    self.speakers = output_device_names();
+                }
+                if before != (self.microphone.clone(), self.speaker.clone()) {
+                    actions.push(Action::AudioChanged);
+                }
+                ui.weak("Новое устройство используется со следующего звонка.");
+            });
+        self.settings_open = open;
+    }
+
+    fn log_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.log_open;
+        egui::Window::new("Журнал")
+            .open(&mut open)
+            .default_size([520.0, 320.0])
+            .show(ctx, |ui| {
+                if ui.button("Очистить").clicked() {
+                    self.logs.clear();
+                }
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &self.logs {
+                            ui.monospace(line);
+                        }
+                    });
+            });
+        self.log_open = open;
     }
 }
 
 /// A drop-down list of devices; an empty choice is the system default.
 fn device_picker(ui: &mut egui::Ui, label: &str, chosen: &mut String, names: &[String]) {
     let shown = if chosen.is_empty() {
-        "System default".to_owned()
+        "По умолчанию".to_owned()
     } else {
         chosen.clone()
     };
     egui::ComboBox::from_label(label)
         .selected_text(shown)
-        .width(260.0)
+        .width(280.0)
         .show_ui(ui, |ui| {
-            ui.selectable_value(chosen, String::new(), "System default");
+            ui.selectable_value(chosen, String::new(), "По умолчанию");
             for name in names {
                 ui.selectable_value(chosen, name.clone(), name);
             }
         });
+}
+
+fn phase_text(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Idle => "Готов",
+        Phase::Calling => "Вызов…",
+        Phase::Ringing => "У абонента звонит телефон",
+        Phase::Incoming => "Входящий вызов",
+        Phase::Answering => "Соединение…",
+        Phase::Connected => "Разговор",
+    }
+}
+
+fn end_reason_text(reason: EndReason) -> String {
+    match reason {
+        EndReason::Completed => "разговор окончен".to_owned(),
+        EndReason::Rejected(486 | 600) => "занято".to_owned(),
+        EndReason::Rejected(404) => "номер не найден".to_owned(),
+        EndReason::Rejected(480) => "абонент недоступен".to_owned(),
+        EndReason::Rejected(603) => "вызов отклонён".to_owned(),
+        EndReason::Rejected(status) => format!("вызов не прошёл (код {status})"),
+        EndReason::Cancelled => "отменён".to_owned(),
+        EndReason::Timeout => "нет ответа".to_owned(),
+        EndReason::Failed => "не удалось позвонить".to_owned(),
+    }
+}
+
+/// Messages of the phone's core, in Russian where they are known. The text
+/// after the first colon (a system detail) is kept as it is.
+fn error_text(message: &str) -> String {
+    const KNOWN: [(&str, &str); 9] = [
+        (
+            "Cannot play the ringing sound",
+            "Не удалось воспроизвести звонок",
+        ),
+        ("Cannot start audio", "Не удалось включить звук"),
+        ("Audio failed", "Сбой звука"),
+        ("Hold did not work", "Удержание не сработало"),
+        ("Resume did not work", "Возобновление не сработало"),
+        (
+            "register on a SIP server before calling a number",
+            "Нет регистрации на сервере — позвонить на номер нельзя",
+        ),
+        ("invalid number or SIP address", "Неверный номер"),
+        ("a call is already in progress", "Уже идёт вызов"),
+        (
+            "digits can be sent only during a connected call",
+            "Цифры можно отправлять только во время разговора",
+        ),
+    ];
+    for (english, russian) in KNOWN {
+        if let Some(rest) = message.strip_prefix(english) {
+            return format!("{russian}{rest}");
+        }
+    }
+    message.to_owned()
+}
+
+fn registration_text(state: &RegistrationState) -> String {
+    match state {
+        RegistrationState::Registering => "подключение…".to_owned(),
+        RegistrationState::Registered { .. } => "в сети".to_owned(),
+        RegistrationState::Unregistered => "не в сети".to_owned(),
+        RegistrationState::Failed(reason) => {
+            let reason = if reason.starts_with("wrong user name or password") {
+                "неверный номер или пароль"
+            } else if reason.starts_with("no response") {
+                "сервер не отвечает"
+            } else {
+                reason.as_str()
+            };
+            format!("Ошибка: {reason}")
+        }
+    }
 }
 
 impl Drop for PhoneWindow {
@@ -478,237 +1116,57 @@ impl Drop for PhoneWindow {
 
 impl eframe::App for PhoneWindow {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll();
-        ctx.request_repaint_after(Duration::from_millis(50));
-        let running = self.handle.is_some();
+        self.poll(ctx);
+        ctx.request_repaint_after(Duration::from_millis(100));
+        let mut actions = Vec::new();
+
+        egui::TopBottomPanel::top("status").show(ctx, |ui| {
+            ui.add_space(4.0);
+            self.status_bar(ui);
+            ui.add_space(4.0);
+        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("MicroSIP Rust — direct-call preview");
-            ui.label("UDP / PCMU. Direct calls and calls through a SIP server; basic NAT, no encryption yet.");
-            ui.separator();
-
-            ui.add_enabled_ui(!running, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Local IP:port");
-                    ui.text_edit_singleline(&mut self.local);
-                });
-            });
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!running, egui::Button::new("Start phone"))
-                    .clicked()
-                    && let Err(error) = self.start()
-                {
-                    self.error(error);
-                }
-                if ui
-                    .add_enabled(running, egui::Button::new("Stop phone"))
-                    .clicked()
-                {
-                    self.stop();
-                }
-            });
-
-            ui.separator();
-            let editable = running && self.can_register();
-            ui.add_enabled_ui(editable, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("SIP server");
-                    ui.text_edit_singleline(&mut self.server);
-                    ui.label("Domain (optional)");
-                    ui.text_edit_singleline(&mut self.domain);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("User");
-                    ui.text_edit_singleline(&mut self.user);
-                    ui.label("Login (if different)");
-                    ui.text_edit_singleline(&mut self.auth_user);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Password");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.password)
-                            .password(!self.show_password),
-                    );
-                    ui.checkbox(&mut self.show_password, "Show");
-                    ui.label(format!("{} characters", self.password.trim().chars().count()));
-                });
-            });
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(editable, egui::Button::new("Register"))
-                    .clicked()
-                {
-                    self.register();
-                }
-                if ui
-                    .add_enabled(
-                        running && self.can_unregister(),
-                        egui::Button::new("Unregister"),
-                    )
-                    .clicked()
-                {
-                    self.unregister();
-                }
-                match self.registration.as_ref() {
-                    Some(state) => ui.label(format!("Account: {state}")),
-                    None => ui.label("Account: not registered"),
-                };
-            });
-            ui.label(
-                "Register switches Local from 127.0.0.1 to this computer's network address \
-                 by itself. Once registered, a number typed into Remote is called through \
-                 the server.",
-            );
-            ui.separator();
-
-            ui.add_enabled_ui(running && self.view.can_dial(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Remote IP:port or number");
-                    ui.text_edit_singleline(&mut self.remote);
-                });
-            });
-
-            ui.horizontal(|ui| {
-                let view = self.view.clone();
-                if ui
-                    .add_enabled(running && view.can_dial(), egui::Button::new("Call"))
-                    .clicked()
-                {
-                    self.call();
-                }
-                if ui
-                    .add_enabled(running && view.can_answer(), egui::Button::new("Answer"))
-                    .clicked()
-                {
-                    self.answer();
-                }
-                if ui
-                    .add_enabled(running && view.can_reject(), egui::Button::new("Reject"))
-                    .clicked()
-                {
-                    self.reject();
-                }
-                if ui
-                    .add_enabled(running && view.can_hangup(), egui::Button::new("Hang up"))
-                    .clicked()
-                {
-                    self.hangup();
-                }
-                let connected = running && view.phase() == Phase::Connected;
-                let label = if self.muted { "Unmute" } else { "Mute" };
-                if ui
-                    .add_enabled(connected, egui::Button::new(label))
-                    .clicked()
-                {
-                    self.toggle_mute();
-                }
-                let label = if view.is_held() { "Resume" } else { "Hold" };
-                if ui
-                    .add_enabled(running && view.can_hold(), egui::Button::new(label))
-                    .clicked()
-                {
-                    self.toggle_hold();
-                }
-                if self.muted {
-                    ui.colored_label(egui::Color32::YELLOW, "Microphone is off");
-                }
-                if view.is_held() {
-                    ui.colored_label(egui::Color32::YELLOW, "On hold");
-                }
-                if view.is_remote_held() {
-                    ui.colored_label(egui::Color32::YELLOW, "Held by the other side");
-                }
-            });
-
-            // Sound devices and volumes.
-            ui.horizontal(|ui| {
-                let before = (self.microphone.clone(), self.speaker.clone());
-                device_picker(ui, "Microphone", &mut self.microphone, &self.microphones);
-                device_picker(ui, "Speaker", &mut self.speaker, &self.speakers);
-                if ui.button("Refresh devices").clicked() {
-                    self.microphones = input_device_names();
-                    self.speakers = output_device_names();
-                }
-                if before != (self.microphone.clone(), self.speaker.clone()) {
-                    self.apply_audio_settings();
-                    self.save_settings();
-                    if self.view.phase() != Phase::Idle {
-                        self.log("The new sound device is used from the next call on.");
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                let before = (self.speaker_volume, self.microphone_volume);
-                ui.label("Speaker volume");
-                ui.add(egui::Slider::new(&mut self.speaker_volume, 0..=200).suffix("%"));
-                ui.label("Microphone volume");
-                ui.add(egui::Slider::new(&mut self.microphone_volume, 0..=200).suffix("%"));
-                if before != (self.speaker_volume, self.microphone_volume) {
-                    self.apply_audio_settings();
-                }
-            });
-
-            // Keypad for menus such as "press 1 for ...", active during a call.
-            let connected = running && self.view.phase() == Phase::Connected;
-            ui.add_enabled_ui(connected, |ui| {
-                for row in ["123", "456", "789", "*0#"] {
-                    ui.horizontal(|ui| {
-                        for digit in row.chars() {
-                            let button = egui::Button::new(digit.to_string())
-                                .min_size(egui::vec2(36.0, 24.0));
-                            if ui.add(button).clicked() {
-                                self.dtmf(digit);
-                            }
-                        }
-                    });
-                }
-            });
-
-            if running {
-                let phase = self.view.phase();
-                match (phase, self.view.peer_label()) {
-                    (Phase::Idle, _) | (_, None) => {
-                        ui.label(format!("Status: {}", phase.label()));
-                    }
-                    (_, Some(peer)) => {
-                        ui.label(format!("Status: {} — {peer}", phase.label()));
-                    }
-                }
-                if let Some((sent, received)) = self.view.stats() {
-                    ui.label(format!("Last call RTP: sent {sent}, received {received}"));
-                }
+            let missed = self.history.missed_since(self.missed_seen);
+            let calls = if missed > 0 {
+                format!("Звонки ({missed})")
             } else {
-                ui.label("The phone is not running.");
-            }
-            ui.label("Closing the window ends an active call with a proper BYE and removes the registration.");
-            if let Some(error) = self.last_error.as_ref() {
-                ui.colored_label(egui::Color32::RED, error);
-            }
+                "Звонки".to_owned()
+            };
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Dialpad, "Набор");
+                ui.selectable_value(&mut self.tab, Tab::Calls, calls);
+                ui.selectable_value(&mut self.tab, Tab::Contacts, "Контакты");
+            });
             ui.separator();
-            if ui.button("Clear log").clicked() {
-                self.logs.clear();
+            match self.tab {
+                Tab::Dialpad => self.dialpad_tab(ui, &mut actions),
+                Tab::Calls => self.calls_tab(ui, &mut actions),
+                Tab::Contacts => self.contacts_tab(ui, &mut actions),
             }
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for line in &self.logs {
-                        ui.monospace(line);
-                    }
-                });
         });
+
+        if self.settings_open {
+            self.settings_window(ctx, &mut actions);
+        }
+        if self.log_open {
+            self.log_window(ctx);
+        }
+        for action in actions {
+            self.apply(action);
+        }
     }
 }
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 600.0])
-            .with_min_inner_size([700.0, 450.0]),
+            .with_inner_size([400.0, 640.0])
+            .with_min_inner_size([360.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "MicroSIP Rust preview",
+        "MicroSIP Rust",
         options,
         Box::new(|_creation_context| Ok(Box::new(PhoneWindow::new()))),
     )
