@@ -4,11 +4,13 @@
 use crate::audio::{MAX_VOLUME_PERCENT, Microphone, Speaker, volume_factor};
 use crate::codec::Codec;
 use crate::gain::AutoGain;
+use crate::recording::{CallRecorder, RecorderInput};
 use crate::rtp::PCMU_CLOCK_RATE;
 use crate::rtp::session::{RtpSession, RtpSessionConfig};
 use crate::tones::{TONE_RATE, Tone, ToneGenerator};
 use std::error::Error;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -110,6 +112,15 @@ pub trait Media {
     /// While the call is on hold nothing from the microphone is sent,
     /// whatever the mute setting is.
     fn set_hold(&mut self, _hold: bool) {}
+
+    /// Starts recording the running call to this WAV file, or stops the
+    /// recording with `None`. Stopping the audio stops it too.
+    fn record(&mut self, path: Option<&Path>) -> Result<(), MediaError> {
+        match path {
+            Some(_) => Err("this phone has no audio to record".into()),
+            None => Ok(()),
+        }
+    }
 
     /// Quality of the received audio; `None` when this media plays nothing.
     fn quality(&self) -> Option<MediaQuality> {
@@ -295,7 +306,14 @@ struct ActiveAudio {
     speaker: Speaker,
     session: RtpSession,
     mic_level: Arc<MicLevel>,
+    /// Where the two audio threads hand their samples while recording.
+    record_local: RecorderSlot,
+    record_remote: RecorderSlot,
+    recorder: Option<CallRecorder>,
 }
+
+/// A recorder input that may be put in place or taken away during a call.
+type RecorderSlot = Arc<Mutex<Option<RecorderInput>>>;
 
 /// Microphone figures written by the sound card thread.
 #[derive(Default)]
@@ -307,6 +325,18 @@ struct MicLevel {
 impl AudioMedia {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Mute and hold both stop the microphone from being sent, and so from
+    /// being recorded.
+    fn apply_silence(&mut self) {
+        let silent = self.muted || self.held;
+        if let Some(active) = self.active.as_ref() {
+            active.session.set_muted(silent);
+            if let Some(recorder) = active.recorder.as_ref() {
+                recorder.set_local_muted(silent);
+            }
+        }
     }
 
     /// Audio that follows the given settings (devices and volumes).
@@ -348,6 +378,9 @@ impl Media for AudioMedia {
             self.reserve_ms,
         )?;
         let mut to_speaker = speaker.sink();
+        let record_local = RecorderSlot::default();
+        let record_remote = RecorderSlot::default();
+        let (tap_local, tap_remote) = (Arc::clone(&record_local), Arc::clone(&record_remote));
         let config = RtpSessionConfig::new(remote, format.sample_rate)
             .with_dtmf_payload_type(self.dtmf_payload_type)
             .with_codec(self.codec);
@@ -357,6 +390,11 @@ impl Media for AudioMedia {
             config,
             self.next_ssrc,
             Some(Box::new(move |samples| {
+                if let Ok(mut tap) = tap_remote.lock()
+                    && let Some(input) = tap.as_mut()
+                {
+                    input.push(&samples, PCMU_CLOCK_RATE);
+                }
                 // A failure here means the speaker is gone; the call ends soon.
                 let _ = to_speaker.push(&samples, PCMU_CLOCK_RATE);
             })),
@@ -384,6 +422,12 @@ impl Media for AudioMedia {
                     *sample = (*sample * volume).clamp(-1.0, 1.0);
                 }
             }
+            // The recording gets the voice as it is sent, after the gain.
+            if let Ok(mut tap) = tap_local.lock()
+                && let Some(input) = tap.as_mut()
+            {
+                input.push(&samples, format.sample_rate);
+            }
             // Never wait on the sound card thread; a full queue drops a block.
             let _ = to_network.try_send(samples);
         })?;
@@ -396,6 +440,9 @@ impl Media for AudioMedia {
             speaker,
             session,
             mic_level,
+            record_local,
+            record_remote,
+            recorder: None,
         });
         // Every call starts with the microphone on and not on hold.
         self.muted = false;
@@ -451,15 +498,43 @@ impl Media for AudioMedia {
 
     fn set_muted(&mut self, muted: bool) {
         self.muted = muted;
-        if let Some(active) = self.active.as_ref() {
-            active.session.set_muted(self.muted || self.held);
-        }
+        self.apply_silence();
     }
 
     fn set_hold(&mut self, hold: bool) {
         self.held = hold;
-        if let Some(active) = self.active.as_ref() {
-            active.session.set_muted(self.muted || self.held);
+        self.apply_silence();
+    }
+
+    fn record(&mut self, path: Option<&Path>) -> Result<(), MediaError> {
+        let silent = self.muted || self.held;
+        let Some(active) = self.active.as_mut() else {
+            return match path {
+                Some(_) => Err("only a connected call can be recorded".into()),
+                None => Ok(()),
+            };
+        };
+        // Taking the inputs away first lets the old file be finished.
+        for slot in [&active.record_local, &active.record_remote] {
+            if let Ok(mut slot) = slot.lock() {
+                *slot = None;
+            }
+        }
+        let finished = active.recorder.take().map(CallRecorder::stop);
+        if let Some(path) = path {
+            let recorder = CallRecorder::start(path)?;
+            recorder.set_local_muted(silent);
+            if let Ok(mut slot) = active.record_local.lock() {
+                *slot = Some(recorder.local_input());
+            }
+            if let Ok(mut slot) = active.record_remote.lock() {
+                *slot = Some(recorder.remote_input());
+            }
+            active.recorder = Some(recorder);
+        }
+        match finished {
+            Some(Err(error)) => Err(format!("the recording could not be finished: {error}").into()),
+            _ => Ok(()),
         }
     }
 
@@ -488,6 +563,8 @@ impl Media for AudioMedia {
                 ..
             } = active;
             self.reserve_ms = speaker.reserve_ms();
+            // The recording ends with the call; its file is completed here.
+            drop(active.recorder);
             // The microphone first: its callback feeds the session.
             drop(microphone);
             // Errors while tearing down a finished call have nobody to act on them.

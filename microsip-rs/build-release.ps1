@@ -180,6 +180,10 @@ First tab   dial pad: type or click a number and press the green button.
             for the microphone and for hold.
 Second tab  the list of calls, missed ones marked in red, with redial.
 Third tab   contacts: names for numbers; a saved name is shown for calls.
+A call can be recorded with the button under "hold", or every call
+automatically (settings window). Recordings are WAV files in
+Documents\MicroSIP-Rust Recordings: left channel you, right channel the
+other side. Tell the other side when you record: the law may require it.
 An incoming call rings on the speaker and brings the window forward.
 Closing the window ends a call properly and takes the phone offline.
 

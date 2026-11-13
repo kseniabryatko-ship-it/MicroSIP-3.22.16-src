@@ -9,6 +9,7 @@ pub mod gain;
 pub mod history;
 pub mod localtime;
 pub mod playout;
+pub mod recording;
 pub mod registration;
 pub mod resample;
 pub mod rtp;

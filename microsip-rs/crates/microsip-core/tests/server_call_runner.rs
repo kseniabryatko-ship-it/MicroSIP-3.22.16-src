@@ -925,3 +925,18 @@ fn answer_choosing_pcma_connects_the_call() {
     let offer = text(&hold.body);
     assert!(offer.contains(" RTP/AVP 8\r\n"), "{offer}");
 }
+
+#[test]
+fn recording_needs_a_connected_call_and_stopping_is_always_allowed() {
+    let handle = phone(fast_timers());
+    let path = std::env::temp_dir().join("microsip-rs-never-written.wav");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(handle.send(UiCommand::Record(Some(path.clone()))));
+    assert_eq!(wait_error(&handle), "only a connected call can be recorded");
+    assert!(!path.exists(), "no file may appear without a call");
+
+    // Stopping when nothing is recorded is not an error.
+    assert!(handle.send(UiCommand::Record(None)));
+    wait_for(&handle, Event::Recording(None));
+}

@@ -1,8 +1,9 @@
 //! The list of recent calls, kept in a plain text file next to the settings.
 //!
 //! One call per line, fields separated by tabs:
-//! `time  direction  seconds  number  name`. Unreadable lines are skipped, so
-//! a damaged file loses those calls only.
+//! `time  direction  seconds  number  name  recording`. The last field (the
+//! recording's file path) may be missing. Unreadable lines are skipped, so a
+//! damaged file loses those calls only.
 
 use std::fs;
 use std::io;
@@ -49,6 +50,8 @@ pub struct CallRecord {
     pub number: String,
     /// Caller's display name, if the network sent one.
     pub name: String,
+    /// Path of the call's recording; empty when it was not recorded.
+    pub recording: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -95,12 +98,14 @@ impl History {
                 let seconds = fields.next()?.trim().parse().ok()?;
                 let number = fields.next()?.trim().to_owned();
                 let name = fields.next().unwrap_or("").trim().to_owned();
+                let recording = fields.next().unwrap_or("").trim().to_owned();
                 (!number.is_empty()).then_some(CallRecord {
                     time,
                     direction,
                     seconds,
                     number,
                     name,
+                    recording,
                 })
             })
             .collect();
@@ -113,12 +118,13 @@ impl History {
             .iter()
             .map(|record| {
                 format!(
-                    "{}\t{}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\n",
                     record.time,
                     record.direction.code(),
                     record.seconds,
                     field(&record.number),
-                    field(&record.name)
+                    field(&record.name),
+                    field(&record.recording)
                 )
             })
             .collect()
@@ -164,6 +170,7 @@ mod tests {
             seconds: time % 100,
             number: number.to_owned(),
             name: String::new(),
+            recording: String::new(),
         }
     }
 
@@ -191,6 +198,7 @@ mod tests {
             seconds: 65,
             number: "4010".to_owned(),
             name: "Иван Петров".to_owned(),
+            recording: r"C:\Users\kseni\Documents\calls\2026-11-12_01-31-40_in_4010.wav".to_owned(),
         });
         history.add(record(
             1_794_436_400,
@@ -200,7 +208,8 @@ mod tests {
 
         let text = history.serialize();
         assert_eq!(text.lines().count(), 3);
-        assert!(text.starts_with("1794436400\tmissed\t0\t+7 (901) 075-06-27\t\n"));
+        assert!(text.starts_with("1794436400\tmissed\t0\t+7 (901) 075-06-27\t\t\n"));
+        assert!(text.contains("\tИван Петров\tC:\\Users\\kseni\\Documents\\calls\\"));
         assert_eq!(History::parse(&text), history);
     }
 
@@ -216,6 +225,9 @@ mod tests {
         let times: Vec<u64> = history.records().iter().map(|record| record.time).collect();
         assert_eq!(times, [100, 500]);
         assert_eq!(history.records()[0].name, "Анна");
+        // Lines written before recordings existed have no such field.
+        assert_eq!(history.records()[0].recording, "");
+        assert_eq!(history.records()[1].recording, "");
 
         let mut history = History::default();
         history.add(CallRecord {
@@ -224,6 +236,7 @@ mod tests {
             seconds: 2,
             number: "40\t10".to_owned(),
             name: "two\nlines".to_owned(),
+            recording: String::new(),
         });
         let parsed = History::parse(&history.serialize());
         assert_eq!(parsed.records().len(), 1);

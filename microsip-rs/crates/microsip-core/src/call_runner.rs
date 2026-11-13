@@ -33,6 +33,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -62,6 +63,10 @@ pub enum UiCommand {
     /// Puts the connected call on hold (`true`) or resumes it. The result
     /// is reported with [`Event::Hold`].
     Hold(bool),
+    /// Records the connected call to this WAV file, or stops recording with
+    /// `None`. Reported with [`Event::Recording`]; the recording also stops
+    /// when the call ends.
+    Record(Option<PathBuf>),
     /// Registers the account on its SIP server and keeps it registered.
     /// Progress is reported with [`Event::Registration`].
     Register(Account),
@@ -126,6 +131,8 @@ pub enum Event {
     Hold(bool),
     /// The other side put the call on hold (`true`) or resumed it.
     RemoteHold(bool),
+    /// The call is being recorded to this file, or recording stopped.
+    Recording(Option<PathBuf>),
     Ended(EndReason),
     /// The account's registration changed state.
     Registration(RegistrationState),
@@ -504,6 +511,17 @@ impl<M: Media> Runner<M> {
                 Ok(())
             }
             UiCommand::Hold(hold) => self.hold(hold),
+            UiCommand::Record(path) => {
+                if path.is_some() && !self.media_running {
+                    Err("only a connected call can be recorded".into())
+                } else {
+                    let result = self.media.record(path.as_deref());
+                    if result.is_ok() {
+                        self.emit(Event::Recording(path));
+                    }
+                    result
+                }
+            }
             UiCommand::Register(account) => {
                 self.register(account);
                 Ok(())

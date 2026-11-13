@@ -10,10 +10,13 @@ use microsip_core::call_runner::{CallHandle, EndReason, Event, UiCommand, spawn}
 use microsip_core::call_view::{CallView, Phase};
 use microsip_core::contacts::Contacts;
 use microsip_core::history::{CallRecord, Direction, History};
-use microsip_core::localtime::{format_duration, format_timestamp, now_unix, utc_offset_seconds};
+use microsip_core::localtime::{
+    DateTime, format_duration, format_timestamp, now_unix, utc_offset_seconds,
+};
+use microsip_core::recording::recording_file_name;
 use microsip_core::registration::{Account, RegistrationState};
 use microsip_core::secret;
-use microsip_core::settings::{self, Settings};
+use microsip_core::settings::{self, Settings, default_recordings_dir};
 use microsip_core::transport::{local_ip_towards, resolve_socket_address};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -47,6 +50,9 @@ enum Action {
     RemoveContact(String),
     ClearHistory,
     AudioChanged,
+    ToggleRecording,
+    /// Opens a file or folder with the program Windows uses for it.
+    Open(PathBuf),
 }
 
 /// The call in progress, for the call list.
@@ -56,6 +62,8 @@ struct CurrentCall {
     name: String,
     started: u64,
     connected: Option<Instant>,
+    /// File of the call's recording; empty when it was not recorded.
+    recording: String,
 }
 
 struct PhoneWindow {
@@ -88,6 +96,12 @@ struct PhoneWindow {
     microphones: Vec<String>,
     speakers: Vec<String>,
     controls: AudioControls,
+
+    // Recording.
+    record_calls: bool,
+    recordings_dir: String,
+    /// The file being written now.
+    recording: Option<PathBuf>,
 
     // The phone.
     handle: Option<CallHandle>,
@@ -186,6 +200,9 @@ impl PhoneWindow {
             microphones: input_device_names(),
             speakers: output_device_names(),
             controls: AudioControls::default(),
+            record_calls: saved.record_calls,
+            recordings_dir: saved.recordings_dir.clone(),
+            recording: None,
             handle: None,
             local: None,
             registration: None,
@@ -302,6 +319,8 @@ impl PhoneWindow {
             local_port: self.port(),
             save_password: self.save_password,
             password_protected,
+            record_calls: self.record_calls,
+            recordings_dir: self.recordings_dir.trim().to_owned(),
         };
         if current == self.saved {
             return;
@@ -437,6 +456,7 @@ impl PhoneWindow {
             name,
             started: now_unix(),
             connected: None,
+            recording: String::new(),
         });
         self.view.dialing_target(&target);
         self.send(UiCommand::DialTarget(target));
@@ -475,6 +495,57 @@ impl PhoneWindow {
         }
     }
 
+    /// Folder for recordings: the one from the settings, or the default.
+    fn recordings_folder(&self) -> Option<PathBuf> {
+        let chosen = self.recordings_dir.trim();
+        if chosen.is_empty() {
+            default_recordings_dir()
+        } else {
+            Some(PathBuf::from(chosen))
+        }
+    }
+
+    fn start_recording(&mut self) {
+        if self.view.phase() != Phase::Connected || self.recording.is_some() {
+            return;
+        }
+        let Some(folder) = self.recordings_folder() else {
+            return self.error("Не задана папка для записей");
+        };
+        let (incoming, number) = self
+            .current
+            .as_ref()
+            .map_or((false, String::new()), |call| {
+                (call.incoming, call.number.clone())
+            });
+        let time = DateTime::from_unix(now_unix(), self.utc_offset);
+        let path = folder.join(recording_file_name(time, incoming, &number));
+        self.send(UiCommand::Record(Some(path)));
+    }
+
+    fn toggle_recording(&mut self) {
+        if self.recording.is_some() {
+            self.send(UiCommand::Record(None));
+        } else {
+            self.start_recording();
+        }
+    }
+
+    /// Opens a recording or the recordings folder.
+    fn open(&mut self, path: PathBuf) {
+        if !path.exists() {
+            return self.error(format!("Не найдено: {}", path.display()));
+        }
+        let program = if cfg!(windows) {
+            "explorer"
+        } else {
+            "xdg-open"
+        };
+        if let Err(error) = std::process::Command::new(program).arg(&path).spawn() {
+            self.error(format!("Не удалось открыть {}: {error}", path.display()));
+        }
+    }
+
     /// A keypad press: a tone during a call, a digit of the number otherwise.
     fn digit(&mut self, digit: char) {
         if self.view.phase() == Phase::Connected {
@@ -488,6 +559,8 @@ impl PhoneWindow {
     /// writes it to the call list.
     fn finish_call(&mut self, reason: EndReason, record: bool) {
         self.muted = false;
+        // The phone finishes the file itself when the call ends.
+        self.recording = None;
         let Some(call) = self.current.take() else {
             return;
         };
@@ -510,6 +583,7 @@ impl PhoneWindow {
             seconds,
             number: call.number,
             name: call.name,
+            recording: call.recording,
         });
         self.save_history();
     }
@@ -537,6 +611,7 @@ impl PhoneWindow {
                         name,
                         started: now_unix(),
                         connected: None,
+                        recording: String::new(),
                     });
                     self.tab = Tab::Dialpad;
                     // Bring the window to the user's attention.
@@ -552,6 +627,20 @@ impl PhoneWindow {
                     if let Some(call) = self.current.as_mut() {
                         call.connected = Some(Instant::now());
                     }
+                    if self.record_calls {
+                        self.start_recording();
+                    }
+                }
+                Event::Recording(Some(path)) => {
+                    self.log(format!("Запись разговора: {}", path.display()));
+                    if let Some(call) = self.current.as_mut() {
+                        call.recording = path.display().to_string();
+                    }
+                    self.recording = Some(path);
+                }
+                Event::Recording(None) => {
+                    self.log("Запись остановлена");
+                    self.recording = None;
                 }
                 Event::MediaStats { sent, received } => {
                     self.log(format!("RTP: отправлено {sent}, принято {received}"));
@@ -615,6 +704,8 @@ impl PhoneWindow {
                 self.apply_audio_settings();
                 self.save_settings();
             }
+            Action::ToggleRecording => self.toggle_recording(),
+            Action::Open(path) => self.open(path),
         }
     }
 
@@ -744,6 +835,11 @@ impl PhoneWindow {
                 } else {
                     "Удержание"
                 };
+                let record = if self.recording.is_some() {
+                    "Остановить запись"
+                } else {
+                    "Записать разговор"
+                };
                 ui.add_enabled_ui(connected, |ui| {
                     ui.horizontal(|ui| {
                         if ui.add_sized(half, egui::Button::new(mute)).clicked() {
@@ -753,6 +849,9 @@ impl PhoneWindow {
                             actions.push(Action::ToggleHold);
                         }
                     });
+                    if ui.add_sized(wide, egui::Button::new(record)).clicked() {
+                        actions.push(Action::ToggleRecording);
+                    }
                 });
             }
         }
@@ -775,6 +874,9 @@ impl PhoneWindow {
             };
             ui.label(egui::RichText::new(who).size(18.0));
             ui.label(state);
+            if self.recording.is_some() {
+                ui.colored_label(egui::Color32::RED, "Идёт запись разговора");
+            }
             if self.muted {
                 ui.colored_label(egui::Color32::YELLOW, "Микрофон выключен");
             }
@@ -847,6 +949,9 @@ impl PhoneWindow {
                             }
                             if name.is_empty() && ui.button("В контакты").clicked() {
                                 to_contacts = Some(record.number.clone());
+                            }
+                            if !record.recording.is_empty() && ui.button("Запись").clicked() {
+                                actions.push(Action::Open(PathBuf::from(&record.recording)));
                             }
                         });
                     });
@@ -990,6 +1095,30 @@ impl PhoneWindow {
                     actions.push(Action::AudioChanged);
                 }
                 ui.weak("Новое устройство используется со следующего звонка.");
+
+                ui.separator();
+                ui.heading("Запись разговоров");
+                ui.checkbox(&mut self.record_calls, "Записывать все разговоры");
+                let default = default_recordings_dir()
+                    .map(|folder| folder.display().to_string())
+                    .unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label("Папка");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.recordings_dir)
+                            .hint_text(default)
+                            .desired_width(260.0),
+                    );
+                });
+                if ui.button("Открыть папку с записями").clicked()
+                    && let Some(folder) = self.recordings_folder()
+                {
+                    // The folder appears with the first recording; make it
+                    // now so that there is something to open.
+                    let _ = std::fs::create_dir_all(&folder);
+                    actions.push(Action::Open(folder));
+                }
+                ui.weak("Файлы WAV: слева ваш голос, справа собеседник.");
             });
         self.settings_open = open;
     }

@@ -35,6 +35,10 @@ pub struct Settings {
     pub save_password: bool,
     /// The password as produced by `secret::protect`; empty when not saved.
     pub password_protected: String,
+    /// Record every call from the moment it is connected.
+    pub record_calls: bool,
+    /// Folder for recordings; empty means [`default_recordings_dir`].
+    pub recordings_dir: String,
 }
 
 impl Default for Settings {
@@ -53,6 +57,8 @@ impl Default for Settings {
             local_port: 0,
             save_password: true,
             password_protected: String::new(),
+            record_calls: false,
+            recordings_dir: String::new(),
         }
     }
 }
@@ -87,6 +93,8 @@ impl Settings {
                 }
                 "save_password" => settings.save_password = value != "0",
                 "password_protected" => settings.password_protected = value,
+                "record_calls" => settings.record_calls = value == "1",
+                "recordings_dir" => settings.recordings_dir = value,
                 "microphone" => settings.microphone = value,
                 "speaker" => settings.speaker = value,
                 // A value that is not a sensible volume keeps the default.
@@ -113,6 +121,7 @@ impl Settings {
         let microphone_volume = self.microphone_volume.to_string();
         let local_port = self.local_port.to_string();
         let save_password = if self.save_password { "1" } else { "0" }.to_owned();
+        let record_calls = if self.record_calls { "1" } else { "0" }.to_owned();
         // Without permission to remember it, no form of the password is written.
         let password_protected = if self.save_password {
             self.password_protected.clone()
@@ -133,6 +142,8 @@ impl Settings {
             ("local_port", &local_port),
             ("save_password", &save_password),
             ("password_protected", &password_protected),
+            ("record_calls", &record_calls),
+            ("recordings_dir", &self.recordings_dir),
         ] {
             text.push_str(key);
             text.push('=');
@@ -183,6 +194,23 @@ fn one_line(value: &str) -> String {
         .collect()
 }
 
+/// Where recordings go unless the user chose a folder: a `MicroSIP-Rust
+/// Recordings` folder in the user's Documents on Windows, in the home
+/// folder elsewhere. `None` when the profile location is unknown.
+pub fn default_recordings_dir() -> Option<PathBuf> {
+    let variable = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let base = if cfg!(windows) {
+        variable("USERPROFILE")?.join("Documents")
+    } else {
+        variable("HOME")?
+    };
+    Some(base.join("MicroSIP-Rust Recordings"))
+}
+
 /// `%APPDATA%\MicroSIP-Rust\settings.ini` on Windows; elsewhere the
 /// `MicroSIP-Rust` folder under `$XDG_CONFIG_HOME` or `$HOME/.config`.
 /// `None` when the profile location is unknown.
@@ -220,6 +248,8 @@ mod tests {
             local_port: 5062,
             save_password: true,
             password_protected: "0a1b2c".to_owned(),
+            record_calls: true,
+            recordings_dir: r"D:\Записи звонков".to_owned(),
         }
     }
 
@@ -253,7 +283,8 @@ mod tests {
              microphone=Headset Microphone (USB Audio)\n\
              speaker=Headset Earphone (USB Audio)\n\
              speaker_volume=80\nmicrophone_volume=150\n\
-             local_port=5062\nsave_password=1\npassword_protected=0a1b2c\n"
+             local_port=5062\nsave_password=1\npassword_protected=0a1b2c\n\
+             record_calls=1\nrecordings_dir=D:\\Записи звонков\n"
         );
         // No line holds the password itself; `save_password` and
         // `password_protected` are different keys.
@@ -321,6 +352,12 @@ mod tests {
         assert!(old.save_password);
         assert_eq!(old.password_protected, "");
         assert_eq!(old.local_port, 0);
+        // Recording is off unless it was switched on.
+        assert!(!old.record_calls);
+        assert_eq!(old.recordings_dir, "");
+        if let Some(folder) = default_recordings_dir() {
+            assert!(folder.ends_with("MicroSIP-Rust Recordings"));
+        }
         // A port that is not a port keeps the automatic choice.
         assert_eq!(Settings::parse("local_port=70000\n").local_port, 0);
     }
