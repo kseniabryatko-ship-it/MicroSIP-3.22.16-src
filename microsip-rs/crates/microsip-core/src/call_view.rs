@@ -161,6 +161,8 @@ impl CallView {
             }
             Event::AudioQuality(_)
             | Event::Recording(_)
+            | Event::Transfer(_)
+            | Event::Declined { .. }
             | Event::Caller { .. }
             | Event::Registration(_)
             | Event::Trace { .. }

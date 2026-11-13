@@ -136,6 +136,25 @@ impl EstablishedDialog {
         Ok(request)
     }
 
+    /// Builds a REFER inside the dialog (call transfer) and reserves its
+    /// CSeq and branch. The caller adds Refer-To and Referred-By.
+    pub fn build_refer(&mut self, branch: &str) -> Result<Request, DialogError> {
+        self.require_confirmed()?;
+        self.check_new_branch(branch)?;
+
+        let cseq = self
+            .local_cseq
+            .checked_add(1)
+            .filter(|number| *number <= MAX_CSEQ)
+            .ok_or(DialogError::CseqExhausted)?;
+
+        let request = self.build_request(Method::Refer, cseq, branch)?;
+
+        self.local_cseq = cseq;
+        self.used_branches.insert(branch.to_owned());
+        Ok(request)
+    }
+
     /// Builds the ACK for a successful re-INVITE that had this CSeq.
     pub fn build_reinvite_ack(&mut self, cseq: u32, branch: &str) -> Result<Request, DialogError> {
         self.require_confirmed()?;
@@ -367,6 +386,26 @@ mod tests {
             Message::parse(text).expect("ACK should parse"),
             Message::Request(ack)
         );
+    }
+
+    #[test]
+    fn refer_takes_the_next_cseq_and_leaves_the_dialog_open() {
+        let mut dialog = EstablishedDialog::new(config()).expect("valid dialog");
+        let first = dialog.local_cseq();
+        let refer = dialog.build_refer("z9hG4bK-refer").expect("valid REFER");
+        assert_eq!(refer.method, Method::Refer);
+        assert_eq!(
+            refer.headers.get("cseq"),
+            Some(format!("{} REFER", first + 1).as_str())
+        );
+        assert_eq!(dialog.state(), DialogState::Confirmed);
+        // The call can still be ended afterwards.
+        let bye = dialog.build_bye("z9hG4bK-bye").expect("valid BYE");
+        assert_eq!(
+            bye.headers.get("cseq"),
+            Some(format!("{} BYE", first + 2).as_str())
+        );
+        assert!(dialog.build_refer("z9hG4bK-late").is_err());
     }
 
     #[test]

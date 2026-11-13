@@ -6,7 +6,7 @@
 use eframe::egui;
 use microsip_core::audio::{input_device_names, output_device_names};
 use microsip_core::call_media::{AudioControls, AudioMedia};
-use microsip_core::call_runner::{CallHandle, EndReason, Event, UiCommand, spawn};
+use microsip_core::call_runner::{CallHandle, EndReason, Event, TransferState, UiCommand, spawn};
 use microsip_core::call_view::{CallView, Phase};
 use microsip_core::contacts::Contacts;
 use microsip_core::history::{CallRecord, Direction, History};
@@ -51,6 +51,8 @@ enum Action {
     ClearHistory,
     AudioChanged,
     ToggleRecording,
+    Transfer(String),
+    DoNotDisturb(bool),
     /// Opens a file or folder with the program Windows uses for it.
     Open(PathBuf),
 }
@@ -102,6 +104,16 @@ struct PhoneWindow {
     recordings_dir: String,
     /// The file being written now.
     recording: Option<PathBuf>,
+
+    // Call handling.
+    do_not_disturb: bool,
+    auto_answer: bool,
+    auto_answer_delay: u32,
+    /// When the ringing call is to be answered automatically.
+    answer_at: Option<Instant>,
+    transfer_to: String,
+    /// A change of the do-not-disturb box, applied after drawing.
+    pending_dnd: Option<bool>,
 
     // The phone.
     handle: Option<CallHandle>,
@@ -203,6 +215,12 @@ impl PhoneWindow {
             record_calls: saved.record_calls,
             recordings_dir: saved.recordings_dir.clone(),
             recording: None,
+            do_not_disturb: saved.do_not_disturb,
+            auto_answer: saved.auto_answer,
+            auto_answer_delay: saved.auto_answer_delay,
+            answer_at: None,
+            transfer_to: String::new(),
+            pending_dnd: None,
             handle: None,
             local: None,
             registration: None,
@@ -321,6 +339,9 @@ impl PhoneWindow {
             password_protected,
             record_calls: self.record_calls,
             recordings_dir: self.recordings_dir.trim().to_owned(),
+            do_not_disturb: self.do_not_disturb,
+            auto_answer: self.auto_answer,
+            auto_answer_delay: self.auto_answer_delay,
         };
         if current == self.saved {
             return;
@@ -391,6 +412,7 @@ impl PhoneWindow {
         let local = handle.local_address();
         self.log(format!("Телефон запущен на {local}"));
         handle.send(UiCommand::Trace(self.trace_file.is_some()));
+        handle.send(UiCommand::DoNotDisturb(self.do_not_disturb));
         handle.send(UiCommand::Register(account));
         self.local = Some(local);
         self.handle = Some(handle);
@@ -559,6 +581,8 @@ impl PhoneWindow {
     /// writes it to the call list.
     fn finish_call(&mut self, reason: EndReason, record: bool) {
         self.muted = false;
+        self.answer_at = None;
+        self.transfer_to.clear();
         // The phone finishes the file itself when the call ends.
         self.recording = None;
         let Some(call) = self.current.take() else {
@@ -614,6 +638,9 @@ impl PhoneWindow {
                         recording: String::new(),
                     });
                     self.tab = Tab::Dialpad;
+                    self.answer_at = self.auto_answer.then(|| {
+                        Instant::now() + Duration::from_secs(u64::from(self.auto_answer_delay))
+                    });
                     // Bring the window to the user's attention.
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -642,6 +669,31 @@ impl PhoneWindow {
                     self.log("Запись остановлена");
                     self.recording = None;
                 }
+                Event::Transfer(TransferState::Accepted) => self.log("Перевод: вызываем номер…"),
+                Event::Transfer(TransferState::Completed) => self.log("Перевод выполнен"),
+                Event::Transfer(TransferState::Failed(status)) => {
+                    self.error(format!(
+                        "Перевод не удался (код {status}); разговор продолжается"
+                    ));
+                }
+                Event::Declined { number, name } => {
+                    // Refused by do-not-disturb: it still belongs in the list.
+                    let name = self
+                        .contacts
+                        .name_of(&number)
+                        .map(str::to_owned)
+                        .unwrap_or(name);
+                    self.log(format!("Не беспокоить: отклонён вызов {number} {name}"));
+                    self.history.add(CallRecord {
+                        time: now_unix(),
+                        direction: Direction::Missed,
+                        seconds: 0,
+                        number,
+                        name,
+                        recording: String::new(),
+                    });
+                    self.save_history();
+                }
                 Event::MediaStats { sent, received } => {
                     self.log(format!("RTP: отправлено {sent}, принято {received}"));
                 }
@@ -665,6 +717,11 @@ impl PhoneWindow {
                 } => self.trace(outgoing, peer, &text),
                 Event::Error(message) => self.error(error_text(&message)),
             }
+        }
+        // Auto-answer, once the chosen time of ringing has passed.
+        if self.answer_at.is_some_and(|at| Instant::now() >= at) {
+            self.answer_at = None;
+            self.answer();
         }
     }
 
@@ -705,6 +762,22 @@ impl PhoneWindow {
                 self.save_settings();
             }
             Action::ToggleRecording => self.toggle_recording(),
+            Action::Transfer(target) => {
+                if target.trim().is_empty() {
+                    self.error("Введите номер, на который перевести");
+                } else if self.view.phase() == Phase::Connected {
+                    self.last_error = None;
+                    self.log(format!("Перевод на {}", target.trim()));
+                    self.send(UiCommand::Transfer(target.trim().to_owned()));
+                }
+            }
+            Action::DoNotDisturb(on) => {
+                self.do_not_disturb = on;
+                self.save_settings();
+                if self.handle.is_some() {
+                    self.send(UiCommand::DoNotDisturb(on));
+                }
+            }
             Action::Open(path) => self.open(path),
         }
     }
@@ -742,6 +815,15 @@ impl PhoneWindow {
                 }
                 if ui.button("Настройки").clicked() {
                     self.settings_open = !self.settings_open;
+                }
+                let mut dnd = self.do_not_disturb;
+                let label = if dnd {
+                    egui::RichText::new("Не беспокоить").color(egui::Color32::RED)
+                } else {
+                    egui::RichText::new("Не беспокоить")
+                };
+                if ui.checkbox(&mut dnd, label).changed() {
+                    self.pending_dnd = Some(dnd);
                 }
                 // The status takes the room that is left and is cut short
                 // rather than running under the buttons.
@@ -852,6 +934,17 @@ impl PhoneWindow {
                     if ui.add_sized(wide, egui::Button::new(record)).clicked() {
                         actions.push(Action::ToggleRecording);
                     }
+                    ui.horizontal(|ui| {
+                        let field = egui::TextEdit::singleline(&mut self.transfer_to)
+                            .hint_text("Перевести на номер")
+                            .desired_width(half.x);
+                        let typed = ui.add(field);
+                        let enter = typed.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                        if ui.button("Перевести").clicked() || enter {
+                            actions.push(Action::Transfer(self.transfer_to.clone()));
+                        }
+                    });
                 });
             }
         }
@@ -874,6 +967,10 @@ impl PhoneWindow {
             };
             ui.label(egui::RichText::new(who).size(18.0));
             ui.label(state);
+            if let Some(at) = self.answer_at {
+                let left = at.saturating_duration_since(Instant::now()).as_secs() + 1;
+                ui.label(format!("Автоответ через {left} с"));
+            }
             if self.recording.is_some() {
                 ui.colored_label(egui::Color32::RED, "Идёт запись разговора");
             }
@@ -1097,6 +1194,15 @@ impl PhoneWindow {
                 ui.weak("Новое устройство используется со следующего звонка.");
 
                 ui.separator();
+                ui.heading("Входящие вызовы");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.auto_answer, "Автоответ через");
+                    ui.add(egui::DragValue::new(&mut self.auto_answer_delay).range(0..=60));
+                    ui.label("с");
+                });
+                ui.weak("«Не беспокоить» включается галочкой в верхней строке окна.");
+
+                ui.separator();
                 ui.heading("Запись разговоров");
                 ui.checkbox(&mut self.record_calls, "Записывать все разговоры");
                 let default = default_recordings_dir()
@@ -1190,7 +1296,7 @@ fn end_reason_text(reason: EndReason) -> String {
 /// Messages of the phone's core, in Russian where they are known. The text
 /// after the first colon (a system detail) is kept as it is.
 fn error_text(message: &str) -> String {
-    const KNOWN: [(&str, &str); 9] = [
+    const KNOWN: [(&str, &str); 11] = [
         (
             "Cannot play the ringing sound",
             "Не удалось воспроизвести звонок",
@@ -1199,6 +1305,11 @@ fn error_text(message: &str) -> String {
         ("Audio failed", "Сбой звука"),
         ("Hold did not work", "Удержание не сработало"),
         ("Resume did not work", "Возобновление не сработало"),
+        ("Transfer did not work", "Перевод не удался"),
+        (
+            "only a connected call can be recorded",
+            "Записывать можно только во время разговора",
+        ),
         (
             "register on a SIP server before calling a number",
             "Нет регистрации на сервере — позвонить на номер нельзя",
@@ -1280,6 +1391,9 @@ impl eframe::App for PhoneWindow {
         }
         if self.log_open {
             self.log_window(ctx);
+        }
+        if let Some(on) = self.pending_dnd.take() {
+            actions.push(Action::DoNotDisturb(on));
         }
         for action in actions {
             self.apply(action);

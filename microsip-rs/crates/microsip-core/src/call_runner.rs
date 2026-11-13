@@ -63,6 +63,13 @@ pub enum UiCommand {
     /// Puts the connected call on hold (`true`) or resumes it. The result
     /// is reported with [`Event::Hold`].
     Hold(bool),
+    /// Hands the connected call over to another number (blind transfer).
+    /// Progress is reported with [`Event::Transfer`]; when the transfer
+    /// succeeds this phone's part of the call ends.
+    Transfer(String),
+    /// While on, incoming calls are refused as busy without ringing and
+    /// reported with [`Event::Declined`].
+    DoNotDisturb(bool),
     /// Records the connected call to this WAV file, or stops recording with
     /// `None`. Reported with [`Event::Recording`]; the recording also stops
     /// when the call ends.
@@ -75,6 +82,17 @@ pub enum UiCommand {
     /// Turns [`Event::Trace`] on or off. It is off at the start.
     Trace(bool),
     Shutdown,
+}
+
+/// Progress of a call transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferState {
+    /// The server took the request and is calling the new number.
+    Accepted,
+    /// The other side is connected to the new number.
+    Completed,
+    /// The transfer did not happen (SIP status); the call goes on.
+    Failed(u16),
 }
 
 /// Why a call ended.
@@ -133,6 +151,13 @@ pub enum Event {
     RemoteHold(bool),
     /// The call is being recorded to this file, or recording stopped.
     Recording(Option<PathBuf>),
+    /// Progress of the transfer asked for with [`UiCommand::Transfer`].
+    Transfer(TransferState),
+    /// A call was refused because do-not-disturb is on.
+    Declined {
+        number: String,
+        name: String,
+    },
     Ended(EndReason),
     /// The account's registration changed state.
     Registration(RegistrationState),
@@ -255,6 +280,7 @@ enum RetxKind {
     Final,
     Register,
     ReInvite,
+    Refer,
 }
 
 struct Retx {
@@ -314,6 +340,8 @@ struct Call {
     reinvite_ack: Option<(TransactionHeaders, Vec<u8>)>,
     local_hold: bool,
     remote_hold: bool,
+    /// Our transfer request that is waiting for its answer.
+    refer: Option<TransactionHeaders>,
 }
 
 struct ReInvite {
@@ -368,6 +396,7 @@ impl Call {
             reinvite_ack: None,
             local_hold: false,
             remote_hold: false,
+            refer: None,
         })
     }
 }
@@ -383,6 +412,7 @@ struct Runner<M: Media> {
     call: Option<Call>,
     registration: Option<Registration>,
     trace: bool,
+    do_not_disturb: bool,
     retx: Vec<Retx>,
     retained: Vec<Retained>,
     pending: VecDeque<Input>,
@@ -411,6 +441,7 @@ impl<M: Media> Runner<M> {
             call: None,
             registration: None,
             trace: false,
+            do_not_disturb: false,
             retx: Vec::new(),
             retained: Vec::new(),
             pending: VecDeque::new(),
@@ -511,6 +542,11 @@ impl<M: Media> Runner<M> {
                 Ok(())
             }
             UiCommand::Hold(hold) => self.hold(hold),
+            UiCommand::Transfer(target) => self.transfer(&target),
+            UiCommand::DoNotDisturb(on) => {
+                self.do_not_disturb = on;
+                Ok(())
+            }
             UiCommand::Record(path) => {
                 if path.is_some() && !self.media_running {
                     Err("only a connected call can be recorded".into())
@@ -1056,6 +1092,97 @@ impl<M: Media> Runner<M> {
         Ok(())
     }
 
+    // ----- transfer ----------------------------------------------------------
+
+    /// Asks the other side to call `target` instead of us (REFER).
+    fn transfer(&mut self, target: &str) -> Result<()> {
+        if self.engine.state() != State::Established {
+            return Err("only a connected call can be transferred".into());
+        }
+        self.ensure_dialog()?;
+        let branch = self.branch();
+        // A number is completed with the account's domain; without an
+        // account, with the address of the other side.
+        let (domain, referrer) = match self.registration.as_ref() {
+            Some(registration) => (
+                registration.domain().to_owned(),
+                format!("sip:{}@{}", registration.username(), registration.domain()),
+            ),
+            None => (
+                self.call_ref()?.peer.to_string(),
+                format!("sip:{}@{}", self.user, self.local),
+            ),
+        };
+        let refer_to = server_target(target.trim(), &domain)?;
+        let call = self.call_mut()?;
+        if call.refer.is_some() || call.reinvite.is_some() {
+            return Err("the previous request is still waiting for an answer".into());
+        }
+        let dialog = call.dialog.as_mut().ok_or("no dialog")?;
+        let mut request = dialog.build_refer(&branch)?;
+        add_routes(&mut request, &call.route_set)?;
+        request
+            .headers
+            .insert("refer-to", format!("<{refer_to}>"))?;
+        request
+            .headers
+            .insert("referred-by", format!("<{referrer}>"))?;
+
+        let headers = TransactionHeaders::from_message(&Message::Request(request.clone()))?;
+        let bytes = request.serialize()?;
+        let (peer, id) = (call.peer, call.call_id.clone());
+        call.refer = Some(headers);
+        self.send(&bytes, peer)?;
+        self.start_retx(RetxKind::Refer, id, bytes, peer, self.timers.t2);
+        Ok(())
+    }
+
+    /// NOTIFY inside the call: the server tells how the transfer is going.
+    fn on_notify(
+        &mut self,
+        request: &Request,
+        headers: &TransactionHeaders,
+        source: SocketAddr,
+    ) -> Result<()> {
+        if !self.is_current(&headers.call_id, source) {
+            return self.reply_stateless(request, source, 481, "Call/Transaction Does Not Exist");
+        }
+        let tag = self.call_ref()?.local_tag.clone();
+        let bytes = build_response(request, 200, "OK", Some(&tag), None, None)?;
+        self.remember(request, bytes.clone(), source);
+        self.send(&bytes, source)?;
+
+        let about_transfer = request
+            .headers
+            .get("event")
+            .is_some_and(|event| event.trim().to_ascii_lowercase().starts_with("refer"));
+        // The body is the status line of the new call: "SIP/2.0 200 OK".
+        let status = std::str::from_utf8(&request.body)
+            .ok()
+            .and_then(|body| body.split_whitespace().nth(1))
+            .and_then(|status| status.parse::<u16>().ok());
+        let (true, Some(status)) = (about_transfer, status) else {
+            return Ok(());
+        };
+        match status {
+            0..=199 => {}
+            200..=299 => {
+                self.emit(Event::Transfer(TransferState::Completed));
+                // Our part is over; some servers wait for us to leave.
+                if self.engine.state() == State::Established {
+                    self.pending.push_back(Input::Command(Command::Hangup));
+                }
+            }
+            _ => {
+                self.report(format!(
+                    "Transfer did not work: the new call failed ({status})"
+                ));
+                self.emit(Event::Transfer(TransferState::Failed(status)));
+            }
+        }
+        Ok(())
+    }
+
     /// The call stays as it was; the interface is told so.
     fn hold_failed(&mut self, hold: bool, why: &str) {
         let action = if hold { "Hold" } else { "Resume" };
@@ -1228,6 +1355,13 @@ impl<M: Media> Runner<M> {
                 .call
                 .as_ref()
                 .is_some_and(|call| call.call_id == call_id);
+            if kind == RetxKind::Refer {
+                if current && self.call.as_mut().is_some_and(|c| c.refer.take().is_some()) {
+                    self.report("Transfer did not work: no answer".to_owned());
+                    self.emit(Event::Transfer(TransferState::Failed(408)));
+                }
+                continue;
+            }
             if kind == RetxKind::ReInvite {
                 if current && let Some(pending) = self.call.as_mut().and_then(|c| c.reinvite.take())
                 {
@@ -1364,6 +1498,13 @@ impl<M: Media> Runner<M> {
             "INVITE" => self.on_invite(request, source),
             "BYE" => self.on_bye(request, &headers, source),
             "CANCEL" => self.on_cancel(request, &headers, source),
+            "NOTIFY" => self.on_notify(request, &headers, source),
+            // Servers ask this to see whether the phone is alive.
+            "OPTIONS" => {
+                let tag = format!("rs-stateless-{}", self.local.port());
+                let bytes = build_options_response(request, &tag)?;
+                self.send(&bytes, source)
+            }
             _ => self.reply_stateless(request, source, 405, "Method Not Allowed"),
         }
     }
@@ -1398,6 +1539,12 @@ impl<M: Media> Runner<M> {
                 return self.on_reinvite(request, source);
             }
             return self.reply_stateless(request, source, 486, "Busy Here");
+        }
+        if self.do_not_disturb {
+            let (number, name) = caller_identity(header(&request.headers, "from")?);
+            self.reply_stateless(request, source, 486, "Busy Here")?;
+            self.emit(Event::Declined { number, name });
+            return Ok(());
         }
         let (remote_rtp, codec) = match negotiate(&request.body, true) {
             Ok(agreed) => agreed,
@@ -1507,6 +1654,25 @@ impl<M: Media> Runner<M> {
         match headers.method.as_str() {
             "INVITE" if call.invite_headers.matches_response(&headers) => {
                 self.on_invite_response(response, status)
+            }
+            "REFER"
+                if call
+                    .refer
+                    .as_ref()
+                    .is_some_and(|sent| sent.matches_response(&headers)) =>
+            {
+                if status < 200 {
+                    return Ok(());
+                }
+                self.stop_retx(&headers.call_id, &[RetxKind::Refer]);
+                self.call_mut()?.refer = None;
+                if (200..300).contains(&status) {
+                    self.emit(Event::Transfer(TransferState::Accepted));
+                } else {
+                    self.report(format!("Transfer did not work: refused ({status})"));
+                    self.emit(Event::Transfer(TransferState::Failed(status)));
+                }
+                Ok(())
             }
             "INVITE"
                 if call
@@ -1869,6 +2035,29 @@ fn build_response(
             .body(sdp.into_bytes());
     }
     Ok(builder.build()?.serialize()?)
+}
+
+/// Answer to OPTIONS: the phone is here, and this is what it understands.
+fn build_options_response(request: &Request, to_tag: &str) -> Result<Vec<u8>> {
+    let to = header(&request.headers, "to")?;
+    let to = if has_tag(to) {
+        to.to_owned()
+    } else {
+        format!("{to};tag={to_tag}")
+    };
+    let mut builder = ResponseBuilder::new(200, "OK");
+    for via in request.headers.get_all("via") {
+        builder = builder.append_header("via", via)?;
+    }
+    let response = builder
+        .header("from", header(&request.headers, "from")?)?
+        .header("to", to)?
+        .header("call-id", header(&request.headers, "call-id")?)?
+        .header("cseq", header(&request.headers, "cseq")?)?
+        .header("allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, NOTIFY")?
+        .header("accept", "application/sdp")?
+        .build()?;
+    Ok(response.serialize()?)
 }
 
 /// Splits a From/To/Contact value into its bare URI and tag parameter.

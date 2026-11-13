@@ -25,7 +25,7 @@ USER@DOMAIN) dials through it.\n\
 (the Digest response value is hidden).";
 
 const COMMANDS: &str = "Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit | \
-register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister | dtmf DIGITS | mute | unmute | hold | resume";
+register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister | dtmf DIGITS | mute | unmute | hold | resume | transfer NUMBER | dnd on|off";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -90,6 +90,10 @@ impl Phone {
             Event::Caller { number, name } => println!("Caller: {number} {name}"),
             Event::Recording(Some(path)) => println!("Recording to {}", path.display()),
             Event::Recording(None) => println!("Recording stopped."),
+            Event::Transfer(state) => println!("Transfer: {state:?}"),
+            Event::Declined { number, name } => {
+                println!("Declined (do not disturb): {number} {name}")
+            }
             Event::Hold(true) => println!("Call is on hold."),
             Event::Hold(false) => println!("Call resumed."),
             Event::RemoteHold(true) => println!("The other side put the call on hold."),
@@ -181,6 +185,19 @@ impl Phone {
                 } else {
                     println!("Only a connected call can be put on hold.");
                 }
+            }
+            Some("transfer") => match parts.next() {
+                Some(target) if self.state == State::Connected => {
+                    println!("Transferring to {target}");
+                    self.handle.send(UiCommand::Transfer(target.to_owned()));
+                }
+                Some(_) => println!("Only a connected call can be transferred."),
+                None => println!("Usage: transfer NUMBER"),
+            },
+            Some("dnd") => {
+                let on = parts.next() == Some("on");
+                self.handle.send(UiCommand::DoNotDisturb(on));
+                println!("Do not disturb is {}.", if on { "on" } else { "off" });
             }
             Some("unregister") => {
                 self.handle.send(UiCommand::Unregister);

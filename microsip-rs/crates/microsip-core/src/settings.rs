@@ -39,6 +39,12 @@ pub struct Settings {
     pub record_calls: bool,
     /// Folder for recordings; empty means [`default_recordings_dir`].
     pub recordings_dir: String,
+    /// Refuse incoming calls as busy, without ringing.
+    pub do_not_disturb: bool,
+    /// Answer incoming calls without a click, after `auto_answer_delay`.
+    pub auto_answer: bool,
+    /// Seconds an incoming call rings before it is answered automatically.
+    pub auto_answer_delay: u32,
 }
 
 impl Default for Settings {
@@ -59,6 +65,9 @@ impl Default for Settings {
             password_protected: String::new(),
             record_calls: false,
             recordings_dir: String::new(),
+            do_not_disturb: false,
+            auto_answer: false,
+            auto_answer_delay: 3,
         }
     }
 }
@@ -95,6 +104,13 @@ impl Settings {
                 "password_protected" => settings.password_protected = value,
                 "record_calls" => settings.record_calls = value == "1",
                 "recordings_dir" => settings.recordings_dir = value,
+                "do_not_disturb" => settings.do_not_disturb = value == "1",
+                "auto_answer" => settings.auto_answer = value == "1",
+                "auto_answer_delay" => {
+                    if let Some(delay) = value.parse::<u32>().ok().filter(|delay| *delay <= 60) {
+                        settings.auto_answer_delay = delay;
+                    }
+                }
                 "microphone" => settings.microphone = value,
                 "speaker" => settings.speaker = value,
                 // A value that is not a sensible volume keeps the default.
@@ -122,6 +138,10 @@ impl Settings {
         let local_port = self.local_port.to_string();
         let save_password = if self.save_password { "1" } else { "0" }.to_owned();
         let record_calls = if self.record_calls { "1" } else { "0" }.to_owned();
+        let flag = |on: bool| if on { "1" } else { "0" }.to_owned();
+        let do_not_disturb = flag(self.do_not_disturb);
+        let auto_answer = flag(self.auto_answer);
+        let auto_answer_delay = self.auto_answer_delay.to_string();
         // Without permission to remember it, no form of the password is written.
         let password_protected = if self.save_password {
             self.password_protected.clone()
@@ -144,6 +164,9 @@ impl Settings {
             ("password_protected", &password_protected),
             ("record_calls", &record_calls),
             ("recordings_dir", &self.recordings_dir),
+            ("do_not_disturb", &do_not_disturb),
+            ("auto_answer", &auto_answer),
+            ("auto_answer_delay", &auto_answer_delay),
         ] {
             text.push_str(key);
             text.push('=');
@@ -250,6 +273,9 @@ mod tests {
             password_protected: "0a1b2c".to_owned(),
             record_calls: true,
             recordings_dir: r"D:\Записи звонков".to_owned(),
+            do_not_disturb: true,
+            auto_answer: true,
+            auto_answer_delay: 5,
         }
     }
 
@@ -284,7 +310,8 @@ mod tests {
              speaker=Headset Earphone (USB Audio)\n\
              speaker_volume=80\nmicrophone_volume=150\n\
              local_port=5062\nsave_password=1\npassword_protected=0a1b2c\n\
-             record_calls=1\nrecordings_dir=D:\\Записи звонков\n"
+             record_calls=1\nrecordings_dir=D:\\Записи звонков\n\
+             do_not_disturb=1\nauto_answer=1\nauto_answer_delay=5\n"
         );
         // No line holds the password itself; `save_password` and
         // `password_protected` are different keys.
@@ -352,6 +379,14 @@ mod tests {
         assert!(old.save_password);
         assert_eq!(old.password_protected, "");
         assert_eq!(old.local_port, 0);
+        // Do-not-disturb and auto-answer are off, with a sensible delay.
+        assert!(!old.do_not_disturb);
+        assert!(!old.auto_answer);
+        assert_eq!(old.auto_answer_delay, 3);
+        assert_eq!(
+            Settings::parse("auto_answer_delay=900\n").auto_answer_delay,
+            3
+        );
         // Recording is off unless it was switched on.
         assert!(!old.record_calls);
         assert_eq!(old.recordings_dir, "");

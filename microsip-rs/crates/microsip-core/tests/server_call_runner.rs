@@ -3,12 +3,14 @@
 
 use microsip_core::call_media::NullMedia;
 use microsip_core::call_runner::{
-    CallHandle, EndReason, Event, Timers, UiCommand, spawn_with_timers,
+    CallHandle, EndReason, Event, Timers, TransferState, UiCommand, spawn_with_timers,
 };
 use microsip_core::dialog::{DialogConfig, EstablishedDialog};
 use microsip_core::registration::{Account, RegistrationState};
 use microsip_core::sip::digest::{DigestChallenge, authorization_header_with_cnonce};
-use microsip_core::sip::message::{InviteRequest, Message, Request, Response, ResponseBuilder};
+use microsip_core::sip::message::{
+    InviteRequest, Message, Method, Request, RequestBuilder, Response, ResponseBuilder,
+};
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -939,4 +941,247 @@ fn recording_needs_a_connected_call_and_stopping_is_always_allowed() {
     // Stopping when nothing is recorded is not an error.
     assert!(handle.send(UiCommand::Record(None)));
     wait_for(&handle, Event::Recording(None));
+}
+
+/// A request from the server inside the call started by `invite`.
+fn in_dialog(
+    server: &Server,
+    invite: &Request,
+    method: Method,
+    cseq: u32,
+    extra: &[(&str, &str)],
+    body: &str,
+) -> Request {
+    let our_from = invite.headers.get("from").unwrap();
+    let name = method.as_str().to_owned();
+    let mut builder = RequestBuilder::new(
+        method,
+        invite
+            .headers
+            .get("contact")
+            .unwrap()
+            .trim_matches(['<', '>']),
+    )
+    .header(
+        "via",
+        format!(
+            "SIP/2.0/UDP {};branch=z9hG4bK-{name}-{cseq}",
+            server.address()
+        ),
+    )
+    .unwrap()
+    // The server's side of the dialog: our To with its tag is its From.
+    .header(
+        "from",
+        format!("{};tag=server-tag", invite.headers.get("to").unwrap()),
+    )
+    .unwrap()
+    .header("to", our_from)
+    .unwrap()
+    .header("call-id", invite.headers.get("call-id").unwrap())
+    .unwrap()
+    .header("cseq", format!("{cseq} {name}"))
+    .unwrap()
+    .header("max-forwards", "70")
+    .unwrap();
+    for (name, value) in extra {
+        builder = builder.header(name, *value).unwrap();
+    }
+    builder.body(body.as_bytes().to_vec()).build().unwrap()
+}
+
+#[test]
+fn transfer_refers_the_call_and_leaves_when_the_new_call_is_up() {
+    let server = Server::new();
+    let handle = phone(calm_timers());
+    let (invite, _) = connect(&server, &handle);
+    let local = handle.local_address();
+    let domain = server.address().ip();
+
+    assert!(handle.send(UiCommand::Transfer(" 4011 ".to_owned())));
+    let (refer, peer) = server.request("REFER");
+    assert_eq!(refer.headers.get("call-id"), invite.headers.get("call-id"));
+    assert_eq!(refer.headers.get("cseq"), Some("2 REFER"));
+    assert_eq!(refer.target, format!("sip:100@{}", server.address()));
+    assert_eq!(
+        refer.headers.get("refer-to"),
+        Some(format!("<sip:4011@{domain}>").as_str())
+    );
+    assert_eq!(
+        refer.headers.get("referred-by"),
+        Some(format!("<sip:alice@{domain}>").as_str())
+    );
+    server.reply(&refer, peer, 202, &[], None);
+    wait_for(&handle, Event::Transfer(TransferState::Accepted));
+
+    // Progress of the new call arrives as NOTIFY; each one is answered.
+    let event = [("event", "refer"), ("content-type", "message/sipfrag")];
+    let ringing = in_dialog(
+        &server,
+        &invite,
+        Method::Notify,
+        1,
+        &event,
+        "SIP/2.0 180 Ringing\r\n",
+    );
+    server.send(&ringing, local);
+    let ok = server.response(200);
+    assert_eq!(ok.headers.get("cseq"), Some("1 NOTIFY"));
+
+    let answered = in_dialog(
+        &server,
+        &invite,
+        Method::Notify,
+        2,
+        &event,
+        "SIP/2.0 200 OK\r\n",
+    );
+    server.send(&answered, local);
+    wait_for(&handle, Event::Transfer(TransferState::Completed));
+
+    // Our part of the call is over: the phone says goodbye by itself.
+    let (bye, peer) = server.request("BYE");
+    assert_eq!(bye.headers.get("cseq"), Some("3 BYE"));
+    server.reply(&bye, peer, 200, &[], None);
+    wait_for(&handle, Event::Ended(EndReason::Completed));
+}
+
+#[test]
+fn refused_or_failed_transfer_keeps_the_call() {
+    let server = Server::new();
+    let handle = phone(calm_timers());
+    let (invite, _) = connect(&server, &handle);
+    let local = handle.local_address();
+
+    // The server will not transfer at all.
+    assert!(handle.send(UiCommand::Transfer("4011".to_owned())));
+    let (refer, peer) = server.request("REFER");
+    server.reply(&refer, peer, 603, &[], None);
+    assert_eq!(wait_error(&handle), "Transfer did not work: refused (603)");
+    wait_for(&handle, Event::Transfer(TransferState::Failed(603)));
+
+    // The server tries, but the new number is busy.
+    assert!(handle.send(UiCommand::Transfer("4011".to_owned())));
+    let (refer, peer) = server.request("REFER");
+    assert_eq!(refer.headers.get("cseq"), Some("3 REFER"));
+    server.reply(&refer, peer, 202, &[], None);
+    wait_for(&handle, Event::Transfer(TransferState::Accepted));
+    let busy = in_dialog(
+        &server,
+        &invite,
+        Method::Notify,
+        1,
+        &[("event", "refer;id=3")],
+        "SIP/2.0 486 Busy Here\r\n",
+    );
+    server.send(&busy, local);
+    assert_eq!(
+        wait_error(&handle),
+        "Transfer did not work: the new call failed (486)"
+    );
+    wait_for(&handle, Event::Transfer(TransferState::Failed(486)));
+
+    // The original call is still there to be ended normally.
+    assert!(handle.send(UiCommand::Hangup));
+    let (bye, peer) = server.request("BYE");
+    assert_eq!(bye.headers.get("cseq"), Some("4 BYE"));
+    server.reply(&bye, peer, 200, &[], None);
+    wait_for(&handle, Event::Ended(EndReason::Completed));
+}
+
+#[test]
+fn transfer_needs_a_connected_call_and_a_usable_number() {
+    let handle = phone(fast_timers());
+    assert!(handle.send(UiCommand::Transfer("4011".to_owned())));
+    assert_eq!(
+        wait_error(&handle),
+        "only a connected call can be transferred"
+    );
+
+    let server = Server::new();
+    let handle = phone(calm_timers());
+    connect(&server, &handle);
+    assert!(handle.send(UiCommand::Transfer("40 11".to_owned())));
+    assert_eq!(wait_error(&handle), "invalid number or SIP address");
+    assert!(
+        !server
+            .methods_for(Duration::from_millis(200))
+            .contains(&"REFER".to_owned())
+    );
+}
+
+#[test]
+fn do_not_disturb_refuses_calls_without_ringing_and_reports_them() {
+    let server = Server::new();
+    let handle = phone(fast_timers());
+    let local = handle.local_address();
+    let address = server.address();
+    assert!(handle.send(UiCommand::DoNotDisturb(true)));
+    std::thread::sleep(Duration::from_millis(100));
+
+    let call = |call_id: &str| {
+        InviteRequest::new(
+            format!("sip:phone@{local}"),
+            format!("sip:4010@{address}"),
+            format!("sip:phone@{local}"),
+            format!("sip:4010@{address}"),
+            address.to_string(),
+            call_id,
+            format!("z9hG4bK-{call_id}"),
+            "caller-tag",
+        )
+        .body(SDP.as_bytes().to_vec())
+        .build()
+        .unwrap()
+    };
+    server.send(&call("dnd-call"), local);
+    let busy = server.response(486);
+    assert_eq!(busy.headers.get("call-id"), Some("dnd-call"));
+    wait_for(
+        &handle,
+        Event::Declined {
+            number: "4010".to_owned(),
+            name: String::new(),
+        },
+    );
+
+    // Switched off again, the next call is offered as usual.
+    assert!(handle.send(UiCommand::DoNotDisturb(false)));
+    // The command travels on its own channel; let it arrive before the call.
+    std::thread::sleep(Duration::from_millis(100));
+    server.send(&call("normal-call"), local);
+    wait_for(&handle, Event::Incoming { peer: address });
+}
+
+#[test]
+fn options_is_answered_so_the_server_sees_the_phone_alive() {
+    let server = Server::new();
+    let handle = phone(fast_timers());
+    let local = handle.local_address();
+    let address = server.address();
+
+    let options = RequestBuilder::new(Method::Options, format!("sip:phone@{local}"))
+        .header(
+            "via",
+            format!("SIP/2.0/UDP {address};branch=z9hG4bK-options"),
+        )
+        .unwrap()
+        .header("from", format!("<sip:pbx@{address}>;tag=pbx"))
+        .unwrap()
+        .header("to", format!("<sip:phone@{local}>"))
+        .unwrap()
+        .header("call-id", "qualify-1")
+        .unwrap()
+        .header("cseq", "1 OPTIONS")
+        .unwrap()
+        .header("max-forwards", "70")
+        .unwrap()
+        .build()
+        .unwrap();
+    server.send(&options, local);
+    let ok = server.response(200);
+    assert_eq!(ok.headers.get("call-id"), Some("qualify-1"));
+    assert_eq!(ok.headers.get("cseq"), Some("1 OPTIONS"));
+    assert!(ok.headers.get("allow").unwrap().contains("INVITE"));
+    assert!(ok.headers.get("to").unwrap().contains(";tag="));
 }
