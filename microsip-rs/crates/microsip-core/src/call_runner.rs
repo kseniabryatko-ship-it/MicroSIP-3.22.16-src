@@ -70,6 +70,19 @@ pub enum UiCommand {
     /// While on, incoming calls are refused as busy without ringing and
     /// reported with [`Event::Declined`].
     DoNotDisturb(bool),
+    /// Makes this line (0, 1, ...) the one the commands go to. Selecting a
+    /// line does not change any call; use `Hold` to switch the conversation.
+    SelectLine(usize),
+    /// Joins all connected lines into one conversation (`true`), or goes
+    /// back to talking on the selected line only.
+    Conference(bool),
+    /// Connects the party of the selected line with the party of the given
+    /// line and leaves both calls (attended transfer). Reported with
+    /// [`Event::Transfer`].
+    TransferToLine(usize),
+    /// Sends all incoming calls to this number instead of ringing;
+    /// `None` switches forwarding off.
+    Forward(Option<String>),
     /// Records the connected call to this WAV file, or stops recording with
     /// `None`. Reported with [`Event::Recording`]; the recording also stops
     /// when the call ends.
@@ -153,6 +166,19 @@ pub enum Event {
     Recording(Option<PathBuf>),
     /// Progress of the transfer asked for with [`UiCommand::Transfer`].
     Transfer(TransferState),
+    /// The events that follow are about this line. Only sent by a phone
+    /// with more than one line; until the first one the line is 0.
+    Line(usize),
+    /// The commands now go to this line.
+    Selected(usize),
+    /// All connected lines were joined into a conference, or separated.
+    Conference(bool),
+    /// A call was sent on to another number because forwarding is on.
+    Forwarded {
+        number: String,
+        name: String,
+        to: String,
+    },
     /// A call was refused because do-not-disturb is on.
     Declined {
         number: String,
@@ -246,6 +272,38 @@ where
     M: Media + 'static,
     F: FnOnce() -> M + Send + 'static,
 {
+    spawn_runner(local, user, timers, move || vec![make_media()])
+}
+
+/// Starts an executor with several lines, so that a second call can be
+/// received or made while the first one is held. `make_media` is called once
+/// per line, on the new thread.
+pub fn spawn_lines<M, F>(
+    local: SocketAddr,
+    user: &str,
+    timers: Timers,
+    lines: usize,
+    make_media: F,
+) -> io::Result<CallHandle>
+where
+    M: Media + 'static,
+    F: Fn() -> M + Send + 'static,
+{
+    spawn_runner(local, user, timers, move || {
+        (0..lines.max(1)).map(|_| make_media()).collect()
+    })
+}
+
+fn spawn_runner<M, F>(
+    local: SocketAddr,
+    user: &str,
+    timers: Timers,
+    make_medias: F,
+) -> io::Result<CallHandle>
+where
+    M: Media + 'static,
+    F: FnOnce() -> Vec<M> + Send + 'static,
+{
     if local.ip().is_unspecified() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -260,7 +318,7 @@ where
     let user = user.to_owned();
 
     let thread = thread::spawn(move || {
-        let runner = Runner::new(socket, local, user, timers, make_media(), event_sender);
+        let runner = Runner::new(socket, local, user, timers, make_medias(), event_sender);
         runner.run(&command_receiver);
     });
 
@@ -342,6 +400,11 @@ struct Call {
     remote_hold: bool,
     /// Our transfer request that is waiting for its answer.
     refer: Option<TransactionHeaders>,
+    /// The line whose call this one is being joined with by an attended
+    /// transfer; it is ended too when the transfer is done.
+    transfer_partner: Option<usize>,
+    /// The BYE was already repeated with credentials once.
+    bye_authorized: bool,
 }
 
 struct ReInvite {
@@ -397,7 +460,30 @@ impl Call {
             local_hold: false,
             remote_hold: false,
             refer: None,
+            transfer_partner: None,
+            bye_authorized: false,
         })
+    }
+}
+
+/// One line of the phone: it can hold one call, with its own audio.
+struct Line<M: Media> {
+    engine: CallEngine,
+    call: Option<Call>,
+    media: M,
+    media_running: bool,
+    pending: VecDeque<Input>,
+}
+
+impl<M: Media> Line<M> {
+    fn new(media: M) -> Self {
+        Self {
+            engine: CallEngine::new(),
+            call: None,
+            media,
+            media_running: false,
+            pending: VecDeque::new(),
+        }
     }
 }
 
@@ -406,17 +492,24 @@ struct Runner<M: Media> {
     local: SocketAddr,
     user: String,
     timers: Timers,
-    media: M,
-    engine: CallEngine,
+    /// The phone's lines. Most of the code below works on `lines[cur]`.
+    lines: Vec<Line<M>>,
+    /// The line the code is working on right now.
+    cur: usize,
+    /// The line the user's commands go to.
+    selected: usize,
+    /// The line the last event was about, as told to the interface.
+    told_line: std::cell::Cell<usize>,
+    /// Every connected line talks at once; nothing is held automatically.
+    conference: bool,
+    /// Where all incoming calls are sent instead of ringing here.
+    forward_to: Option<String>,
     events: Sender<Event>,
-    call: Option<Call>,
     registration: Option<Registration>,
     trace: bool,
     do_not_disturb: bool,
     retx: Vec<Retx>,
     retained: Vec<Retained>,
-    pending: VecDeque<Input>,
-    media_running: bool,
     counter: u64,
     buffer: Vec<u8>,
 }
@@ -427,7 +520,7 @@ impl<M: Media> Runner<M> {
         local: SocketAddr,
         user: String,
         timers: Timers,
-        media: M,
+        medias: Vec<M>,
         events: Sender<Event>,
     ) -> Self {
         Self {
@@ -435,17 +528,18 @@ impl<M: Media> Runner<M> {
             local,
             user,
             timers,
-            media,
-            engine: CallEngine::new(),
+            lines: medias.into_iter().map(Line::new).collect(),
+            cur: 0,
+            selected: 0,
+            told_line: std::cell::Cell::new(0),
+            conference: false,
+            forward_to: None,
             events,
-            call: None,
             registration: None,
             trace: false,
             do_not_disturb: false,
             retx: Vec::new(),
             retained: Vec::new(),
-            pending: VecDeque::new(),
-            media_running: false,
             counter: 0,
             buffer: vec![0_u8; 65_535],
         }
@@ -473,36 +567,71 @@ impl<M: Media> Runner<M> {
                 self.report(format!("SIP socket failed: {error}"));
                 break;
             }
-            self.pump_media();
+            for line in 0..self.lines.len() {
+                self.cur = line;
+                self.pump_media();
+            }
             self.tick_timers();
-            self.drain_pending();
+            for line in 0..self.lines.len() {
+                self.cur = line;
+                self.drain_pending();
+            }
+            // Whatever is not about a particular call belongs to the
+            // selected line.
+            self.cur = self.selected;
 
-            let settled = self.engine.state() == State::Idle && self.registration.is_none();
+            let idle = self
+                .lines
+                .iter()
+                .all(|line| line.engine.state() == State::Idle);
+            let settled = idle && self.registration.is_none();
             if let Some(deadline) = shutdown
                 && (settled || Instant::now() >= deadline)
             {
                 break;
             }
         }
-        self.media.stop();
+        for line in &mut self.lines {
+            line.media.stop();
+        }
     }
 
     fn begin_shutdown(&mut self) {
         self.unregister();
-        let input = match self.engine.state() {
-            State::Outgoing | State::Established => Input::Command(Command::Hangup),
-            State::Incoming => Input::Command(Command::Reject),
-            State::Idle | State::Answered | State::Ending => return,
-        };
-        self.dispatch_reporting(input);
+        for line in 0..self.lines.len() {
+            self.cur = line;
+            let input = match self.lines[self.cur].engine.state() {
+                State::Outgoing | State::Established => Input::Command(Command::Hangup),
+                State::Incoming => Input::Command(Command::Reject),
+                State::Idle | State::Answered | State::Ending => continue,
+            };
+            self.dispatch_reporting(input);
+        }
     }
 
     fn on_command(&mut self, command: UiCommand) {
+        self.cur = self.selected;
+        // A new call needs a line that is free.
+        if matches!(command, UiCommand::Dial(_) | UiCommand::DialTarget(_))
+            && self.lines[self.cur].engine.state() != State::Idle
+            && let Some(line) = self.free_line()
+        {
+            self.select(line);
+        }
+        // "Answer" means the ringing call, wherever it is.
+        if matches!(command, UiCommand::Answer | UiCommand::Reject)
+            && self.lines[self.cur].engine.state() != State::Incoming
+            && let Some(line) = (0..self.lines.len())
+                .find(|line| self.lines[*line].engine.state() == State::Incoming)
+        {
+            self.select(line);
+        }
         let result = match command {
             UiCommand::Dial(peer) => {
-                let was_idle = self.engine.state() == State::Idle;
+                let was_idle = self.lines[self.cur].engine.state() == State::Idle;
                 let result = self.dial(peer);
-                if result.is_err() && was_idle && self.engine.state() == State::Idle {
+                if result.is_err() && was_idle && self.lines[self.cur].engine.state() == State::Idle
+                {
                     // Tell the interface the attempt is over, not just why.
                     if let Err(error) = &result {
                         self.report(error.to_string());
@@ -513,9 +642,10 @@ impl<M: Media> Runner<M> {
                 result
             }
             UiCommand::DialTarget(target) => {
-                let was_idle = self.engine.state() == State::Idle;
+                let was_idle = self.lines[self.cur].engine.state() == State::Idle;
                 let result = self.dial_target(&target);
-                if result.is_err() && was_idle && self.engine.state() == State::Idle {
+                if result.is_err() && was_idle && self.lines[self.cur].engine.state() == State::Idle
+                {
                     if let Err(error) = &result {
                         self.report(error.to_string());
                     }
@@ -524,34 +654,64 @@ impl<M: Media> Runner<M> {
                 }
                 result
             }
-            UiCommand::Answer => self.dispatch(Input::Command(Command::Answer)),
+            UiCommand::Answer => {
+                let answered = self.dispatch(Input::Command(Command::Answer));
+                if answered.is_ok() {
+                    // The call just answered is the one to talk on.
+                    self.hold_other_lines();
+                }
+                answered
+            }
             UiCommand::Reject => self.dispatch(Input::Command(Command::Reject)),
             // The other side may end the call at the very moment the user
             // presses the button; there is then nothing left to hang up.
-            UiCommand::Hangup if self.engine.state() == State::Idle => Ok(()),
+            UiCommand::Hangup if self.lines[self.cur].engine.state() == State::Idle => Ok(()),
             UiCommand::Hangup => self.dispatch(Input::Command(Command::Hangup)),
             UiCommand::Dtmf(digit) => {
-                if self.media_running {
-                    self.media.send_dtmf(digit)
+                if self.lines[self.cur].media_running {
+                    self.lines[self.cur].media.send_dtmf(digit)
                 } else {
                     Err("digits can be sent only during a connected call".into())
                 }
             }
             UiCommand::Mute(muted) => {
-                self.media.set_muted(muted);
+                self.lines[self.cur].media.set_muted(muted);
                 Ok(())
             }
-            UiCommand::Hold(hold) => self.hold(hold),
+            UiCommand::Hold(hold) => {
+                let done = self.hold(hold);
+                if done.is_ok() && !hold {
+                    // Resuming one call puts the other on hold.
+                    self.hold_other_lines();
+                }
+                done
+            }
+            UiCommand::SelectLine(line) => {
+                if line < self.lines.len() {
+                    self.select(line);
+                    Ok(())
+                } else {
+                    Err(format!("this phone has no line {}", line + 1).into())
+                }
+            }
+            UiCommand::Conference(on) => self.set_conference(on),
+            UiCommand::TransferToLine(line) => self.transfer_to_line(line),
+            UiCommand::Forward(target) => {
+                self.forward_to = target
+                    .map(|target| target.trim().to_owned())
+                    .filter(|target| !target.is_empty());
+                Ok(())
+            }
             UiCommand::Transfer(target) => self.transfer(&target),
             UiCommand::DoNotDisturb(on) => {
                 self.do_not_disturb = on;
                 Ok(())
             }
             UiCommand::Record(path) => {
-                if path.is_some() && !self.media_running {
+                if path.is_some() && !self.lines[self.cur].media_running {
                     Err("only a connected call can be recorded".into())
                 } else {
-                    let result = self.media.record(path.as_deref());
+                    let result = self.lines[self.cur].media.record(path.as_deref());
                     if result.is_ok() {
                         self.emit(Event::Recording(path));
                     }
@@ -589,13 +749,13 @@ impl<M: Media> Runner<M> {
     /// Starts or stops the phone's own ringing. A phone that cannot ring
     /// (no speaker) still works, so a failure is only reported.
     fn ring(&mut self, tone: Option<Tone>) {
-        if let Err(error) = self.media.ring(tone) {
+        if let Err(error) = self.lines[self.cur].media.ring(tone) {
             self.report(format!("Cannot play the ringing sound: {error}"));
         }
     }
 
     fn drain_pending(&mut self) {
-        while let Some(input) = self.pending.pop_front() {
+        while let Some(input) = self.lines[self.cur].pending.pop_front() {
             self.dispatch_reporting(input);
         }
     }
@@ -605,8 +765,69 @@ impl<M: Media> Runner<M> {
     }
 
     fn emit(&self, event: Event) {
+        // With several lines the interface is told which one the following
+        // events are about, whenever that changes.
+        if self.lines.len() > 1 && self.told_line.get() != self.cur {
+            self.told_line.set(self.cur);
+            let _ = self.events.send(Event::Line(self.cur));
+        }
         // The interface may have gone away; the executor then just finishes.
         let _ = self.events.send(event);
+    }
+
+    /// Makes `cur` the line that has this call, if any does.
+    fn find_line(&mut self, call_id: &str, source: SocketAddr) -> bool {
+        let found = self.lines.iter().position(|line| {
+            line.call
+                .as_ref()
+                .is_some_and(|call| call.call_id == call_id && call.peer == source)
+        });
+        if let Some(line) = found {
+            self.cur = line;
+        }
+        found.is_some()
+    }
+
+    /// A line without a call, preferring the selected one.
+    fn free_line(&self) -> Option<usize> {
+        let idle = |line: usize| self.lines[line].engine.state() == State::Idle;
+        if idle(self.selected) {
+            Some(self.selected)
+        } else {
+            (0..self.lines.len()).find(|line| idle(*line))
+        }
+    }
+
+    /// Tells the interface which line its commands now go to.
+    fn select(&mut self, line: usize) {
+        if line < self.lines.len() && self.selected != line {
+            self.selected = line;
+            let _ = self.events.send(Event::Selected(line));
+        }
+        self.cur = self.selected;
+    }
+
+    /// Only one call talks at a time: every other connected line is put on
+    /// hold, unless the lines are joined in a conference.
+    fn hold_other_lines(&mut self) {
+        if self.conference {
+            return;
+        }
+        let keep = self.cur;
+        for line in 0..self.lines.len() {
+            let talking = self.lines[line].engine.state() == State::Established
+                && self.lines[line]
+                    .call
+                    .as_ref()
+                    .is_some_and(|call| !call.local_hold && call.reinvite.is_none());
+            if line != keep && talking {
+                self.cur = line;
+                if let Err(error) = self.hold(true) {
+                    self.report(error.to_string());
+                }
+            }
+        }
+        self.cur = keep;
     }
 
     fn unique(&mut self) -> String {
@@ -755,17 +976,19 @@ impl<M: Media> Runner<M> {
 
     fn dispatch(&mut self, input: Input) -> Result<()> {
         self.note_reason(input);
-        let actions = self.engine.handle(input)?;
+        let actions = self.lines[self.cur].engine.handle(input)?;
         for action in actions {
             if let Err(error) = self.execute(action) {
                 self.report(format!("{action:?} failed: {error}"));
                 match action {
                     // Without a sent request nothing will ever time out.
                     Action::SendBye | Action::SendInvite => {
-                        self.pending.push_back(Input::Timeout);
+                        self.lines[self.cur].pending.push_back(Input::Timeout);
                     }
                     Action::SendSuccessAck => {
-                        self.pending.push_back(Input::Command(Command::Hangup));
+                        self.lines[self.cur]
+                            .pending
+                            .push_back(Input::Command(Command::Hangup));
                     }
                     _ => {}
                 }
@@ -775,7 +998,7 @@ impl<M: Media> Runner<M> {
     }
 
     fn note_reason(&mut self, input: Input) {
-        let reason = match (self.engine.state(), input) {
+        let reason = match (self.lines[self.cur].engine.state(), input) {
             (State::Outgoing, Input::Command(Command::Hangup)) => Some(EndReason::Cancelled),
             (State::Outgoing, Input::InviteResponse(status)) if status >= 300 => {
                 Some(EndReason::Rejected(status))
@@ -790,7 +1013,7 @@ impl<M: Media> Runner<M> {
             | (State::Ending, Input::ByeResponse(_)) => Some(EndReason::Completed),
             _ => None,
         };
-        if let (Some(reason), Some(call)) = (reason, self.call.as_mut())
+        if let (Some(reason), Some(call)) = (reason, self.lines[self.cur].call.as_mut())
             && call.reason.is_none()
         {
             call.reason = Some(reason);
@@ -798,11 +1021,17 @@ impl<M: Media> Runner<M> {
     }
 
     fn call_ref(&self) -> Result<&Call> {
-        self.call.as_ref().ok_or_else(|| "no current call".into())
+        self.lines[self.cur]
+            .call
+            .as_ref()
+            .ok_or_else(|| "no current call".into())
     }
 
     fn call_mut(&mut self) -> Result<&mut Call> {
-        self.call.as_mut().ok_or_else(|| "no current call".into())
+        self.lines[self.cur]
+            .call
+            .as_mut()
+            .ok_or_else(|| "no current call".into())
     }
 
     fn execute(&mut self, action: Action) -> Result<()> {
@@ -893,40 +1122,42 @@ impl<M: Media> Runner<M> {
                 let codec = call.codec;
                 let started = match remote_rtp {
                     Some(remote) => {
-                        self.media.set_codec(codec);
-                        self.media.set_dtmf_payload_type(dtmf);
-                        self.media.start(remote)
+                        self.lines[self.cur].media.set_codec(codec);
+                        self.lines[self.cur].media.set_dtmf_payload_type(dtmf);
+                        self.lines[self.cur].media.start(remote)
                     }
                     None => Err("the other side offered no usable G.711 audio".into()),
                 };
                 match started {
-                    Ok(()) => self.media_running = true,
+                    Ok(()) => self.lines[self.cur].media_running = true,
                     Err(error) => {
                         self.report(format!("Cannot start audio: {error}"));
-                        self.pending.push_back(Input::Command(Command::Hangup));
+                        self.lines[self.cur]
+                            .pending
+                            .push_back(Input::Command(Command::Hangup));
                     }
                 }
             }
             Action::StopMedia => {
-                if self.media_running {
-                    let stats = self.media.stats();
+                if self.lines[self.cur].media_running {
+                    let stats = self.lines[self.cur].media.stats();
                     self.emit(Event::MediaStats {
                         sent: stats.sent_packets,
                         received: stats.received_packets,
                     });
-                    if let Some(quality) = self.media.quality() {
+                    if let Some(quality) = self.lines[self.cur].media.quality() {
                         self.emit(Event::AudioQuality(quality));
                     }
                 }
-                self.media.stop();
-                self.media_running = false;
+                self.lines[self.cur].media.stop();
+                self.lines[self.cur].media_running = false;
             }
             Action::ReportEstablished => self.emit(Event::Established),
             Action::ReportEnded => {
                 // Also releases a reserved RTP port when media never started.
-                self.media.stop();
-                self.media_running = false;
-                let reason = self
+                self.lines[self.cur].media.stop();
+                self.lines[self.cur].media_running = false;
+                let reason = self.lines[self.cur]
                     .call
                     .as_ref()
                     .and_then(|call| call.reason)
@@ -1015,7 +1246,7 @@ impl<M: Media> Runner<M> {
 
     /// Asks the other side to hold or resume the call with a re-INVITE.
     fn hold(&mut self, hold: bool) -> Result<()> {
-        if self.engine.state() != State::Established {
+        if self.lines[self.cur].engine.state() != State::Established {
             return Err("only a connected call can be put on hold".into());
         }
         self.ensure_dialog()?;
@@ -1087,7 +1318,7 @@ impl<M: Media> Runner<M> {
         call.reinvite_ack = Some((pending.headers, bytes.clone()));
         call.local_hold = pending.hold;
         self.send(&bytes, peer)?;
-        self.media.set_hold(pending.hold);
+        self.lines[self.cur].media.set_hold(pending.hold);
         self.emit(Event::Hold(pending.hold));
         Ok(())
     }
@@ -1096,24 +1327,67 @@ impl<M: Media> Runner<M> {
 
     /// Asks the other side to call `target` instead of us (REFER).
     fn transfer(&mut self, target: &str) -> Result<()> {
-        if self.engine.state() != State::Established {
+        if self.lines[self.cur].engine.state() != State::Established {
             return Err("only a connected call can be transferred".into());
         }
-        self.ensure_dialog()?;
-        let branch = self.branch();
         // A number is completed with the account's domain; without an
         // account, with the address of the other side.
-        let (domain, referrer) = match self.registration.as_ref() {
-            Some(registration) => (
-                registration.domain().to_owned(),
-                format!("sip:{}@{}", registration.username(), registration.domain()),
-            ),
-            None => (
-                self.call_ref()?.peer.to_string(),
-                format!("sip:{}@{}", self.user, self.local),
-            ),
+        let domain = match self.registration.as_ref() {
+            Some(registration) => registration.domain().to_owned(),
+            None => self.call_ref()?.peer.to_string(),
         };
         let refer_to = server_target(target.trim(), &domain)?;
+        self.send_refer(format!("<{refer_to}>"))
+    }
+
+    /// Attended transfer: the party of the selected line (the one just
+    /// consulted) and the party of `other` are connected with each other.
+    fn transfer_to_line(&mut self, other: usize) -> Result<()> {
+        let this = self.cur;
+        if other == this || other >= self.lines.len() {
+            return Err("choose the other line to connect with".into());
+        }
+        let connected = |line: usize| self.lines[line].engine.state() == State::Established;
+        if !connected(this) || !connected(other) {
+            return Err("both lines must have a connected call".into());
+        }
+
+        // The call on this line is named in Replaces: the server joins the
+        // other party into it in our place.
+        self.ensure_dialog()?;
+        let refer_to = {
+            let call = self.call_ref()?;
+            let config = call.dialog.as_ref().ok_or("no dialog")?.config();
+            let (uri, remote_tag) = split_address(&config.remote_to);
+            let (_, local_tag) = split_address(&config.local_from);
+            let replaces = format!(
+                "{};to-tag={};from-tag={}",
+                call.call_id,
+                remote_tag.ok_or("the call has no remote tag")?,
+                local_tag.ok_or("the call has no local tag")?
+            );
+            format!("<{uri}?Replaces={}>", percent_encode(&replaces))
+        };
+
+        self.cur = other;
+        let sent = self.send_refer(refer_to);
+        if sent.is_ok() {
+            self.call_mut()?.transfer_partner = Some(this);
+        }
+        self.cur = this;
+        sent
+    }
+
+    /// Sends REFER with this Refer-To value on the current line.
+    fn send_refer(&mut self, refer_to: String) -> Result<()> {
+        self.ensure_dialog()?;
+        let branch = self.branch();
+        let referrer = match self.registration.as_ref() {
+            Some(registration) => {
+                format!("sip:{}@{}", registration.username(), registration.domain())
+            }
+            None => format!("sip:{}@{}", self.user, self.local),
+        };
         let call = self.call_mut()?;
         if call.refer.is_some() || call.reinvite.is_some() {
             return Err("the previous request is still waiting for an answer".into());
@@ -1121,9 +1395,7 @@ impl<M: Media> Runner<M> {
         let dialog = call.dialog.as_mut().ok_or("no dialog")?;
         let mut request = dialog.build_refer(&branch)?;
         add_routes(&mut request, &call.route_set)?;
-        request
-            .headers
-            .insert("refer-to", format!("<{refer_to}>"))?;
+        request.headers.insert("refer-to", refer_to)?;
         request
             .headers
             .insert("referred-by", format!("<{referrer}>"))?;
@@ -1134,6 +1406,36 @@ impl<M: Media> Runner<M> {
         call.refer = Some(headers);
         self.send(&bytes, peer)?;
         self.start_retx(RetxKind::Refer, id, bytes, peer, self.timers.t2);
+        Ok(())
+    }
+
+    /// Joins all connected lines into one conversation, or separates them.
+    fn set_conference(&mut self, on: bool) -> Result<()> {
+        let keep = self.cur;
+        self.conference = on;
+        for line in &mut self.lines {
+            line.media.set_conference(on);
+        }
+        if on {
+            // Everybody talks: bring the held calls back.
+            for line in 0..self.lines.len() {
+                let held = self.lines[line].engine.state() == State::Established
+                    && self.lines[line]
+                        .call
+                        .as_ref()
+                        .is_some_and(|call| call.local_hold);
+                if held {
+                    self.cur = line;
+                    if let Err(error) = self.hold(false) {
+                        self.report(error.to_string());
+                    }
+                }
+            }
+            self.cur = keep;
+        } else {
+            self.hold_other_lines();
+        }
+        let _ = self.events.send(Event::Conference(on));
         Ok(())
     }
 
@@ -1168,9 +1470,17 @@ impl<M: Media> Runner<M> {
             0..=199 => {}
             200..=299 => {
                 self.emit(Event::Transfer(TransferState::Completed));
-                // Our part is over; some servers wait for us to leave.
-                if self.engine.state() == State::Established {
-                    self.pending.push_back(Input::Command(Command::Hangup));
+                // Our part is over; some servers wait for us to leave. After
+                // an attended transfer that is true of both calls.
+                let partner = self.call_mut()?.transfer_partner.take();
+                for line in [Some(self.cur), partner].into_iter().flatten() {
+                    if line < self.lines.len()
+                        && self.lines[line].engine.state() == State::Established
+                    {
+                        self.lines[line]
+                            .pending
+                            .push_back(Input::Command(Command::Hangup));
+                    }
                 }
             }
             _ => {
@@ -1187,7 +1497,10 @@ impl<M: Media> Runner<M> {
     fn hold_failed(&mut self, hold: bool, why: &str) {
         let action = if hold { "Hold" } else { "Resume" };
         self.report(format!("{action} did not work: {why}"));
-        let held = self.call.as_ref().is_some_and(|call| call.local_hold);
+        let held = self.lines[self.cur]
+            .call
+            .as_ref()
+            .is_some_and(|call| call.local_hold);
         self.emit(Event::Hold(held));
     }
 
@@ -1308,6 +1621,7 @@ impl<M: Media> Runner<M> {
     }
 
     fn tick_timers(&mut self) {
+        self.cur = self.selected;
         let now = Instant::now();
         let mut expired = Vec::new();
         for retx in &mut self.retx {
@@ -1351,19 +1665,34 @@ impl<M: Media> Runner<M> {
                 }
                 continue;
             }
-            let current = self
-                .call
-                .as_ref()
-                .is_some_and(|call| call.call_id == call_id);
+            // Retransmissions are kept per call: find the line it is on.
+            let line = self.lines.iter().position(|line| {
+                line.call
+                    .as_ref()
+                    .is_some_and(|call| call.call_id == call_id)
+            });
+            let current = line.is_some();
+            if let Some(line) = line {
+                self.cur = line;
+            }
             if kind == RetxKind::Refer {
-                if current && self.call.as_mut().is_some_and(|c| c.refer.take().is_some()) {
+                if current
+                    && self.lines[self.cur]
+                        .call
+                        .as_mut()
+                        .is_some_and(|c| c.refer.take().is_some())
+                {
                     self.report("Transfer did not work: no answer".to_owned());
                     self.emit(Event::Transfer(TransferState::Failed(408)));
                 }
                 continue;
             }
             if kind == RetxKind::ReInvite {
-                if current && let Some(pending) = self.call.as_mut().and_then(|c| c.reinvite.take())
+                if current
+                    && let Some(pending) = self.lines[self.cur]
+                        .call
+                        .as_mut()
+                        .and_then(|c| c.reinvite.take())
                 {
                     self.hold_failed(pending.hold, "no answer");
                 }
@@ -1371,7 +1700,7 @@ impl<M: Media> Runner<M> {
             }
             let fire = current
                 && matches!(
-                    (kind, self.engine.state()),
+                    (kind, self.lines[self.cur].engine.state()),
                     (RetxKind::Invite | RetxKind::Cancel, State::Outgoing)
                         | (RetxKind::Bye, State::Ending)
                         | (RetxKind::Final, State::Answered)
@@ -1383,13 +1712,15 @@ impl<M: Media> Runner<M> {
     }
 
     fn pump_media(&mut self) {
-        if !self.media_running {
+        if !self.lines[self.cur].media_running {
             return;
         }
-        if let Err(error) = self.media.pump() {
+        if let Err(error) = self.lines[self.cur].media.pump() {
             self.report(format!("Audio failed: {error}"));
-            self.media_running = false;
-            self.pending.push_back(Input::Command(Command::Hangup));
+            self.lines[self.cur].media_running = false;
+            self.lines[self.cur]
+                .pending
+                .push_back(Input::Command(Command::Hangup));
         }
     }
 
@@ -1430,6 +1761,7 @@ impl<M: Media> Runner<M> {
     // ----- receiving -------------------------------------------------------
 
     fn receive_one(&mut self) -> io::Result<()> {
+        self.cur = self.selected;
         match self.socket.recv_from(&mut self.buffer) {
             Ok((length, source)) => {
                 let data = self.buffer[..length].to_vec();
@@ -1493,6 +1825,11 @@ impl<M: Media> Runner<M> {
             return self.send(&bytes, source);
         }
 
+        // The line of this call; a new call goes to a free line. With no
+        // free line the selected one answers, and it answers "busy".
+        if !self.find_line(&headers.call_id, source) {
+            self.cur = self.free_line().unwrap_or(self.selected);
+        }
         match method {
             "ACK" => self.on_ack(&headers, source),
             "INVITE" => self.on_invite(request, source),
@@ -1510,7 +1847,8 @@ impl<M: Media> Runner<M> {
     }
 
     fn is_current(&self, call_id: &str, source: SocketAddr) -> bool {
-        self.call
+        self.lines[self.cur]
+            .call
             .as_ref()
             .is_some_and(|call| call.call_id == call_id && call.peer == source)
     }
@@ -1521,24 +1859,50 @@ impl<M: Media> Runner<M> {
         }
         self.stop_retx(&headers.call_id, &[RetxKind::Final]);
         let invite_cseq = self.call_ref()?.invite_headers.cseq;
-        if self.engine.state() == State::Answered && headers.cseq == invite_cseq {
+        if self.lines[self.cur].engine.state() == State::Answered && headers.cseq == invite_cseq {
             self.dispatch(Input::IncomingAck)?;
         }
         Ok(())
     }
 
     fn on_invite(&mut self, request: &Request, source: SocketAddr) -> Result<()> {
-        if self.engine.state() != State::Idle {
+        if self.lines[self.cur].engine.state() != State::Idle {
             // An INVITE inside the current call changes that call (hold,
             // resume, session refresh); any other one finds the phone busy.
             let same_call = request
                 .headers
                 .get("call-id")
                 .is_some_and(|call_id| self.is_current(call_id, source));
-            if same_call && self.engine.state() == State::Established {
+            if same_call && self.lines[self.cur].engine.state() == State::Established {
                 return self.on_reinvite(request, source);
             }
             return self.reply_stateless(request, source, 486, "Busy Here");
+        }
+        if let Some(target) = self.forward_to.clone() {
+            // Forwarding: the caller's server is told where to call instead.
+            let (number, name) = caller_identity(header(&request.headers, "from")?);
+            let domain = match self.registration.as_ref() {
+                Some(registration) => registration.domain().to_owned(),
+                None => source.to_string(),
+            };
+            let uri = server_target(&target, &domain)?;
+            let tag = format!("rs-stateless-{}", self.local.port());
+            let contact = format!("<{uri}>");
+            let bytes = build_response(
+                request,
+                302,
+                "Moved Temporarily",
+                Some(&tag),
+                Some(&contact),
+                None,
+            )?;
+            self.send(&bytes, source)?;
+            let _ = self.events.send(Event::Forwarded {
+                number,
+                name,
+                to: target,
+            });
+            return Ok(());
         }
         if self.do_not_disturb {
             let (number, name) = caller_identity(header(&request.headers, "from")?);
@@ -1555,7 +1919,7 @@ impl<M: Media> Runner<M> {
         if contact_uri(&request.headers).is_err() {
             return self.reply_stateless(request, source, 400, "Bad Request");
         }
-        let local_rtp = match self.media.prepare(self.local.ip()) {
+        let local_rtp = match self.lines[self.cur].media.prepare(self.local.ip()) {
             Ok(address) => address,
             Err(error) => {
                 self.report(format!("Cannot reserve audio port: {error}"));
@@ -1570,7 +1934,7 @@ impl<M: Media> Runner<M> {
         call.dtmf_payload_type = telephone_event_payload_type(&request.body);
         // The called side uses the recorded route in the order received.
         call.route_set = record_routes(&request.headers);
-        self.call = Some(call);
+        self.lines[self.cur].call = Some(call);
 
         let trying = self.invite_response(100, "Trying", None)?;
         self.send(&trying, source)?;
@@ -1589,7 +1953,7 @@ impl<M: Media> Runner<M> {
         source: SocketAddr,
     ) -> Result<()> {
         let live = matches!(
-            self.engine.state(),
+            self.lines[self.cur].engine.state(),
             State::Answered | State::Established | State::Ending
         );
         if !(live && self.is_current(&headers.call_id, source)) {
@@ -1607,11 +1971,14 @@ impl<M: Media> Runner<M> {
         source: SocketAddr,
     ) -> Result<()> {
         let matches_invite = self.is_current(&headers.call_id, source)
-            && self
+            && self.lines[self.cur]
                 .call
                 .as_ref()
                 .is_some_and(|call| call.invite_headers.branch == headers.branch)
-            && matches!(self.engine.state(), State::Incoming | State::Answered);
+            && matches!(
+                self.lines[self.cur].engine.state(),
+                State::Incoming | State::Answered
+            );
         if !matches_invite {
             return self.reply_stateless(request, source, 481, "Call/Transaction Does Not Exist");
         }
@@ -1643,7 +2010,10 @@ impl<M: Media> Runner<M> {
         if self.on_register_response(response, &headers, source) {
             return Ok(());
         }
-        let Some(call) = self.call.as_ref() else {
+        if !self.find_line(&headers.call_id, source) {
+            return Ok(());
+        }
+        let Some(call) = self.lines[self.cur].call.as_ref() else {
             return Ok(());
         };
         if call.peer != source || call.call_id != headers.call_id {
@@ -1734,6 +2104,9 @@ impl<M: Media> Runner<M> {
                 if status < 200 {
                     return Ok(());
                 }
+                if matches!(status, 401 | 407) && self.retry_bye_with_credentials(response)? {
+                    return Ok(());
+                }
                 self.stop_retx(&headers.call_id, &[RetxKind::Bye]);
                 if (200..300).contains(&status)
                     && let Some(dialog) = self.call_mut()?.dialog.as_mut()
@@ -1741,7 +2114,7 @@ impl<M: Media> Runner<M> {
                     // A refused state change here only means the BYE was not sent by us.
                     let _ = dialog.finish_local_bye();
                 }
-                if self.engine.state() == State::Ending {
+                if self.lines[self.cur].engine.state() == State::Ending {
                     self.dispatch(Input::ByeResponse(status))?;
                 }
                 Ok(())
@@ -1752,7 +2125,7 @@ impl<M: Media> Runner<M> {
 
     fn on_invite_response(&mut self, response: &Response, status: u16) -> Result<()> {
         let id = self.call_ref()?.call_id.clone();
-        let state = self.engine.state();
+        let state = self.lines[self.cur].engine.state();
 
         if status < 200 {
             self.stop_retx(&id, &[RetxKind::Invite]);
@@ -1845,10 +2218,10 @@ impl<M: Media> Runner<M> {
         contact_uri: String,
         through_server: bool,
     ) -> Result<()> {
-        if self.engine.state() != State::Idle {
+        if self.lines[self.cur].engine.state() != State::Idle {
             return Err("a call is already in progress".into());
         }
-        let local_rtp = self.media.prepare(self.local.ip())?;
+        let local_rtp = self.lines[self.cur].media.prepare(self.local.ip())?;
         let local = self.local;
         let call_id = format!("{}@{}", self.unique(), local.ip());
         let branch = self.branch();
@@ -1878,15 +2251,64 @@ impl<M: Media> Runner<M> {
                 authorized: false,
             });
         }
-        self.call = Some(call);
-        self.dispatch(Input::Command(Command::Dial))
+        self.lines[self.cur].call = Some(call);
+        self.dispatch(Input::Command(Command::Dial))?;
+        // A new call takes over the conversation.
+        self.hold_other_lines();
+        Ok(())
+    }
+
+    /// A few servers ask for the password again when a call is ended. The
+    /// BYE is then sent once more with credentials. Returns false when
+    /// there is nothing to answer with, and the response ends the call.
+    fn retry_bye_with_credentials(&mut self, response: &Response) -> Result<bool> {
+        let branch = self.branch();
+        let local = self.local;
+        let Some(call) = self.lines[self.cur].call.as_ref() else {
+            return Ok(false);
+        };
+        let (Some(previous), Some(sent), false) = (
+            call.bye_request.as_ref(),
+            call.bye_headers.as_ref(),
+            call.bye_authorized,
+        ) else {
+            return Ok(false);
+        };
+        let Some(registration) = self.registration.as_ref() else {
+            return Ok(false);
+        };
+        let Ok((name, value)) = registration.authorize(response, "BYE", &previous.target) else {
+            return Ok(false);
+        };
+
+        // The same BYE as a new transaction: next CSeq, new branch.
+        let mut request = previous.clone();
+        request
+            .headers
+            .insert("cseq", format!("{} BYE", sent.cseq + 1))?;
+        request
+            .headers
+            .insert("via", format!("SIP/2.0/UDP {local};branch={branch};rport"))?;
+        request.headers.insert(name, value)?;
+        let headers = TransactionHeaders::from_message(&Message::Request(request.clone()))?;
+        let bytes = request.serialize()?;
+        let (peer, id) = (call.peer, call.call_id.clone());
+
+        self.stop_retx(&id, &[RetxKind::Bye]);
+        let call = self.call_mut()?;
+        call.bye_request = Some(request);
+        call.bye_headers = Some(headers);
+        call.bye_authorized = true;
+        self.send(&bytes, peer)?;
+        self.start_retx(RetxKind::Bye, id, bytes, peer, self.timers.t2);
+        Ok(true)
     }
 
     /// Answers a 401/407 to an INVITE sent through the server: acknowledges
     /// it and sends the INVITE again with credentials, once per call. Returns
     /// false when the response must end the call instead.
     fn retry_with_credentials(&mut self, response: &Response) -> Result<bool> {
-        let Some(call) = self.call.as_ref() else {
+        let Some(call) = self.lines[self.cur].call.as_ref() else {
             return Ok(false);
         };
         let Some(server) = call.server.as_ref() else {
@@ -2109,6 +2531,19 @@ fn contact_uri(headers: &Headers) -> Result<String> {
         return Err("unsupported Contact".into());
     }
     Ok(uri)
+}
+
+/// Escapes a value for use inside a URI header parameter (`?Replaces=...`).
+fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                char::from(byte).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }
 
 /// Record-Route entries in header order; one header may list several.

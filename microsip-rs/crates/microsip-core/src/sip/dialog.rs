@@ -97,6 +97,11 @@ impl EstablishedDialog {
         })
     }
 
+    /// The addresses and identifiers this dialog was created with.
+    pub fn config(&self) -> &DialogConfig {
+        &self.config
+    }
+
     pub fn state(&self) -> DialogState {
         self.state
     }

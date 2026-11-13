@@ -6,7 +6,9 @@
 use eframe::egui;
 use microsip_core::audio::{input_device_names, output_device_names};
 use microsip_core::call_media::{AudioControls, AudioMedia};
-use microsip_core::call_runner::{CallHandle, EndReason, Event, TransferState, UiCommand, spawn};
+use microsip_core::call_runner::{
+    CallHandle, EndReason, Event, Timers, TransferState, UiCommand, spawn_lines,
+};
 use microsip_core::call_view::{CallView, Phase};
 use microsip_core::contacts::{Contacts, dialable};
 use microsip_core::history::{CallRecord, Direction, History};
@@ -52,6 +54,12 @@ enum Action {
     AudioChanged,
     ToggleRecording,
     Transfer(String),
+    /// Looks at this line; a held call on it is resumed.
+    SwitchLine(usize),
+    /// Connects the two calls with each other and leaves both.
+    JoinLines,
+    Conference(bool),
+    ForwardChanged,
     DoNotDisturb(bool),
     /// Puts the clipboard's text into the number field.
     Paste,
@@ -70,6 +78,22 @@ struct CurrentCall {
     connected: Option<Instant>,
     /// File of the call's recording; empty when it was not recorded.
     recording: String,
+}
+
+/// Number of lines: one call can be held while another is talked on.
+const LINES: usize = 2;
+
+/// The state of one line as the window shows it.
+#[derive(Default)]
+struct LineUi {
+    view: CallView,
+    muted: bool,
+    current: Option<CurrentCall>,
+    caller: Option<(String, String)>,
+    /// The file being written now.
+    recording: Option<PathBuf>,
+    /// When the ringing call is to be answered automatically.
+    answer_at: Option<Instant>,
 }
 
 struct PhoneWindow {
@@ -106,15 +130,11 @@ struct PhoneWindow {
     // Recording.
     record_calls: bool,
     recordings_dir: String,
-    /// The file being written now.
-    recording: Option<PathBuf>,
 
     // Call handling.
     do_not_disturb: bool,
     auto_answer: bool,
     auto_answer_delay: u32,
-    /// When the ringing call is to be answered automatically.
-    answer_at: Option<Instant>,
     transfer_to: String,
     /// A change of the do-not-disturb box, applied after drawing.
     pending_dnd: Option<bool>,
@@ -127,10 +147,16 @@ struct PhoneWindow {
     handle: Option<CallHandle>,
     local: Option<SocketAddr>,
     registration: Option<RegistrationState>,
-    view: CallView,
-    muted: bool,
-    current: Option<CurrentCall>,
-    caller: Option<(String, String)>,
+    /// What each line is doing; `at` says which one the code works on.
+    lines: [LineUi; LINES],
+    at: usize,
+    /// The line the phone's events are about.
+    event_line: usize,
+    /// The line the buttons act on.
+    selected: usize,
+    conference: bool,
+    forward: bool,
+    forward_to: String,
 
     // The window.
     tab: Tab,
@@ -222,11 +248,9 @@ impl PhoneWindow {
             controls: AudioControls::default(),
             record_calls: saved.record_calls,
             recordings_dir: saved.recordings_dir.clone(),
-            recording: None,
             do_not_disturb: saved.do_not_disturb,
             auto_answer: saved.auto_answer,
             auto_answer_delay: saved.auto_answer_delay,
-            answer_at: None,
             transfer_to: String::new(),
             pending_dnd: None,
             number_changed: false,
@@ -235,10 +259,13 @@ impl PhoneWindow {
             handle: None,
             local: None,
             registration: None,
-            view: CallView::default(),
-            muted: false,
-            current: None,
-            caller: None,
+            lines: Default::default(),
+            at: 0,
+            event_line: 0,
+            selected: 0,
+            conference: false,
+            forward: saved.forward,
+            forward_to: saved.forward_to.clone(),
             tab: Tab::Dialpad,
             number: String::new(),
             contact_search: String::new(),
@@ -353,6 +380,8 @@ impl PhoneWindow {
             do_not_disturb: self.do_not_disturb,
             auto_answer: self.auto_answer,
             auto_answer_delay: self.auto_answer_delay,
+            forward: self.forward,
+            forward_to: self.forward_to.trim().to_owned(),
         };
         if current == self.saved {
             return;
@@ -414,7 +443,9 @@ impl PhoneWindow {
         };
         let local = SocketAddr::new(ip, self.port());
         let controls = self.controls.clone();
-        let handle = match spawn(local, "phone", move || AudioMedia::with_controls(controls)) {
+        let make_media = move || AudioMedia::with_controls(controls.clone());
+        let started = spawn_lines(local, "phone", Timers::default(), LINES, make_media);
+        let handle = match started {
             Ok(handle) => handle,
             Err(error) => {
                 return self.error(format!("Не удалось открыть порт {local}: {error}"));
@@ -424,10 +455,11 @@ impl PhoneWindow {
         self.log(format!("Телефон запущен на {local}"));
         handle.send(UiCommand::Trace(self.trace_file.is_some()));
         handle.send(UiCommand::DoNotDisturb(self.do_not_disturb));
+        handle.send(UiCommand::Forward(self.forward_target()));
         handle.send(UiCommand::Register(account));
         self.local = Some(local);
         self.handle = Some(handle);
-        self.view = CallView::default();
+        self.reset_lines();
         self.registration = Some(RegistrationState::Registering);
     }
 
@@ -437,11 +469,25 @@ impl PhoneWindow {
             drop(handle);
             self.log("Телефон отключён");
         }
-        self.finish_call(EndReason::Completed, false);
         self.local = None;
         self.registration = None;
-        self.view = CallView::default();
-        self.muted = false;
+        self.reset_lines();
+    }
+
+    /// Forgets every call; used when the phone itself stops or starts.
+    fn reset_lines(&mut self) {
+        self.lines = Default::default();
+        self.at = 0;
+        self.event_line = 0;
+        self.selected = 0;
+        self.conference = false;
+        self.transfer_to.clear();
+    }
+
+    /// The number calls are forwarded to, when forwarding is switched on.
+    fn forward_target(&self) -> Option<String> {
+        let target = self.forward_to.trim();
+        (self.forward && !target.is_empty()).then(|| target.to_owned())
     }
 
     fn send(&mut self, command: UiCommand) {
@@ -452,7 +498,7 @@ impl PhoneWindow {
         if !delivered {
             self.handle = None;
             self.registration = None;
-            self.view = CallView::default();
+            self.reset_lines();
             self.error("Телефон не подключён. Нажмите «Сохранить и подключить» в настройках.");
         }
     }
@@ -469,7 +515,19 @@ impl PhoneWindow {
     fn call(&mut self, target: String) {
         // Brackets, spaces and dashes of a pasted number are not dialled.
         let target = dialable(&target);
-        if target.is_empty() || !self.view.can_dial() {
+        if target.is_empty() {
+            return;
+        }
+        // During a call, a new one goes out on the free line; the phone
+        // holds the first call by itself.
+        if !self.lines[self.at].view.can_dial()
+            && let Some(line) = (0..LINES).find(|line| self.lines[*line].view.can_dial())
+        {
+            self.selected = line;
+            self.at = line;
+            self.send(UiCommand::SelectLine(line));
+        }
+        if !self.lines[self.at].view.can_dial() {
             return;
         }
         if self.handle.is_none() {
@@ -484,7 +542,7 @@ impl PhoneWindow {
         self.save_settings();
         let name = self.contacts.name_of(&target).unwrap_or("").to_owned();
         self.log(format!("Вызов {target}"));
-        self.current = Some(CurrentCall {
+        self.lines[self.at].current = Some(CurrentCall {
             incoming: false,
             number: target.clone(),
             name,
@@ -492,40 +550,48 @@ impl PhoneWindow {
             connected: None,
             recording: String::new(),
         });
-        self.view.dialing_target(&target);
+        self.lines[self.at].view.dialing_target(&target);
         self.send(UiCommand::DialTarget(target));
         self.tab = Tab::Dialpad;
     }
 
     fn answer(&mut self) {
-        if self.view.can_answer() {
-            self.view.answering();
+        // The ringing call may be on the line that is not shown; the phone
+        // then selects that line itself and holds the other call.
+        if !self.lines[self.at].view.can_answer()
+            && let Some(line) = (0..LINES).find(|line| self.lines[*line].view.can_answer())
+        {
+            self.at = line;
+            self.selected = line;
+        }
+        if self.lines[self.at].view.can_answer() {
+            self.lines[self.at].view.answering();
             self.send(UiCommand::Answer);
         }
     }
 
     fn reject(&mut self) {
-        if self.view.can_reject() {
+        if self.lines[self.at].view.can_reject() {
             self.send(UiCommand::Reject);
         }
     }
 
     fn hangup(&mut self) {
-        if self.view.can_hangup() {
+        if self.lines[self.at].view.can_hangup() {
             self.send(UiCommand::Hangup);
         }
     }
 
     fn toggle_mute(&mut self) {
-        if self.view.phase() == Phase::Connected {
-            self.muted = !self.muted;
-            self.send(UiCommand::Mute(self.muted));
+        if self.lines[self.at].view.phase() == Phase::Connected {
+            self.lines[self.at].muted = !self.lines[self.at].muted;
+            self.send(UiCommand::Mute(self.lines[self.at].muted));
         }
     }
 
     fn toggle_hold(&mut self) {
-        if self.view.can_hold() {
-            self.send(UiCommand::Hold(!self.view.is_held()));
+        if self.lines[self.at].view.can_hold() {
+            self.send(UiCommand::Hold(!self.lines[self.at].view.is_held()));
         }
     }
 
@@ -540,13 +606,15 @@ impl PhoneWindow {
     }
 
     fn start_recording(&mut self) {
-        if self.view.phase() != Phase::Connected || self.recording.is_some() {
+        if self.lines[self.at].view.phase() != Phase::Connected
+            || self.lines[self.at].recording.is_some()
+        {
             return;
         }
         let Some(folder) = self.recordings_folder() else {
             return self.error("Не задана папка для записей");
         };
-        let (incoming, number) = self
+        let (incoming, number) = self.lines[self.at]
             .current
             .as_ref()
             .map_or((false, String::new()), |call| {
@@ -558,7 +626,7 @@ impl PhoneWindow {
     }
 
     fn toggle_recording(&mut self) {
-        if self.recording.is_some() {
+        if self.lines[self.at].recording.is_some() {
             self.send(UiCommand::Record(None));
         } else {
             self.start_recording();
@@ -582,9 +650,9 @@ impl PhoneWindow {
 
     /// A keypad press: a tone during a call, a digit of the number otherwise.
     fn digit(&mut self, digit: char) {
-        if self.view.phase() == Phase::Connected {
+        if self.lines[self.at].view.phase() == Phase::Connected {
             self.send(UiCommand::Dtmf(digit));
-        } else if self.view.can_dial() {
+        } else if self.lines[self.at].view.can_dial() {
             self.number.push(digit);
             self.number_changed = true;
         }
@@ -593,12 +661,12 @@ impl PhoneWindow {
     /// Ends the bookkeeping of the current call and, when `record` is set,
     /// writes it to the call list.
     fn finish_call(&mut self, reason: EndReason, record: bool) {
-        self.muted = false;
-        self.answer_at = None;
+        self.lines[self.at].muted = false;
+        self.lines[self.at].answer_at = None;
         self.transfer_to.clear();
         // The phone finishes the file itself when the call ends.
-        self.recording = None;
-        let Some(call) = self.current.take() else {
+        self.lines[self.at].recording = None;
+        let Some(call) = self.lines[self.at].current.take() else {
             return;
         };
         if !record {
@@ -626,12 +694,19 @@ impl PhoneWindow {
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
+        // Events are about the line the phone last named.
+        self.at = self.event_line;
         while let Some(event) = self.handle.as_ref().and_then(|handle| handle.try_event()) {
-            self.view.on_event(&event);
+            if let Event::Line(line) = event {
+                self.event_line = line.min(LINES - 1);
+                self.at = self.event_line;
+                continue;
+            }
+            self.lines[self.at].view.on_event(&event);
             match event {
-                Event::Caller { number, name } => self.caller = Some((number, name)),
+                Event::Caller { number, name } => self.lines[self.at].caller = Some((number, name)),
                 Event::Incoming { peer } => {
-                    let (number, name) = self
+                    let (number, name) = self.lines[self.at]
                         .caller
                         .take()
                         .unwrap_or_else(|| (peer.to_string(), String::new()));
@@ -642,7 +717,7 @@ impl PhoneWindow {
                         .map(str::to_owned)
                         .unwrap_or(name);
                     self.log(format!("Входящий вызов: {number} {name}"));
-                    self.current = Some(CurrentCall {
+                    self.lines[self.at].current = Some(CurrentCall {
                         incoming: true,
                         number,
                         name,
@@ -651,7 +726,7 @@ impl PhoneWindow {
                         recording: String::new(),
                     });
                     self.tab = Tab::Dialpad;
-                    self.answer_at = self.auto_answer.then(|| {
+                    self.lines[self.at].answer_at = self.auto_answer.then(|| {
                         Instant::now() + Duration::from_secs(u64::from(self.auto_answer_delay))
                     });
                     // Bring the window to the user's attention.
@@ -664,7 +739,7 @@ impl PhoneWindow {
                 Event::Ringing => self.log("У абонента звонит телефон"),
                 Event::Established => {
                     self.log("Соединено");
-                    if let Some(call) = self.current.as_mut() {
+                    if let Some(call) = self.lines[self.at].current.as_mut() {
                         call.connected = Some(Instant::now());
                     }
                     if self.record_calls {
@@ -673,14 +748,14 @@ impl PhoneWindow {
                 }
                 Event::Recording(Some(path)) => {
                     self.log(format!("Запись разговора: {}", path.display()));
-                    if let Some(call) = self.current.as_mut() {
+                    if let Some(call) = self.lines[self.at].current.as_mut() {
                         call.recording = path.display().to_string();
                     }
-                    self.recording = Some(path);
+                    self.lines[self.at].recording = Some(path);
                 }
                 Event::Recording(None) => {
                     self.log("Запись остановлена");
-                    self.recording = None;
+                    self.lines[self.at].recording = None;
                 }
                 Event::Transfer(TransferState::Accepted) => self.log("Перевод: вызываем номер…"),
                 Event::Transfer(TransferState::Completed) => self.log("Перевод выполнен"),
@@ -728,13 +803,69 @@ impl PhoneWindow {
                     peer,
                     text,
                 } => self.trace(outgoing, peer, &text),
+                Event::Line(_) => {}
+                Event::Selected(line) => self.selected = line.min(LINES - 1),
+                Event::Conference(on) => {
+                    self.conference = on;
+                    self.log(if on {
+                        "Конференция: все линии соединены"
+                    } else {
+                        "Конференция завершена"
+                    });
+                }
+                Event::Forwarded { number, name, to } => {
+                    let name = self
+                        .contacts
+                        .name_of(&number)
+                        .map(str::to_owned)
+                        .unwrap_or(name);
+                    self.log(format!("Переадресован на {to}: {number} {name}"));
+                    self.history.add(CallRecord {
+                        time: now_unix(),
+                        direction: Direction::Missed,
+                        seconds: 0,
+                        number,
+                        name,
+                        recording: String::new(),
+                    });
+                    self.save_history();
+                }
                 Event::Error(message) => self.error(error_text(&message)),
             }
         }
         // Auto-answer, once the chosen time of ringing has passed.
-        if self.answer_at.is_some_and(|at| Instant::now() >= at) {
-            self.answer_at = None;
-            self.answer();
+        for line in 0..LINES {
+            if self.lines[line]
+                .answer_at
+                .is_some_and(|at| Instant::now() >= at)
+            {
+                self.lines[line].answer_at = None;
+                self.at = line;
+                self.answer();
+            }
+        }
+        // From here on the code is about the line the user looks at.
+        self.at = self.selected;
+    }
+
+    /// The other line, when it has a call.
+    fn other_line(&self) -> Option<usize> {
+        let other = (self.selected + 1) % LINES;
+        (self.lines[other].view.phase() != Phase::Idle).then_some(other)
+    }
+
+    /// Makes a line the selected one; a held call on it is taken back, which
+    /// puts the other call on hold.
+    fn switch_line(&mut self, line: usize) {
+        if line >= LINES || self.handle.is_none() {
+            return;
+        }
+        self.selected = line;
+        self.at = line;
+        self.send(UiCommand::SelectLine(line));
+        let view = &self.lines[line].view;
+        if view.phase() == Phase::Connected && view.is_held() && !self.conference {
+            self.send(UiCommand::Hold(false));
         }
     }
 
@@ -778,7 +909,7 @@ impl PhoneWindow {
             Action::Transfer(target) => {
                 if target.trim().is_empty() {
                     self.error("Введите номер, на который перевести");
-                } else if self.view.phase() == Phase::Connected {
+                } else if self.lines[self.at].view.phase() == Phase::Connected {
                     self.last_error = None;
                     self.log(format!("Перевод на {}", target.trim()));
                     self.send(UiCommand::Transfer(target.trim().to_owned()));
@@ -793,6 +924,21 @@ impl PhoneWindow {
             Action::Erase => {
                 self.number.pop();
                 self.number_changed = true;
+            }
+            Action::SwitchLine(line) => self.switch_line(line),
+            Action::JoinLines => {
+                if let Some(other) = self.other_line() {
+                    self.last_error = None;
+                    self.log("Соединяю двух собеседников между собой");
+                    self.send(UiCommand::TransferToLine(other));
+                }
+            }
+            Action::Conference(on) => self.send(UiCommand::Conference(on)),
+            Action::ForwardChanged => {
+                self.save_settings();
+                if self.handle.is_some() {
+                    self.send(UiCommand::Forward(self.forward_target()));
+                }
             }
             Action::DoNotDisturb(on) => {
                 self.do_not_disturb = on;
@@ -857,8 +1003,83 @@ impl PhoneWindow {
         });
     }
 
+    /// What a line's button says: its number and what is on it.
+    fn line_label(&self, line: usize) -> String {
+        let state = &self.lines[line];
+        let who = state
+            .current
+            .as_ref()
+            .map(|call| {
+                if call.name.is_empty() {
+                    call.number.clone()
+                } else {
+                    call.name.clone()
+                }
+            })
+            .unwrap_or_default();
+        let what = match state.view.phase() {
+            Phase::Idle => "свободна".to_owned(),
+            Phase::Incoming => format!("входящий {who}"),
+            Phase::Connected if state.view.is_held() => format!("удержание {who}"),
+            Phase::Connected => format!("разговор {who}"),
+            _ => format!("вызов {who}"),
+        };
+        format!("Линия {}: {what}", line + 1)
+    }
+
+    fn lines_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            for line in 0..LINES {
+                let label = self.line_label(line);
+                let ringing = self.lines[line].view.phase() == Phase::Incoming;
+                let text = if ringing {
+                    egui::RichText::new(label).color(egui::Color32::YELLOW)
+                } else {
+                    egui::RichText::new(label)
+                };
+                if ui.selectable_label(self.selected == line, text).clicked()
+                    && self.selected != line
+                {
+                    actions.push(Action::SwitchLine(line));
+                }
+            }
+        });
+        // A call ringing on the line that is not shown must not be missed.
+        let other = (self.selected + 1) % LINES;
+        if self.lines[other].view.phase() == Phase::Incoming {
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::YELLOW, "Второй вызов:");
+                if ui.button("Ответить").clicked() {
+                    actions.push(Action::Answer);
+                }
+                if ui.button("Показать").clicked() {
+                    actions.push(Action::SwitchLine(other));
+                }
+            });
+        }
+        // With two calls connected they can be joined.
+        let both = (0..LINES).all(|line| self.lines[line].view.phase() == Phase::Connected);
+        if both {
+            ui.horizontal(|ui| {
+                if ui.button("Соединить собеседников").clicked() {
+                    actions.push(Action::JoinLines);
+                }
+                let label = if self.conference {
+                    "Завершить конференцию"
+                } else {
+                    "Конференция"
+                };
+                if ui.button(label).clicked() {
+                    actions.push(Action::Conference(!self.conference));
+                }
+            });
+        }
+        ui.separator();
+    }
+
     fn dialpad_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        let phase = self.view.phase();
+        self.lines_bar(ui, actions);
+        let phase = self.lines[self.at].view.phase();
         let idle = phase == Phase::Idle;
 
         let number_id = egui::Id::new("number-field");
@@ -969,24 +1190,26 @@ impl PhoneWindow {
             _ => {
                 let hangup = egui::Button::new(big("Завершить")).fill(red);
                 let pressed = ui
-                    .add_enabled_ui(self.view.can_hangup(), |ui| ui.add_sized(wide, hangup))
+                    .add_enabled_ui(self.lines[self.at].view.can_hangup(), |ui| {
+                        ui.add_sized(wide, hangup)
+                    })
                     .inner
                     .clicked();
                 if pressed {
                     actions.push(Action::Hangup);
                 }
                 let connected = phase == Phase::Connected;
-                let mute = if self.muted {
+                let mute = if self.lines[self.at].muted {
                     "Включить микрофон"
                 } else {
                     "Выключить микрофон"
                 };
-                let hold = if self.view.is_held() {
+                let hold = if self.lines[self.at].view.is_held() {
                     "Продолжить"
                 } else {
                     "Удержание"
                 };
-                let record = if self.recording.is_some() {
+                let record = if self.lines[self.at].recording.is_some() {
                     "Остановить запись"
                 } else {
                     "Записать разговор"
@@ -1019,7 +1242,7 @@ impl PhoneWindow {
         }
 
         ui.add_space(6.0);
-        if let Some(call) = self.current.as_ref() {
+        if let Some(call) = self.lines[self.at].current.as_ref() {
             let who = if call.name.is_empty() {
                 call.number.clone()
             } else {
@@ -1036,20 +1259,20 @@ impl PhoneWindow {
             };
             ui.label(egui::RichText::new(who).size(18.0));
             ui.label(state);
-            if let Some(at) = self.answer_at {
+            if let Some(at) = self.lines[self.at].answer_at {
                 let left = at.saturating_duration_since(Instant::now()).as_secs() + 1;
                 ui.label(format!("Автоответ через {left} с"));
             }
-            if self.recording.is_some() {
+            if self.lines[self.at].recording.is_some() {
                 ui.colored_label(egui::Color32::RED, "Идёт запись разговора");
             }
-            if self.muted {
+            if self.lines[self.at].muted {
                 ui.colored_label(egui::Color32::YELLOW, "Микрофон выключен");
             }
-            if self.view.is_held() {
+            if self.lines[self.at].view.is_held() {
                 ui.colored_label(egui::Color32::YELLOW, "Вызов на удержании");
             }
-            if self.view.is_remote_held() {
+            if self.lines[self.at].view.is_remote_held() {
                 ui.colored_label(egui::Color32::YELLOW, "Собеседник поставил на удержание");
             }
         }
@@ -1083,7 +1306,7 @@ impl PhoneWindow {
             }
         });
         ui.separator();
-        let can_dial = self.view.can_dial();
+        let can_dial = self.lines[self.at].view.can_dial();
         let mut to_contacts = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (index, record) in self.history.records().iter().enumerate() {
@@ -1159,7 +1382,7 @@ impl PhoneWindow {
                 .hint_text("Поиск")
                 .desired_width(f32::INFINITY),
         );
-        let can_dial = self.view.can_dial();
+        let can_dial = self.lines[self.at].view.can_dial();
         egui::ScrollArea::vertical().show(ui, |ui| {
             let found = self.contacts.matching(&self.contact_search);
             if found.is_empty() {
@@ -1270,6 +1493,14 @@ impl PhoneWindow {
                     ui.label("с");
                 });
                 ui.weak("«Не беспокоить» включается галочкой в верхней строке окна.");
+                let before = (self.forward, self.forward_to.clone());
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.forward, "Переадресация на номер");
+                    ui.add(egui::TextEdit::singleline(&mut self.forward_to).desired_width(140.0));
+                });
+                if before != (self.forward, self.forward_to.clone()) {
+                    actions.push(Action::ForwardChanged);
+                }
 
                 ui.separator();
                 ui.heading("Запись разговоров");
@@ -1365,7 +1596,7 @@ fn end_reason_text(reason: EndReason) -> String {
 /// Messages of the phone's core, in Russian where they are known. The text
 /// after the first colon (a system detail) is kept as it is.
 fn error_text(message: &str) -> String {
-    const KNOWN: [(&str, &str); 11] = [
+    const KNOWN: [(&str, &str); 12] = [
         (
             "Cannot play the ringing sound",
             "Не удалось воспроизвести звонок",
@@ -1375,6 +1606,10 @@ fn error_text(message: &str) -> String {
         ("Hold did not work", "Удержание не сработало"),
         ("Resume did not work", "Возобновление не сработало"),
         ("Transfer did not work", "Перевод не удался"),
+        (
+            "both lines must have a connected call",
+            "Соединить можно только два идущих разговора",
+        ),
         (
             "only a connected call can be recorded",
             "Записывать можно только во время разговора",

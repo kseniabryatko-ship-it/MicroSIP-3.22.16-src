@@ -5,9 +5,11 @@ use crate::audio::{MAX_VOLUME_PERCENT, Microphone, Speaker, volume_factor};
 use crate::codec::Codec;
 use crate::gain::AutoGain;
 use crate::recording::{CallRecorder, RecorderInput};
+use crate::resample::Resampler;
 use crate::rtp::PCMU_CLOCK_RATE;
 use crate::rtp::session::{RtpSession, RtpSessionConfig};
 use crate::tones::{TONE_RATE, Tone, ToneGenerator};
+use std::collections::VecDeque;
 use std::error::Error;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::Path;
@@ -113,6 +115,10 @@ pub trait Media {
     /// whatever the mute setting is.
     fn set_hold(&mut self, _hold: bool) {}
 
+    /// In a conference every line hears the other lines as well as the
+    /// microphone. Without a conference a line carries the microphone only.
+    fn set_conference(&mut self, _on: bool) {}
+
     /// Starts recording the running call to this WAV file, or stops the
     /// recording with `None`. Stopping the audio stops it too.
     fn record(&mut self, path: Option<&Path>) -> Result<(), MediaError> {
@@ -162,7 +168,18 @@ pub struct AudioControls {
     inner: Arc<ControlsInner>,
 }
 
+/// What one line hears from its other side, at 8 kHz, kept briefly so the
+/// other lines of a conference can send it on.
+type HeardQueue = Arc<Mutex<VecDeque<f32>>>;
+
+/// Audio waiting in a [`HeardQueue`] beyond this is dropped (half a second).
+const HEARD_LIMIT: usize = 4_000;
+
 struct ControlsInner {
+    /// All connected lines talk together.
+    conference: AtomicBool,
+    /// One queue per line of the phone, in the order the lines were made.
+    heard: Mutex<Vec<HeardQueue>>,
     speaker_percent: Arc<AtomicU32>,
     microphone_percent: AtomicU32,
     input_device: Mutex<Option<String>>,
@@ -173,6 +190,8 @@ impl Default for AudioControls {
     fn default() -> Self {
         Self {
             inner: Arc::new(ControlsInner {
+                conference: AtomicBool::new(false),
+                heard: Mutex::new(Vec::new()),
                 speaker_percent: Arc::new(AtomicU32::new(100)),
                 microphone_percent: AtomicU32::new(100),
                 input_device: Mutex::new(None),
@@ -230,6 +249,95 @@ impl AudioControls {
     fn speaker_volume_handle(&self) -> Arc<AtomicU32> {
         Arc::clone(&self.inner.speaker_percent)
     }
+
+    /// Adds a line and returns its number among the lines sharing these
+    /// controls.
+    fn register_line(&self) -> usize {
+        match self.inner.heard.lock() {
+            Ok(mut heard) => {
+                heard.push(HeardQueue::default());
+                heard.len() - 1
+            }
+            Err(_) => 0,
+        }
+    }
+
+    fn heard_queue(&self, line: usize) -> Option<HeardQueue> {
+        self.inner.heard.lock().ok()?.get(line).cloned()
+    }
+
+    /// The queues of every line but this one.
+    fn other_heard_queues(&self, line: usize) -> Vec<HeardQueue> {
+        match self.inner.heard.lock() {
+            Ok(heard) => heard
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != line)
+                .map(|(_, queue)| Arc::clone(queue))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub fn is_conference(&self) -> bool {
+        self.inner.conference.load(Ordering::Relaxed)
+    }
+
+    fn set_conference(&self, on: bool) {
+        self.inner.conference.store(on, Ordering::Relaxed);
+        // Old audio must not be heard when a conference starts or ends.
+        if let Ok(heard) = self.inner.heard.lock() {
+            for queue in heard.iter() {
+                if let Ok(mut queue) = queue.lock() {
+                    queue.clear();
+                }
+            }
+        }
+    }
+}
+
+/// Adds what the other lines hear to the audio a line sends, so that in a
+/// conference every party hears every other one.
+struct ConferenceMixer {
+    /// The other lines, each with a converter from 8 kHz to the microphone's
+    /// rate.
+    others: Vec<(HeardQueue, Resampler)>,
+    rate: u32,
+    /// Part of an 8 kHz sample still owed from earlier blocks.
+    owed: u64,
+}
+
+impl ConferenceMixer {
+    fn new(others: Vec<HeardQueue>, rate: u32) -> Self {
+        Self {
+            others: others
+                .into_iter()
+                .filter_map(|queue| Some((queue, Resampler::new(PCMU_CLOCK_RATE, rate)?)))
+                .collect(),
+            rate: rate.max(1),
+            owed: 0,
+        }
+    }
+
+    /// Mixes the other lines into `samples` (recorded at the mixer's rate).
+    fn mix(&mut self, samples: &mut [f32]) {
+        // How many 8 kHz samples cover this block, without losing fractions.
+        let scaled = samples.len() as u64 * u64::from(PCMU_CLOCK_RATE) + self.owed;
+        let wanted = (scaled / u64::from(self.rate)) as usize;
+        self.owed = scaled % u64::from(self.rate);
+        for (queue, resampler) in &mut self.others {
+            let mut heard = vec![0.0; wanted];
+            if let Ok(mut queue) = queue.lock() {
+                for slot in &mut heard {
+                    // A line with nothing to say adds silence.
+                    *slot = queue.pop_front().unwrap_or(0.0);
+                }
+            }
+            for (sample, other) in samples.iter_mut().zip(resampler.push(&heard)) {
+                *sample = (*sample + other).clamp(-1.0, 1.0);
+            }
+        }
+    }
 }
 
 /// Microphone and speaker over a PCMU RTP session.
@@ -243,6 +351,8 @@ pub struct AudioMedia {
     muted: bool,
     held: bool,
     controls: AudioControls,
+    /// This line's number among the lines sharing `controls`.
+    line: Option<usize>,
     codec: Codec,
     /// Playback reserve the last call ended with; the next call on the
     /// same connection starts from it instead of learning it again.
@@ -341,8 +451,10 @@ impl AudioMedia {
 
     /// Audio that follows the given settings (devices and volumes).
     pub fn with_controls(controls: AudioControls) -> Self {
+        let line = Some(controls.register_line());
         Self {
             controls,
+            line,
             ..Self::default()
         }
     }
@@ -381,6 +493,15 @@ impl Media for AudioMedia {
         let record_local = RecorderSlot::default();
         let record_remote = RecorderSlot::default();
         let (tap_local, tap_remote) = (Arc::clone(&record_local), Arc::clone(&record_remote));
+        // For a conference: what this line hears is kept for the others,
+        // and what the others hear is added to what this line sends.
+        let heard = self.line.and_then(|line| self.controls.heard_queue(line));
+        let others = self
+            .line
+            .map(|line| self.controls.other_heard_queues(line))
+            .unwrap_or_default();
+        let mut mixer = ConferenceMixer::new(others, format.sample_rate);
+        let (conference_in, conference_out) = (self.controls.clone(), self.controls.clone());
         let config = RtpSessionConfig::new(remote, format.sample_rate)
             .with_dtmf_payload_type(self.dtmf_payload_type)
             .with_codec(self.codec);
@@ -390,6 +511,16 @@ impl Media for AudioMedia {
             config,
             self.next_ssrc,
             Some(Box::new(move |samples| {
+                if conference_in.is_conference()
+                    && let Some(heard) = heard.as_ref()
+                    && let Ok(mut heard) = heard.lock()
+                {
+                    heard.extend(samples.iter().copied());
+                    if heard.len() > HEARD_LIMIT {
+                        let excess = heard.len() - HEARD_LIMIT;
+                        heard.drain(..excess);
+                    }
+                }
                 if let Ok(mut tap) = tap_remote.lock()
                     && let Some(input) = tap.as_mut()
                 {
@@ -421,6 +552,9 @@ impl Media for AudioMedia {
                 for sample in &mut samples {
                     *sample = (*sample * volume).clamp(-1.0, 1.0);
                 }
+            }
+            if conference_out.is_conference() {
+                mixer.mix(&mut samples);
             }
             // The recording gets the voice as it is sent, after the gain.
             if let Ok(mut tap) = tap_local.lock()
@@ -504,6 +638,12 @@ impl Media for AudioMedia {
     fn set_hold(&mut self, hold: bool) {
         self.held = hold;
         self.apply_silence();
+    }
+
+    fn set_conference(&mut self, on: bool) {
+        if self.controls.is_conference() != on {
+            self.controls.set_conference(on);
+        }
     }
 
     fn record(&mut self, path: Option<&Path>) -> Result<(), MediaError> {
@@ -613,6 +753,90 @@ mod tests {
         assert_eq!(controls.input_device(), None);
         controls.set_output_device(None);
         assert_eq!(controls.output_device(), None);
+    }
+
+    fn queue_of(samples: &[f32]) -> HeardQueue {
+        Arc::new(Mutex::new(samples.iter().copied().collect()))
+    }
+
+    #[test]
+    fn conference_adds_the_other_line_to_what_is_sent() {
+        // The other line hears a steady level; this line's microphone is
+        // silent. After mixing, this line sends that level on.
+        let other = queue_of(&[0.4; 8_000]);
+        let mut mixer = ConferenceMixer::new(vec![Arc::clone(&other)], 48_000);
+        let mut sent = Vec::new();
+        for _ in 0..50 {
+            let mut block = vec![0.0; 480];
+            mixer.mix(&mut block);
+            sent.extend(block);
+        }
+        // Half a second at 48 kHz took exactly half a second at 8 kHz.
+        assert_eq!(other.lock().unwrap().len(), 4_000);
+        let settled = &sent[2_000..];
+        assert!(settled.iter().all(|sample| (sample - 0.4).abs() < 0.01));
+    }
+
+    #[test]
+    fn conference_keeps_the_microphone_and_limits_the_sum() {
+        let other = queue_of(&[0.8; 1_000]);
+        let mut mixer = ConferenceMixer::new(vec![other], 8_000);
+        let mut block = vec![0.5; 160];
+        mixer.mix(&mut block);
+        // 0.5 + 0.8 would clip: the sum stops at full scale.
+        assert!(block.iter().all(|sample| *sample == 1.0));
+
+        // A line that has nothing to say changes nothing.
+        let mut mixer = ConferenceMixer::new(vec![queue_of(&[])], 8_000);
+        let mut block = vec![0.5; 160];
+        mixer.mix(&mut block);
+        assert!(block.iter().all(|sample| *sample == 0.5));
+    }
+
+    #[test]
+    fn odd_block_sizes_do_not_drift() {
+        // 441 samples at 44.1 kHz are 80 at 8 kHz: 100 blocks take 8000.
+        let other = queue_of(&vec![0.1; 9_000]);
+        let mut mixer = ConferenceMixer::new(vec![Arc::clone(&other)], 44_100);
+        for _ in 0..100 {
+            mixer.mix(&mut [0.0; 441]);
+        }
+        assert_eq!(other.lock().unwrap().len(), 1_000);
+        // And with a block size that does not divide evenly.
+        let other = queue_of(&vec![0.1; 9_000]);
+        let mut mixer = ConferenceMixer::new(vec![Arc::clone(&other)], 48_000);
+        for _ in 0..1_000 {
+            mixer.mix(&mut [0.0; 47]);
+        }
+        // 47_000 samples at 48 kHz are 7833.33 at 8 kHz.
+        assert_eq!(other.lock().unwrap().len(), 9_000 - 7_833);
+    }
+
+    #[test]
+    fn lines_sharing_controls_find_each_other_for_a_conference() {
+        let controls = AudioControls::default();
+        let first = AudioMedia::with_controls(controls.clone());
+        let second = AudioMedia::with_controls(controls.clone());
+        assert_eq!((first.line, second.line), (Some(0), Some(1)));
+        assert_eq!(controls.other_heard_queues(0).len(), 1);
+        assert!(Arc::ptr_eq(
+            &controls.other_heard_queues(0)[0],
+            &controls.heard_queue(1).unwrap()
+        ));
+        // A phone made without shared controls has no conference partner.
+        assert_eq!(AudioMedia::new().line, None);
+
+        // Switching the conference clears what was waiting.
+        controls
+            .heard_queue(1)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .push_back(0.5);
+        assert!(!controls.is_conference());
+        controls.set_conference(true);
+        assert!(controls.is_conference());
+        assert!(controls.heard_queue(1).unwrap().lock().unwrap().is_empty());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! line per event so scripts and, later, the GUI can follow it.
 
 use microsip_core::call_media::{AudioMedia, NullMedia};
-use microsip_core::call_runner::{CallHandle, EndReason, Event, UiCommand, spawn};
+use microsip_core::call_runner::{CallHandle, EndReason, Event, Timers, UiCommand, spawn_lines};
 use microsip_core::registration::{Account, RegistrationState};
 use std::error::Error;
 use std::io::{self, BufRead};
@@ -25,7 +25,7 @@ USER@DOMAIN) dials through it.\n\
 (the Digest response value is hidden).";
 
 const COMMANDS: &str = "Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit | \
-register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister | dtmf DIGITS | mute | unmute | hold | resume | transfer NUMBER | dnd on|off";
+register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister | dtmf DIGITS | mute | unmute | hold | resume | transfer NUMBER | dnd on|off | line 1|2 | join | conference on|off | forward NUMBER|off";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -51,7 +51,12 @@ impl State {
 struct Phone {
     handle: CallHandle,
     local: SocketAddr,
-    state: State,
+    /// State of each line; `state` and `set_state` work on one of them.
+    states: Vec<State>,
+    /// The line the events being printed are about.
+    event_line: usize,
+    /// The line the typed commands go to.
+    selected: usize,
     registration: String,
     registered: bool,
     quitting: bool,
@@ -67,16 +72,41 @@ fn describe(reason: EndReason) -> String {
     }
 }
 
+const LINES: usize = 2;
+
 impl Phone {
+    /// State of the line in question: while an event is handled that is the
+    /// event's line, otherwise the selected one.
+    fn state(&self) -> State {
+        self.states[self.event_line]
+    }
+
+    fn set_state(&mut self, state: State) {
+        self.states[self.event_line] = state;
+    }
+
     fn on_event(&mut self, event: Event) {
         match event {
+            Event::Line(line) => {
+                self.event_line = line.min(LINES - 1);
+                println!("--- line {} ---", line + 1);
+            }
+            Event::Selected(line) => {
+                self.selected = line.min(LINES - 1);
+                println!("Selected line {}.", line + 1);
+            }
+            Event::Conference(true) => println!("Conference on."),
+            Event::Conference(false) => println!("Conference off."),
+            Event::Forwarded { number, name, to } => {
+                println!("Forwarded to {to}: {number} {name}");
+            }
             Event::Incoming { peer } => {
-                self.state = State::Incoming;
+                self.set_state(State::Incoming);
                 println!("Incoming call from {peer}. Type answer or reject.");
             }
             Event::Ringing => println!("Remote is ringing."),
             Event::Established => {
-                self.state = State::Connected;
+                self.set_state(State::Connected);
                 println!("Connected.");
                 if self.quitting {
                     // A hangup sent before the ACK was refused; repeat it now.
@@ -99,7 +129,7 @@ impl Phone {
             Event::RemoteHold(true) => println!("The other side put the call on hold."),
             Event::RemoteHold(false) => println!("The other side resumed the call."),
             Event::Ended(reason) => {
-                self.state = State::Idle;
+                self.set_state(State::Idle);
                 println!("Call ended: {}", describe(reason));
             }
             Event::Registration(state) => {
@@ -122,27 +152,35 @@ impl Phone {
     }
 
     fn on_line(&mut self, line: &str) {
+        // Typed commands are about the selected line.
+        let event_line = std::mem::replace(&mut self.event_line, self.selected);
+        self.on_typed(line);
+        self.event_line = event_line;
+    }
+
+    fn on_typed(&mut self, line: &str) {
         let mut parts = line.split_whitespace();
         match parts.next() {
             None => {}
             Some("call") => self.call(parts.next()),
-            Some("answer") => {
-                if self.state == State::Incoming {
-                    self.state = State::Answering;
+            // The ringing call is answered wherever it is; the phone then
+            // selects its line and holds the other call.
+            Some("answer") => match self.states.iter().position(|s| *s == State::Incoming) {
+                Some(line) => {
+                    self.states[line] = State::Answering;
                     self.handle.send(UiCommand::Answer);
-                } else {
-                    println!("No incoming call to answer.");
                 }
-            }
+                None => println!("No incoming call to answer."),
+            },
             Some("reject") => {
-                if self.state == State::Incoming {
+                if self.states.contains(&State::Incoming) {
                     self.handle.send(UiCommand::Reject);
                 } else {
                     println!("No ringing call to reject.");
                 }
             }
             Some("hangup") => {
-                if self.state == State::Idle {
+                if self.state() == State::Idle {
                     println!("No active call.");
                 } else {
                     self.handle.send(UiCommand::Hangup);
@@ -150,7 +188,7 @@ impl Phone {
             }
             Some("status") => println!(
                 "State: {}; local: {}; registration: {}",
-                self.state.name(),
+                self.state().name(),
                 self.local,
                 self.registration
             ),
@@ -165,7 +203,7 @@ impl Phone {
                 self.handle.send(UiCommand::Register(account));
             }
             Some("dtmf") => match parts.next() {
-                Some(digits) if self.state == State::Connected => {
+                Some(digits) if self.state() == State::Connected => {
                     for digit in digits.chars() {
                         self.handle.send(UiCommand::Dtmf(digit));
                     }
@@ -180,19 +218,50 @@ impl Phone {
                 println!("Microphone {}.", if muted { "off" } else { "on" });
             }
             Some(word @ ("hold" | "resume")) => {
-                if self.state == State::Connected {
+                if self.state() == State::Connected {
                     self.handle.send(UiCommand::Hold(word == "hold"));
                 } else {
                     println!("Only a connected call can be put on hold.");
                 }
             }
             Some("transfer") => match parts.next() {
-                Some(target) if self.state == State::Connected => {
+                Some(target) if self.state() == State::Connected => {
                     println!("Transferring to {target}");
                     self.handle.send(UiCommand::Transfer(target.to_owned()));
                 }
                 Some(_) => println!("Only a connected call can be transferred."),
                 None => println!("Usage: transfer NUMBER"),
+            },
+            Some("line") => match parts.next().and_then(|text| text.parse::<usize>().ok()) {
+                Some(line) if (1..=LINES).contains(&line) => {
+                    self.handle.send(UiCommand::SelectLine(line - 1));
+                }
+                _ => println!("Usage: line 1|2"),
+            },
+            Some("conference") => {
+                let on = parts.next() != Some("off");
+                self.handle.send(UiCommand::Conference(on));
+            }
+            Some("join") => {
+                // Connects the two calls with each other and leaves both.
+                let other = (self.selected + 1) % LINES;
+                self.handle.send(UiCommand::TransferToLine(other));
+                println!(
+                    "Connecting line {} with line {}",
+                    self.selected + 1,
+                    other + 1
+                );
+            }
+            Some("forward") => match parts.next() {
+                Some("off") | None => {
+                    self.handle.send(UiCommand::Forward(None));
+                    println!("Forwarding is off.");
+                }
+                Some(target) => {
+                    self.handle
+                        .send(UiCommand::Forward(Some(target.to_owned())));
+                    println!("Forwarding to {target}.");
+                }
             },
             Some("dnd") => {
                 let on = parts.next() == Some("on");
@@ -208,9 +277,14 @@ impl Phone {
     }
 
     fn call(&mut self, argument: Option<&str>) {
-        if self.state != State::Idle {
-            println!("A call is already in progress.");
-            return;
+        if self.state() != State::Idle {
+            // The phone puts a new call on a free line and holds the other.
+            let Some(free) = self.states.iter().position(|state| *state == State::Idle) else {
+                println!("A call is already in progress.");
+                return;
+            };
+            self.selected = free;
+            self.event_line = free;
         }
         let Some(text) = argument else {
             println!("Usage: call IP:PORT or call NUMBER");
@@ -218,7 +292,7 @@ impl Phone {
         };
         match text.parse::<SocketAddr>() {
             Ok(peer) if !peer.ip().is_unspecified() && peer.port() != 0 => {
-                self.state = State::Calling;
+                self.set_state(State::Calling);
                 println!("Calling {peer}");
                 self.handle.send(UiCommand::Dial(peer));
             }
@@ -228,7 +302,7 @@ impl Phone {
             }
             // Not an address: a number or user on the SIP server.
             Err(_) => {
-                self.state = State::Calling;
+                self.set_state(State::Calling);
                 println!("Calling {text}");
                 self.handle.send(UiCommand::DialTarget(text.to_owned()));
             }
@@ -237,20 +311,24 @@ impl Phone {
 
     fn begin_quit(&mut self) {
         if self.quitting {
-            // Second quit: stop waiting for the call to finish.
-            self.state = State::Idle;
+            // Second quit: stop waiting for the calls to finish.
+            self.states = vec![State::Idle; LINES];
             return;
         }
         self.quitting = true;
-        match self.state {
-            State::Idle => {}
-            State::Incoming => {
-                println!("Rejecting the call, then exiting.");
-                self.handle.send(UiCommand::Reject);
-            }
-            _ => {
-                println!("Ending the call, then exiting.");
-                self.handle.send(UiCommand::Hangup);
+        for line in 0..LINES {
+            match self.states[line] {
+                State::Idle => {}
+                State::Incoming => {
+                    println!("Rejecting the call, then exiting.");
+                    self.handle.send(UiCommand::SelectLine(line));
+                    self.handle.send(UiCommand::Reject);
+                }
+                _ => {
+                    println!("Ending the call, then exiting.");
+                    self.handle.send(UiCommand::SelectLine(line));
+                    self.handle.send(UiCommand::Hangup);
+                }
             }
         }
     }
@@ -279,9 +357,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let handle = if no_audio {
-        spawn(local, "phone", NullMedia::default)?
+        spawn_lines(local, "phone", Timers::default(), LINES, NullMedia::default)?
     } else {
-        spawn(local, "phone", AudioMedia::new)?
+        spawn_lines(local, "phone", Timers::default(), LINES, AudioMedia::new)?
     };
 
     if trace {
@@ -314,7 +392,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut phone = Phone {
         handle,
         local,
-        state: State::Idle,
+        states: vec![State::Idle; LINES],
+        event_line: 0,
+        selected: 0,
         registration: "not registered".to_owned(),
         registered: false,
         quitting: false,
@@ -340,7 +420,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             thread::sleep(Duration::from_millis(20));
         }
 
-        if phone.quitting && phone.state == State::Idle {
+        if phone.quitting && phone.states.iter().all(|state| *state == State::Idle) {
             break;
         }
     }

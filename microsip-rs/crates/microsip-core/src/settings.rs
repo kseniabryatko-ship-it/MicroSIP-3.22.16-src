@@ -45,6 +45,9 @@ pub struct Settings {
     pub auto_answer: bool,
     /// Seconds an incoming call rings before it is answered automatically.
     pub auto_answer_delay: u32,
+    /// Send every incoming call on to `forward_to` instead of ringing.
+    pub forward: bool,
+    pub forward_to: String,
 }
 
 impl Default for Settings {
@@ -68,6 +71,8 @@ impl Default for Settings {
             do_not_disturb: false,
             auto_answer: false,
             auto_answer_delay: 3,
+            forward: false,
+            forward_to: String::new(),
         }
     }
 }
@@ -106,6 +111,8 @@ impl Settings {
                 "recordings_dir" => settings.recordings_dir = value,
                 "do_not_disturb" => settings.do_not_disturb = value == "1",
                 "auto_answer" => settings.auto_answer = value == "1",
+                "forward" => settings.forward = value == "1",
+                "forward_to" => settings.forward_to = value,
                 "auto_answer_delay" => {
                     if let Some(delay) = value.parse::<u32>().ok().filter(|delay| *delay <= 60) {
                         settings.auto_answer_delay = delay;
@@ -142,6 +149,7 @@ impl Settings {
         let do_not_disturb = flag(self.do_not_disturb);
         let auto_answer = flag(self.auto_answer);
         let auto_answer_delay = self.auto_answer_delay.to_string();
+        let forward = flag(self.forward);
         // Without permission to remember it, no form of the password is written.
         let password_protected = if self.save_password {
             self.password_protected.clone()
@@ -167,6 +175,8 @@ impl Settings {
             ("do_not_disturb", &do_not_disturb),
             ("auto_answer", &auto_answer),
             ("auto_answer_delay", &auto_answer_delay),
+            ("forward", &forward),
+            ("forward_to", &self.forward_to),
         ] {
             text.push_str(key);
             text.push('=');
@@ -276,6 +286,8 @@ mod tests {
             do_not_disturb: true,
             auto_answer: true,
             auto_answer_delay: 5,
+            forward: true,
+            forward_to: "4011".to_owned(),
         }
     }
 
@@ -311,7 +323,8 @@ mod tests {
              speaker_volume=80\nmicrophone_volume=150\n\
              local_port=5062\nsave_password=1\npassword_protected=0a1b2c\n\
              record_calls=1\nrecordings_dir=D:\\Записи звонков\n\
-             do_not_disturb=1\nauto_answer=1\nauto_answer_delay=5\n"
+             do_not_disturb=1\nauto_answer=1\nauto_answer_delay=5\n\
+             forward=1\nforward_to=4011\n"
         );
         // No line holds the password itself; `save_password` and
         // `password_protected` are different keys.
@@ -379,6 +392,9 @@ mod tests {
         assert!(old.save_password);
         assert_eq!(old.password_protected, "");
         assert_eq!(old.local_port, 0);
+        // Forwarding is off and has no number.
+        assert!(!old.forward);
+        assert_eq!(old.forward_to, "");
         // Do-not-disturb and auto-answer are off, with a sensible delay.
         assert!(!old.do_not_disturb);
         assert!(!old.auto_answer);
