@@ -10,6 +10,7 @@ use microsip_core::call_runner::{
     CallHandle, EndReason, Event, Timers, TransferState, UiCommand, spawn_lines,
 };
 use microsip_core::call_view::{CallView, Phase};
+use microsip_core::codec::Codec;
 use microsip_core::contacts::{Contacts, dialable};
 use microsip_core::history::{CallRecord, Direction, History};
 use microsip_core::localtime::{
@@ -81,6 +82,8 @@ enum Action {
     /// Shows a system dialog; its answer is taken when it closes.
     Browse(Dialog),
     Autostart(bool),
+    /// The codecs or their order were changed.
+    CodecsChanged,
     /// A box of the "Window" settings was changed.
     WindowChanged,
 }
@@ -152,6 +155,8 @@ struct PhoneWindow {
     speakers: Vec<String>,
     controls: AudioControls,
 
+    /// Codecs in use, the preferred one first.
+    codecs: Vec<Codec>,
     /// Device and melody of the incoming ring.
     ring_speaker: String,
     ringtone: String,
@@ -289,6 +294,7 @@ impl PhoneWindow {
         };
 
         let mut window = Self {
+            codecs: Codec::parse_list(&saved.codecs),
             ring_speaker: saved.ring_speaker.clone(),
             ringtone: saved.ringtone.clone(),
             shell,
@@ -496,6 +502,7 @@ impl PhoneWindow {
             close_to_tray: self.close_to_tray,
             hotkeys: self.hotkeys,
             light_theme: self.light_theme,
+            codecs: Codec::format_list(&self.codecs),
         };
         if current == self.saved {
             return;
@@ -570,6 +577,7 @@ impl PhoneWindow {
         handle.send(UiCommand::Trace(self.trace_file.is_some()));
         handle.send(UiCommand::DoNotDisturb(self.do_not_disturb));
         handle.send(UiCommand::Forward(self.forward_target()));
+        handle.send(UiCommand::Codecs(self.codecs.clone()));
         handle.send(UiCommand::Register(account));
         if let Some(shell) = self.shell.as_ref() {
             shell.watch_ringing(Some(handle.ringing_flag()));
@@ -939,7 +947,7 @@ impl PhoneWindow {
                     peer,
                     text,
                 } => self.trace(outgoing, peer, &text),
-                Event::Line(_) => {}
+                Event::Line(_) | Event::Codec(_) => {}
                 Event::Selected(line) => self.selected = line.min(LINES - 1),
                 Event::Conference(on) => {
                     self.conference = on;
@@ -1103,6 +1111,12 @@ impl PhoneWindow {
                 }
             },
             Action::WindowChanged => self.save_settings(),
+            Action::CodecsChanged => {
+                self.save_settings();
+                if self.handle.is_some() {
+                    self.send(UiCommand::Codecs(self.codecs.clone()));
+                }
+            }
         }
     }
 
@@ -1573,10 +1587,11 @@ impl PhoneWindow {
             };
             let state = match (phase, call.connected) {
                 (Phase::Connected, Some(connected)) => {
-                    format!(
-                        "Разговор {}",
-                        format_duration(connected.elapsed().as_secs())
-                    )
+                    let time = format_duration(connected.elapsed().as_secs());
+                    match self.lines[self.at].view.codec() {
+                        Some(codec) => format!("Разговор {time} · {codec}"),
+                        None => format!("Разговор {time}"),
+                    }
                 }
                 _ => phase_text(phase).to_owned(),
             };
@@ -1878,6 +1893,16 @@ impl PhoneWindow {
                 );
 
                         ui.separator();
+                        ui.heading("Кодеки");
+                        if self.codecs_editor(ui) {
+                            actions.push(Action::CodecsChanged);
+                        }
+                        ui.weak(
+                            "Сверху — предпочитаемый. Изменения действуют со следующего звонка. \
+     Если АТС выбирает кодек сама, решает её порядок.",
+                        );
+
+                        ui.separator();
                         ui.heading("Входящие вызовы");
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.auto_answer, "Автоответ через");
@@ -1964,6 +1989,54 @@ impl PhoneWindow {
                     });
             });
         self.settings_open = open;
+    }
+
+    /// The list of codecs: a box to switch each on or off and buttons to
+    /// move it up and down. Returns true when something was changed.
+    fn codecs_editor(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        // Those in use first, in their order; the rest below, switched off.
+        let mut rows: Vec<(Codec, bool)> = self.codecs.iter().map(|codec| (*codec, true)).collect();
+        for codec in Codec::PREFERRED {
+            if !self.codecs.contains(&codec) {
+                rows.push((codec, false));
+            }
+        }
+        let in_use = self.codecs.len();
+        for (index, (codec, on)) in rows.into_iter().enumerate() {
+            ui.push_id(("codec", index), |ui| {
+                ui.horizontal(|ui| {
+                    let mut enabled = on;
+                    // The last codec cannot be switched off.
+                    let may_toggle = !on || in_use > 1;
+                    let label = format!("{codec} — {}", codec_note(codec));
+                    if ui
+                        .add_enabled(may_toggle, egui::Checkbox::new(&mut enabled, label))
+                        .changed()
+                    {
+                        if enabled {
+                            self.codecs.push(codec);
+                        } else {
+                            self.codecs.retain(|kept| *kept != codec);
+                        }
+                        changed = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let down = on && index + 1 < in_use;
+                        if ui.add_enabled(down, egui::Button::new("Ниже")).clicked() {
+                            self.codecs.swap(index, index + 1);
+                            changed = true;
+                        }
+                        let up = on && index > 0;
+                        if ui.add_enabled(up, egui::Button::new("Выше")).clicked() {
+                            self.codecs.swap(index, index - 1);
+                            changed = true;
+                        }
+                    });
+                });
+            });
+        }
+        changed
     }
 
     /// The ring device or melody differs from what is saved and in use.
@@ -2073,6 +2146,16 @@ fn error_text(message: &str) -> String {
         }
     }
     message.to_owned()
+}
+
+/// A few words on what a codec is good for.
+fn codec_note(codec: Codec) -> &'static str {
+    match codec {
+        Codec::Pcmu | Codec::Pcma => "обычная телефония, есть везде",
+        Codec::G722 => "чистый широкополосный звук",
+        Codec::Opus => "широкополосный, стойкий к потерям",
+        Codec::G729 => "для медленных каналов",
+    }
 }
 
 /// Why a melody file was refused, in the user's language.

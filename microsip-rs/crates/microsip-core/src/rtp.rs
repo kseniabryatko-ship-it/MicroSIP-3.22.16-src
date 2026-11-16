@@ -1,7 +1,7 @@
 pub mod dtmf;
 pub mod order;
 pub mod session;
-use crate::codec::Codec;
+use crate::codec::{Codec, VoiceEncoder};
 use crate::resample::Resampler;
 use dtmf::{DtmfFrame, DtmfSender};
 use std::error::Error;
@@ -203,7 +203,11 @@ pub struct PcmuStream {
     ssrc: u32,
     first_packet: bool,
     dtmf: DtmfSender,
-    codec: Codec,
+    dtmf_payload_type: Option<u8>,
+    encoder: VoiceEncoder,
+    /// Payload type of the voice packets, as agreed in SDP.
+    payload_type: u8,
+    source_sample_rate: u32,
 }
 
 impl PcmuStream {
@@ -217,19 +221,42 @@ impl PcmuStream {
             ssrc,
             first_packet: true,
             dtmf: DtmfSender::default(),
-            codec: Codec::Pcmu,
+            dtmf_payload_type: None,
+            encoder: VoiceEncoder::new(Codec::Pcmu),
+            payload_type: Codec::Pcmu.payload_type(),
+            source_sample_rate,
         })
     }
 
     /// Chooses the codec of the voice packets; PCMU unless set otherwise.
+    /// To be called before any sound is pushed.
     pub fn set_codec(&mut self, codec: Codec) {
-        self.codec = codec;
+        if let Some(resampler) = Resampler::new(self.source_sample_rate, codec.sample_rate()) {
+            self.resampler = resampler;
+        }
+        self.pending_samples.clear();
+        self.encoder = VoiceEncoder::new(codec);
+        self.payload_type = codec.payload_type();
+        self.set_dtmf_payload_type(self.dtmf_payload_type);
+    }
+
+    pub fn codec(&self) -> Codec {
+        self.encoder.codec()
+    }
+
+    /// Sets the payload type agreed for the voice, where it differs from
+    /// the codec's usual one (Opus has no fixed number). Call it after
+    /// [`PcmuStream::set_codec`].
+    pub fn set_payload_type(&mut self, payload_type: u8) {
+        self.payload_type = payload_type & 0x7F;
     }
 
     /// Sets the negotiated telephone-event payload type. Without one, digits
     /// are sent as tones inside the voice.
     pub fn set_dtmf_payload_type(&mut self, payload_type: Option<u8>) {
-        self.dtmf = DtmfSender::new(payload_type);
+        let codec = self.encoder.codec();
+        self.dtmf_payload_type = payload_type;
+        self.dtmf = DtmfSender::for_stream(payload_type, codec.clock_rate(), codec.sample_rate());
     }
 
     /// Queues a keypad digit; false when it is not a keypad character or too
@@ -245,35 +272,34 @@ impl PcmuStream {
 
         let mut packets = Vec::new();
 
-        while self.pending_samples.len() >= PCMU_SAMPLES_PER_PACKET {
+        let codec = self.encoder.codec();
+        let frame_samples = codec.frame_samples();
+        let frame_ticks = codec.clock_rate() / 50;
+
+        while self.pending_samples.len() >= frame_samples {
             let chunk = self
                 .pending_samples
-                .drain(..PCMU_SAMPLES_PER_PACKET)
+                .drain(..frame_samples)
                 .collect::<Vec<f32>>();
 
             // A digit being sent takes the place of the microphone; the
-            // sequence numbers and the voice clock run on regardless.
-            let codec = self.codec;
-            let voice = |samples: &[f32]| {
-                (
-                    codec.payload_type(),
-                    codec.encode(samples),
-                    self.first_packet,
-                    None,
-                )
+            // sequence numbers and the voice clock run on regardless. The
+            // encoder sees every frame, so that its state follows the clock.
+            let frame = self.dtmf.next_frame(self.next_timestamp);
+            let sound = match &frame {
+                DtmfFrame::Tone(tone) => self.encoder.encode(tone),
+                DtmfFrame::Silence => self.encoder.encode(&vec![0.0; frame_samples]),
+                DtmfFrame::Voice | DtmfFrame::Event { .. } => self.encoder.encode(&chunk),
             };
-            let (payload_type, payload, marker, timestamp) =
-                match self.dtmf.next_frame(self.next_timestamp) {
-                    DtmfFrame::Voice => voice(&chunk),
-                    DtmfFrame::Tone(tone) => voice(&tone),
-                    DtmfFrame::Silence => voice(&[0.0; PCMU_SAMPLES_PER_PACKET]),
-                    DtmfFrame::Event {
-                        payload_type,
-                        payload,
-                        marker,
-                        timestamp,
-                    } => (payload_type, payload.to_vec(), marker, Some(timestamp)),
-                };
+            let (payload_type, payload, marker, timestamp) = match frame {
+                DtmfFrame::Event {
+                    payload_type,
+                    payload,
+                    marker,
+                    timestamp,
+                } => (payload_type, payload.to_vec(), marker, Some(timestamp)),
+                _ => (self.payload_type, sound, self.first_packet, None),
+            };
 
             let packet = RtpPacket {
                 marker,
@@ -288,9 +314,7 @@ impl PcmuStream {
 
             self.next_sequence_number = self.next_sequence_number.wrapping_add(1);
 
-            self.next_timestamp = self
-                .next_timestamp
-                .wrapping_add(PCMU_SAMPLES_PER_PACKET as u32);
+            self.next_timestamp = self.next_timestamp.wrapping_add(frame_ticks);
 
             packets.push(packet);
         }
@@ -508,6 +532,96 @@ mod tests {
                 .iter()
                 .any(|sample| sample.abs() > 0.1)
         );
+    }
+
+    #[test]
+    fn wideband_codecs_keep_their_own_frame_and_clock() {
+        // (codec, payload type to use, samples per packet, clock per packet)
+        for (codec, payload_type, frame, ticks) in [
+            (Codec::G722, 9_u8, 320_usize, 160_u32),
+            (Codec::Opus, 107, 320, 960),
+            (Codec::G729, 18, 160, 160),
+        ] {
+            let rate = codec.sample_rate();
+            let mut stream = PcmuStream::new(7, rate).expect("stream should be valid");
+            stream.set_codec(codec);
+            stream.set_payload_type(payload_type);
+            assert_eq!(stream.codec(), codec);
+            // Two and a half packets of sound give two packets.
+            let packets = stream.push_pcm(&vec![0.1; frame * 5 / 2]);
+            assert_eq!(packets.len(), 2, "{codec}");
+            assert!(
+                packets
+                    .iter()
+                    .all(|packet| packet.payload_type == payload_type)
+            );
+            assert_eq!(packets[0].timestamp, 0);
+            assert_eq!(packets[1].timestamp, ticks, "{codec}");
+            assert!(packets[0].marker && !packets[1].marker);
+            // The rest waits for the next push.
+            assert_eq!(stream.push_pcm(&vec![0.1; frame / 2]).len(), 1, "{codec}");
+        }
+    }
+
+    #[test]
+    fn sound_from_the_sound_card_is_brought_to_the_codecs_rate() {
+        // 48 kHz in: one packet per 20 ms whatever the codec's own rate.
+        for codec in Codec::PREFERRED {
+            let mut stream = PcmuStream::new(1, 48_000).expect("stream should be valid");
+            stream.set_codec(codec);
+            let packets: usize = (0..50).map(|_| stream.push_pcm(&[0.0; 960]).len()).sum();
+            assert!((49..=50).contains(&packets), "{codec}: {packets}");
+        }
+    }
+
+    #[test]
+    fn keypad_events_follow_the_clock_of_the_voice() {
+        // With Opus the events run on its 48 kHz clock.
+        let mut stream = PcmuStream::new(1, 16_000).expect("stream should be valid");
+        stream.set_codec(Codec::Opus);
+        stream.set_payload_type(107);
+        stream.set_dtmf_payload_type(Some(110));
+        let voice = vec![0.25; 320];
+        let mut packets = stream.push_pcm(&voice);
+        assert!(stream.queue_dtmf('3'));
+        for _ in 0..11 {
+            packets.extend(stream.push_pcm(&voice));
+        }
+        let types: Vec<u8> = packets.iter().map(|packet| packet.payload_type).collect();
+        assert_eq!(
+            types,
+            [107, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 107]
+        );
+        // All event packets carry the start of the digit; the duration
+        // grows by 20 ms of that clock and stops at the full 160 ms.
+        assert!(packets[1..11].iter().all(|packet| packet.timestamp == 960));
+        let durations: Vec<u16> = packets[1..11]
+            .iter()
+            .map(|packet| u16::from_be_bytes([packet.payload[2], packet.payload[3]]))
+            .collect();
+        assert_eq!(
+            durations,
+            [960, 1920, 2880, 3840, 4800, 5760, 6720, 7680, 7680, 7680]
+        );
+        assert_eq!(packets[11].timestamp, 11 * 960);
+
+        // Without events the digit is a tone inside the G.722 voice.
+        let mut stream = PcmuStream::new(1, 16_000).expect("stream should be valid");
+        stream.set_codec(Codec::G722);
+        assert!(stream.queue_dtmf('1'));
+        let mut decoder = crate::codec::VoiceDecoder::new(Codec::G722);
+        let loud: Vec<bool> = (0..12)
+            .flat_map(|_| stream.push_pcm(&[0.0; 320]))
+            .map(|packet| {
+                assert_eq!(packet.payload_type, 9);
+                decoder
+                    .decode(&packet.payload)
+                    .iter()
+                    .any(|sample| sample.abs() > 0.1)
+            })
+            .collect();
+        assert_eq!(loud.iter().filter(|loud| **loud).count(), 8);
+        assert!(loud[0] && !loud[11]);
     }
 
     #[test]

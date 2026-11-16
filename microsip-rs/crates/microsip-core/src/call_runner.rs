@@ -85,6 +85,9 @@ pub enum UiCommand {
     /// Sends all incoming calls to this number instead of ringing;
     /// `None` switches forwarding off.
     Forward(Option<String>),
+    /// Sets the codecs offered and accepted from the next call on, in the
+    /// order of preference. An empty list means all of them.
+    Codecs(Vec<Codec>),
     /// Records the connected call to this WAV file, or stops recording with
     /// `None`. Reported with [`Event::Recording`]; the recording also stops
     /// when the call ends.
@@ -152,6 +155,8 @@ pub enum Event {
     },
     Ringing,
     Established,
+    /// The codec the call's audio started with.
+    Codec(Codec),
     /// RTP packet counters, sent just before the media stops.
     MediaStats {
         sent: u64,
@@ -383,8 +388,14 @@ struct Call {
     remote_rtp: Option<SocketAddr>,
     /// Telephone-event payload type the other side offered or accepted.
     dtmf_payload_type: Option<u8>,
+    /// Clock rate the agreed telephone-event type was announced with.
+    dtmf_clock: u32,
     /// Voice codec agreed with the other side.
     codec: Codec,
+    /// Payload type agreed for `codec`.
+    codec_payload_type: u8,
+    /// Every codec of ours the other side listed, with its payload type.
+    listed: Vec<(u8, Codec)>,
     local_tag: String,
     dialog: Option<EstablishedDialog>,
     last_invite_response: Option<Response>,
@@ -451,7 +462,10 @@ impl Call {
             local_rtp,
             remote_rtp: None,
             dtmf_payload_type: None,
+            dtmf_clock: 8_000,
             codec: Codec::Pcmu,
+            codec_payload_type: Codec::Pcmu.payload_type(),
+            listed: Vec::new(),
             local_tag,
             dialog: None,
             last_invite_response: None,
@@ -481,6 +495,31 @@ impl Call {
 }
 
 /// One line of the phone: it can hold one call, with its own audio.
+impl Call {
+    /// Takes over what an SDP body agreed about the audio.
+    fn agree(&mut self, agreed: Agreed, body: &[u8]) {
+        self.remote_rtp = Some(agreed.address);
+        self.codec = agreed.codec;
+        self.codec_payload_type = agreed.payload_type;
+        self.listed = agreed.listed;
+        let event = telephone_event_payload_type(body, agreed.codec.clock_rate());
+        self.dtmf_payload_type = event.map(|(payload_type, _)| payload_type);
+        self.dtmf_clock = event.map_or(8_000, |(_, clock)| clock);
+    }
+
+    /// The one codec of this call, as written in our SDP.
+    fn sdp_codecs(&self) -> [(Codec, u8); 1] {
+        [(self.codec, self.codec_payload_type)]
+    }
+
+    fn sdp_events(&self) -> Vec<(u8, u32)> {
+        self.dtmf_payload_type
+            .map(|payload_type| (payload_type, self.dtmf_clock))
+            .into_iter()
+            .collect()
+    }
+}
+
 struct Line<M: Media> {
     engine: CallEngine,
     call: Option<Call>,
@@ -521,6 +560,8 @@ struct Runner<M: Media> {
     conference: bool,
     /// Where all incoming calls are sent instead of ringing here.
     forward_to: Option<String>,
+    /// Codecs offered and accepted, in the user's order of preference.
+    codecs: Vec<Codec>,
     /// Shared with [`CallHandle::ringing_flag`].
     ringing: Arc<AtomicBool>,
     events: Sender<Event>,
@@ -553,6 +594,7 @@ impl<M: Media> Runner<M> {
             told_line: std::cell::Cell::new(0),
             conference: false,
             forward_to: None,
+            codecs: Codec::PREFERRED.to_vec(),
             ringing: Arc::new(AtomicBool::new(false)),
             events,
             registration: None,
@@ -716,6 +758,15 @@ impl<M: Media> Runner<M> {
             }
             UiCommand::Conference(on) => self.set_conference(on),
             UiCommand::TransferToLine(line) => self.transfer_to_line(line),
+            UiCommand::Codecs(codecs) => {
+                // The phone is never left without a codec.
+                self.codecs = if codecs.is_empty() {
+                    Codec::PREFERRED.to_vec()
+                } else {
+                    codecs
+                };
+                Ok(())
+            }
             UiCommand::Forward(target) => {
                 self.forward_to = target
                     .map(|target| target.trim().to_owned())
@@ -1089,8 +1140,8 @@ impl<M: Media> Runner<M> {
                 // The answer names the one codec chosen from the offer.
                 let sdp = make_sdp(
                     call.local_rtp,
-                    &[call.codec],
-                    call.dtmf_payload_type,
+                    &call.sdp_codecs(),
+                    &call.sdp_events(),
                     1,
                     "sendrecv",
                 );
@@ -1155,16 +1206,22 @@ impl<M: Media> Runner<M> {
                 let call = self.call_ref()?;
                 let (remote_rtp, dtmf) = (call.remote_rtp, call.dtmf_payload_type);
                 let codec = call.codec;
+                let (payload_type, listed) = (call.codec_payload_type, call.listed.clone());
                 let started = match remote_rtp {
                     Some(remote) => {
-                        self.lines[self.cur].media.set_codec(codec);
-                        self.lines[self.cur].media.set_dtmf_payload_type(dtmf);
-                        self.lines[self.cur].media.start(remote)
+                        let media = &mut self.lines[self.cur].media;
+                        media.set_codec(codec);
+                        media.set_payload_types(payload_type, listed);
+                        media.set_dtmf_payload_type(dtmf);
+                        media.start(remote)
                     }
-                    None => Err("the other side offered no usable G.711 audio".into()),
+                    None => Err("the other side offered no usable audio".into()),
                 };
                 match started {
-                    Ok(()) => self.lines[self.cur].media_running = true,
+                    Ok(()) => {
+                        self.lines[self.cur].media_running = true;
+                        self.emit(Event::Codec(codec));
+                    }
                     Err(error) => {
                         self.report(format!("Cannot start audio: {error}"));
                         self.lines[self.cur]
@@ -1218,14 +1275,10 @@ impl<M: Media> Runner<M> {
             .ok_or("no 2xx response to acknowledge")?;
 
         // In an answer the first codec listed is the one the other side uses.
-        match negotiate(&response.body, false) {
-            Ok((address, codec)) => {
-                call.remote_rtp = Some(address);
-                call.codec = codec;
-            }
+        match negotiate(&response.body, false, &Codec::PREFERRED) {
+            Ok(agreed) => call.agree(agreed, &response.body),
             Err(_) => call.remote_rtp = None,
         }
-        call.dtmf_payload_type = telephone_event_payload_type(&response.body);
         // The caller uses the recorded route in reverse order.
         call.route_set = record_routes(&response.headers);
         call.route_set.reverse();
@@ -1296,8 +1349,8 @@ impl<M: Media> Runner<M> {
         let direction = if hold { "sendonly" } else { "sendrecv" };
         let sdp = make_sdp(
             call.local_rtp,
-            &[call.codec],
-            call.dtmf_payload_type,
+            &call.sdp_codecs(),
+            &call.sdp_events(),
             call.sdp_version,
             direction,
         );
@@ -1562,8 +1615,8 @@ impl<M: Media> Runner<M> {
         call.sdp_version += 1;
         let sdp = make_sdp(
             call.local_rtp,
-            &[call.codec],
-            call.dtmf_payload_type,
+            &call.sdp_codecs(),
+            &call.sdp_events(),
             call.sdp_version,
             ours,
         );
@@ -1943,7 +1996,7 @@ impl<M: Media> Runner<M> {
             self.emit(Event::Declined { number, name });
             return Ok(());
         }
-        let (remote_rtp, codec) = match negotiate(&request.body, true) {
+        let agreed = match negotiate(&request.body, true, &self.codecs) {
             Ok(agreed) => agreed,
             Err(_) => {
                 return self.reply_stateless(request, source, 488, "Not Acceptable Here");
@@ -1962,9 +2015,7 @@ impl<M: Media> Runner<M> {
 
         let tag = format!("rs-{}", self.unique());
         let mut call = Call::new(source, request.clone(), local_rtp, tag)?;
-        call.remote_rtp = Some(remote_rtp);
-        call.codec = codec;
-        call.dtmf_payload_type = telephone_event_payload_type(&request.body);
+        call.agree(agreed, &request.body);
         // The called side uses the recorded route in the order received.
         call.route_set = record_routes(&request.headers);
         self.lines[self.cur].call = Some(call);
@@ -2269,7 +2320,7 @@ impl<M: Media> Runner<M> {
             branch,
             from_tag.clone(),
         )
-        .body(offer_sdp(local_rtp).into_bytes())
+        .body(offer_sdp(local_rtp, &self.codecs).into_bytes())
         .build()?;
         add_rport(&mut invite.headers)?;
 
@@ -2376,7 +2427,7 @@ impl<M: Media> Runner<M> {
             server.from_tag.clone(),
         )
         .cseq(old_headers.cseq + 1)
-        .body(offer_sdp(call.local_rtp).into_bytes())
+        .body(offer_sdp(call.local_rtp, &self.codecs).into_bytes())
         .build()?;
         invite.headers.insert(name, value)?;
         add_rport(&mut invite.headers)?;
@@ -2631,53 +2682,58 @@ fn server_target(text: &str, domain: &str) -> Result<String> {
 
 /// Payload type this phone proposes for telephone-event (keypad digits).
 const OFFERED_DTMF_PAYLOAD_TYPE: u8 = 101;
+/// Payload type offered for telephone-event on the 48 kHz clock of Opus.
+const OFFERED_WIDE_DTMF_PAYLOAD_TYPE: u8 = 102;
 
 /// The first offer of a call: every codec this phone has, in its order of
 /// preference, and telephone-event.
-fn offer_sdp(address: SocketAddr) -> String {
-    make_sdp(
-        address,
-        &Codec::PREFERRED,
-        Some(OFFERED_DTMF_PAYLOAD_TYPE),
-        1,
-        "sendrecv",
-    )
+fn offer_sdp(address: SocketAddr, codecs: &[Codec]) -> String {
+    let offered: Vec<(Codec, u8)> = codecs
+        .iter()
+        .map(|codec| (*codec, codec.payload_type()))
+        .collect();
+    // Digits are events on the clock of the voice: Opus runs at 48 kHz.
+    let mut events = vec![(OFFERED_DTMF_PAYLOAD_TYPE, 8_000)];
+    if codecs.contains(&Codec::Opus) {
+        events.push((OFFERED_WIDE_DTMF_PAYLOAD_TYPE, Codec::Opus.clock_rate()));
+    }
+    make_sdp(address, &offered, &events, 1, "sendrecv")
 }
 
-/// Audio with the given codecs, plus telephone-event with the given payload
-/// type when the digits may be sent as RFC 4733 events. `version` must grow
-/// whenever the description changes; `direction` is `sendrecv`, `sendonly`
-/// (hold), `recvonly` or `inactive`.
+/// Audio with the given codecs (each with its payload type), plus
+/// telephone-event with the given payload types and clock rates when the
+/// digits may be sent as RFC 4733 events. `version` must grow whenever the
+/// description changes; `direction` is `sendrecv`, `sendonly` (hold),
+/// `recvonly` or `inactive`.
 fn make_sdp(
     address: SocketAddr,
-    codecs: &[Codec],
-    dtmf: Option<u8>,
+    codecs: &[(Codec, u8)],
+    events: &[(u8, u32)],
     version: u32,
     direction: &str,
 ) -> String {
     let family = if address.is_ipv4() { "IP4" } else { "IP6" };
     let ip = address.ip();
     let port = address.port();
-    let (dtmf_format, dtmf_lines) = match dtmf {
-        Some(payload) => (
-            format!(" {payload}"),
-            format!("a=rtpmap:{payload} telephone-event/8000\r\na=fmtp:{payload} 0-16\r\n"),
-        ),
-        None => (String::new(), String::new()),
-    };
-    let formats: Vec<String> = codecs
-        .iter()
-        .map(|codec| codec.payload_type().to_string())
-        .collect();
-    let formats = formats.join(" ");
-    let codec_lines: String = codecs
-        .iter()
-        .map(|codec| format!("a=rtpmap:{} {}\r\n", codec.payload_type(), codec.rtpmap()))
-        .collect();
+    let mut formats = String::new();
+    let mut lines = String::new();
+    for (codec, payload) in codecs {
+        formats.push_str(&format!(" {payload}"));
+        lines.push_str(&format!("a=rtpmap:{payload} {}\r\n", codec.rtpmap()));
+        if let Some(parameters) = codec.fmtp() {
+            lines.push_str(&format!("a=fmtp:{payload} {parameters}\r\n"));
+        }
+    }
+    for (payload, clock) in events {
+        formats.push_str(&format!(" {payload}"));
+        lines.push_str(&format!(
+            "a=rtpmap:{payload} telephone-event/{clock}\r\na=fmtp:{payload} 0-16\r\n"
+        ));
+    }
     format!(
         "v=0\r\no=phone 1 {version} IN {family} {ip}\r\ns=Rust direct call\r\n\
-         c=IN {family} {ip}\r\nt=0 0\r\nm=audio {port} RTP/AVP {formats}{dtmf_format}\r\n\
-         {codec_lines}{dtmf_lines}a={direction}\r\n"
+         c=IN {family} {ip}\r\nt=0 0\r\nm=audio {port} RTP/AVP{formats}\r\n\
+         {lines}a={direction}\r\n"
     )
 }
 
@@ -2703,44 +2759,82 @@ fn sdp_direction(body: &[u8]) -> Option<&'static str> {
     }
 }
 
-/// Payload type of 8 kHz telephone-event in an SDP body, if it is offered.
-fn telephone_event_payload_type(body: &[u8]) -> Option<u8> {
-    let sdp = Sdp::parse(std::str::from_utf8(body).ok()?).ok()?;
-    let audio = sdp.media(&MediaKind::Audio)?;
+/// The `a=rtpmap` values of the audio part: `101 telephone-event/8000`.
+fn rtpmaps(audio: &crate::sip::sdp::MediaDescription) -> Vec<&str> {
     audio
         .attributes
         .iter()
         .filter(|attribute| attribute.name.eq_ignore_ascii_case("rtpmap"))
-        .filter_map(|attribute| attribute.value.as_deref()?.split_once(' '))
-        .find(|(_, encoding)| encoding.trim().eq_ignore_ascii_case("telephone-event/8000"))
-        .and_then(|(payload, _)| payload.trim().parse::<u8>().ok())
+        .filter_map(|attribute| attribute.value.as_deref())
+        .collect()
+}
+
+/// Payload type and clock rate of telephone-event in an SDP body, if it is
+/// offered. Events on `clock` (the clock of the voice) are preferred; where
+/// there are none, the usual 8 kHz type is taken.
+fn telephone_event_payload_type(body: &[u8], clock: u32) -> Option<(u8, u32)> {
+    let sdp = Sdp::parse(std::str::from_utf8(body).ok()?).ok()?;
+    let audio = sdp.media(&MediaKind::Audio)?;
+    let events: Vec<(u8, u32)> = rtpmaps(audio)
+        .into_iter()
+        .filter_map(|rtpmap| rtpmap.split_once(' '))
+        .filter_map(|(payload, encoding)| {
+            let mut parts = encoding.trim().split('/');
+            let name = parts.next()?;
+            let rate = parts.next()?.parse::<u32>().ok()?;
+            let payload = payload.trim().parse::<u8>().ok()?;
+            name.eq_ignore_ascii_case("telephone-event")
+                .then_some((payload, rate))
+        })
         // The type must also be listed on the m= line and be a dynamic one.
-        .filter(|payload| {
+        .filter(|(payload, _)| {
             (96..=127).contains(payload)
                 && audio
                     .formats
                     .iter()
                     .any(|format| *format == payload.to_string())
         })
+        .collect();
+    events
+        .iter()
+        .find(|(_, rate)| *rate == clock)
+        // Many exchanges announce only 8 kHz events, also next to Opus, and
+        // take them on the clock of the voice.
+        .or_else(|| events.iter().find(|(_, rate)| *rate == 8_000))
+        .copied()
+}
+
+/// What an SDP body settles about the audio of a call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Agreed {
+    /// Where the other side receives audio.
+    address: SocketAddr,
+    codec: Codec,
+    /// The payload type the codec has in this call.
+    payload_type: u8,
+    /// Every codec of this phone the other side listed.
+    listed: Vec<(u8, Codec)>,
 }
 
 /// Audio address from an SDP body; see [`negotiate`].
 #[cfg(test)]
 fn media_address(body: &[u8]) -> Result<SocketAddr> {
-    negotiate(body, true).map(|(address, _)| address)
+    negotiate(body, true, &Codec::PREFERRED).map(|agreed| agreed.address)
 }
 
 /// Audio address and codec from an SDP body. Requires RTP/AVP audio with at
-/// least one codec this phone has. `is_offer` says whose preference decides:
-/// ours for an offer, the other side's for an answer.
-fn negotiate(body: &[u8], is_offer: bool) -> Result<(SocketAddr, Codec)> {
+/// least one codec this phone has and `enabled` allows. `is_offer` says
+/// whose preference decides: ours for an offer, the other side's for an
+/// answer.
+fn negotiate(body: &[u8], is_offer: bool, enabled: &[Codec]) -> Result<Agreed> {
     let sdp = Sdp::parse(std::str::from_utf8(body)?)?;
     let audio = sdp.media(&MediaKind::Audio).ok_or("no audio in SDP")?;
     if audio.port == 0 || audio.protocol != "RTP/AVP" {
         return Err("audio must be enabled RTP/AVP".into());
     }
-    let codec = Codec::choose(&audio.formats, is_offer)
-        .ok_or("no common codec: this phone has G.711 (PCMU and PCMA) only")?;
+    let listed = Codec::listed(&audio.formats, &rtpmaps(audio));
+    let (codec, payload_type) =
+        Codec::choose(&listed, enabled, is_offer).ok_or("no common codec with the other side")?;
     let connection = audio
         .connection
         .as_ref()
@@ -2750,7 +2844,12 @@ fn negotiate(body: &[u8], is_offer: bool) -> Result<(SocketAddr, Codec)> {
     if ip.is_unspecified() {
         return Err("hold or unspecified media address is not supported".into());
     }
-    Ok((SocketAddr::new(ip, audio.port), codec))
+    Ok(Agreed {
+        address: SocketAddr::new(ip, audio.port),
+        codec,
+        payload_type,
+        listed,
+    })
 }
 
 #[cfg(test)]
@@ -2780,19 +2879,48 @@ mod tests {
     }
 
     #[test]
-    fn first_offer_lists_both_codecs_and_an_answer_names_one() {
+    fn first_offer_lists_the_enabled_codecs_and_an_answer_names_one() {
         let address = "192.0.2.5:40000".parse().unwrap();
-        let offer = offer_sdp(address);
+        let offer = offer_sdp(address, &Codec::PREFERRED);
         assert!(
-            offer.contains("m=audio 40000 RTP/AVP 0 8 101\r\n"),
+            offer.contains("m=audio 40000 RTP/AVP 0 8 9 111 18 101 102\r\n"),
             "{offer}"
         );
-        assert!(offer.contains("a=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n"));
+        assert!(offer.contains(
+            "a=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:9 G722/8000\r\n\
+             a=rtpmap:111 opus/48000/2\r\na=fmtp:111 useinbandfec=1"
+        ));
+        assert!(offer.contains("a=rtpmap:18 G729/8000\r\na=fmtp:18 annexb=no\r\n"));
+        // Digits for the 8 kHz codecs and for the 48 kHz clock of Opus.
+        assert!(offer.contains("a=rtpmap:101 telephone-event/8000\r\n"));
+        assert!(offer.contains("a=rtpmap:102 telephone-event/48000\r\n"));
 
-        let answer = make_sdp(address, &[Codec::Pcma], None, 1, "sendrecv");
+        // Only what the user left switched on is offered, in their order.
+        let narrow = offer_sdp(address, &[Codec::Pcma, Codec::Pcmu]);
+        assert!(
+            narrow.contains("m=audio 40000 RTP/AVP 8 0 101\r\n"),
+            "{narrow}"
+        );
+        assert!(!narrow.contains("opus") && !narrow.contains("48000"));
+
+        let answer = make_sdp(address, &[(Codec::Pcma, 8)], &[], 1, "sendrecv");
         assert!(answer.contains("m=audio 40000 RTP/AVP 8\r\n"), "{answer}");
         assert!(answer.contains("a=rtpmap:8 PCMA/8000\r\n"));
         assert!(!answer.contains("PCMU"));
+        // Opus is answered with the number the other side gave it.
+        let answer = make_sdp(
+            address,
+            &[(Codec::Opus, 107)],
+            &[(110, 48_000)],
+            1,
+            "sendrecv",
+        );
+        assert!(
+            answer.contains("m=audio 40000 RTP/AVP 107 110\r\n"),
+            "{answer}"
+        );
+        assert!(answer.contains("a=rtpmap:107 opus/48000/2\r\n"));
+        assert!(answer.contains("a=rtpmap:110 telephone-event/48000\r\n"));
     }
 
     #[test]
@@ -2800,32 +2928,56 @@ mod tests {
         let sdp = |formats: &str| {
             format!(
                 "v=0\r\no=x 1 1 IN IP4 192.0.2.1\r\ns=x\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n\
-                 m=audio 4000 RTP/AVP {formats}\r\n"
+                 m=audio 4000 RTP/AVP {formats}\r\na=rtpmap:107 opus/48000/2\r\n"
             )
         };
-        let address = "192.0.2.1:4000".parse().unwrap();
-        let agreed = |formats: &str, is_offer: bool| {
-            negotiate(sdp(formats).as_bytes(), is_offer).map_err(|error| error.to_string())
+        let address: std::net::SocketAddr = "192.0.2.1:4000".parse().unwrap();
+        let agreed = |formats: &str, is_offer: bool, enabled: &[Codec]| {
+            negotiate(sdp(formats).as_bytes(), is_offer, enabled)
+                .map(|agreed| {
+                    assert_eq!(agreed.address, address);
+                    (agreed.codec, agreed.payload_type)
+                })
+                .map_err(|error| error.to_string())
         };
+        let all = Codec::PREFERRED;
         // An offer with only PCMA is accepted with PCMA.
-        assert_eq!(agreed("8 101", true), Ok((address, Codec::Pcma)));
+        assert_eq!(agreed("8 101", true, &all), Ok((Codec::Pcma, 8)));
         // Offered both: our preference. Answered both: their first.
-        assert_eq!(agreed("8 0", true), Ok((address, Codec::Pcmu)));
-        assert_eq!(agreed("8 0", false), Ok((address, Codec::Pcma)));
-        // Nothing in common.
+        assert_eq!(agreed("8 0", true, &all), Ok((Codec::Pcmu, 0)));
+        assert_eq!(agreed("8 0", false, &all), Ok((Codec::Pcma, 8)));
+        // The user's order decides among what is offered.
+        let wide_first = [Codec::Opus, Codec::G722, Codec::Pcma];
+        assert_eq!(
+            agreed("0 8 9 107", true, &wide_first),
+            Ok((Codec::Opus, 107))
+        );
+        assert_eq!(agreed("0 8 9", true, &wide_first), Ok((Codec::G722, 9)));
+        assert_eq!(agreed("18 9", true, &all), Ok((Codec::G722, 9)));
+        // Nothing in common, or nothing the user allows.
         assert!(
-            agreed("18 9", true)
+            agreed("3 4", true, &all)
                 .unwrap_err()
                 .contains("no common codec")
         );
-        assert!(agreed("18 9", false).is_err());
+        assert!(agreed("3 4", false, &all).is_err());
+        assert!(agreed("0 8", true, &[Codec::G729]).is_err());
+
+        // Everything of ours they list is remembered for receiving.
+        let listed = negotiate(sdp("9 107 3 0").as_bytes(), true, &all)
+            .unwrap()
+            .listed;
+        assert_eq!(
+            listed,
+            [(9, Codec::G722), (107, Codec::Opus), (0, Codec::Pcmu)]
+        );
     }
 
     #[test]
     fn direction_and_version_are_written_and_read_back() {
         let address = "192.0.2.5:40000".parse().unwrap();
         for direction in ["sendrecv", "sendonly", "recvonly", "inactive"] {
-            let sdp = make_sdp(address, &Codec::PREFERRED, Some(101), 7, direction);
+            let sdp = make_sdp(address, &[(Codec::Pcmu, 0)], &[(101, 8_000)], 7, direction);
             assert!(sdp.contains("o=phone 1 7 IN IP4 192.0.2.5\r\n"));
             assert_eq!(sdp_direction(sdp.as_bytes()), Some(direction));
         }
@@ -2844,18 +2996,34 @@ mod tests {
     #[test]
     fn offer_lists_telephone_event_and_stays_valid_pcmu() {
         let address = "192.0.2.5:40000".parse().unwrap();
-        let offer = make_sdp(address, &[Codec::Pcmu], Some(101), 1, "sendrecv");
+        let offer = make_sdp(address, &[(Codec::Pcmu, 0)], &[(101, 8_000)], 1, "sendrecv");
         assert!(offer.contains("m=audio 40000 RTP/AVP 0 101\r\n"));
         assert!(offer.contains("a=rtpmap:101 telephone-event/8000\r\n"));
         assert!(offer.contains("a=fmtp:101 0-16\r\n"));
         // Our own offer is something we would accept ourselves.
         assert_eq!(media_address(offer.as_bytes()).unwrap(), address);
-        assert_eq!(telephone_event_payload_type(offer.as_bytes()), Some(101));
+        assert_eq!(
+            telephone_event_payload_type(offer.as_bytes(), 8_000),
+            Some((101, 8_000))
+        );
 
-        let plain = make_sdp(address, &[Codec::Pcmu], None, 1, "sendrecv");
+        let plain = make_sdp(address, &[(Codec::Pcmu, 0)], &[], 1, "sendrecv");
         assert!(plain.contains("m=audio 40000 RTP/AVP 0\r\n"));
         assert!(!plain.contains("telephone-event"));
-        assert_eq!(telephone_event_payload_type(plain.as_bytes()), None);
+        assert_eq!(telephone_event_payload_type(plain.as_bytes(), 8_000), None);
+
+        // The full offer is accepted by ourselves too, with the events of
+        // each clock found.
+        let full = offer_sdp(address, &Codec::PREFERRED);
+        assert_eq!(media_address(full.as_bytes()).unwrap(), address);
+        assert_eq!(
+            telephone_event_payload_type(full.as_bytes(), 8_000),
+            Some((101, 8_000))
+        );
+        assert_eq!(
+            telephone_event_payload_type(full.as_bytes(), 48_000),
+            Some((102, 48_000))
+        );
     }
 
     #[test]
@@ -2867,7 +3035,8 @@ mod tests {
             )
         };
         let found = |formats: &str, lines: &str| {
-            telephone_event_payload_type(sdp(formats, lines).as_bytes())
+            telephone_event_payload_type(sdp(formats, lines).as_bytes(), 8_000)
+                .map(|(payload_type, _)| payload_type)
         };
         assert_eq!(
             found("0 96", "a=rtpmap:96 telephone-event/8000\r\n"),
@@ -2888,7 +3057,23 @@ mod tests {
         assert_eq!(found("0", "a=rtpmap:101 telephone-event/8000\r\n"), None);
         assert_eq!(found("0 8", "a=rtpmap:8 telephone-event/8000\r\n"), None);
         assert_eq!(found("0", ""), None);
-        assert_eq!(telephone_event_payload_type(b"not sdp"), None);
+        assert_eq!(telephone_event_payload_type(b"not sdp", 8_000), None);
+
+        // For Opus the events on its own clock are taken when there are
+        // any, and the 8 kHz ones otherwise.
+        let both = sdp(
+            "107 101 110",
+            "a=rtpmap:101 telephone-event/8000\r\na=rtpmap:110 telephone-event/48000\r\n",
+        );
+        assert_eq!(
+            telephone_event_payload_type(both.as_bytes(), 48_000),
+            Some((110, 48_000))
+        );
+        let narrow = sdp("107 101", "a=rtpmap:101 telephone-event/8000\r\n");
+        assert_eq!(
+            telephone_event_payload_type(narrow.as_bytes(), 48_000),
+            Some((101, 8_000))
+        );
     }
 
     #[test]

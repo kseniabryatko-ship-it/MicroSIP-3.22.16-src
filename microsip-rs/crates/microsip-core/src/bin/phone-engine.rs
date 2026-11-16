@@ -3,17 +3,20 @@
 //! One program handles both incoming and outgoing calls. It prints one status
 //! line per event so scripts and, later, the GUI can follow it.
 
-use microsip_core::call_media::{AudioMedia, NullMedia};
+use microsip_core::call_media::{AudioMedia, NullMedia, ToneMedia, ToneReport};
 use microsip_core::call_runner::{CallHandle, EndReason, Event, Timers, UiCommand, spawn_lines};
+use microsip_core::codec::Codec;
 use microsip_core::registration::{Account, RegistrationState};
 use std::error::Error;
 use std::io::{self, BufRead};
 use std::net::SocketAddr;
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 const HELP: &str = "Usage: phone-engine.exe LOCAL_IP:SIP_PORT [--no-audio] [--trace]\n\
+       [--codecs=LIST] [--tone=HZ]\n\
 Port 0 picks a free port; the chosen address is printed on the first line.\n\
 Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit\n\
           register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister\n\
@@ -22,7 +25,10 @@ call IP:PORT dials directly. register keeps the account registered on a SIP\n\
 server; after that the server can send calls here and call NUMBER (or\n\
 USER@DOMAIN) dials through it.\n\
 --no-audio runs without sound devices. --trace prints every SIP message\n\
-(the Digest response value is hidden).";
+(the Digest response value is hidden).\n\
+--codecs=opus,G722,PCMA sets the codecs and their order (PCMU, PCMA, G722,\n\
+opus, G729). --tone=440 needs no sound devices: it sends a tone of that\n\
+pitch and prints what was heard when the call ends.";
 
 const COMMANDS: &str = "Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit | \
 register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister | dtmf DIGITS | mute | unmute | hold | resume | transfer NUMBER | dnd on|off | line 1|2 | join | conference on|off | forward NUMBER|off";
@@ -60,6 +66,8 @@ struct Phone {
     registration: String,
     registered: bool,
     quitting: bool,
+    /// With --tone: what the test tone's receiver heard in the last call.
+    tone: Option<Arc<Mutex<ToneReport>>>,
 }
 
 fn describe(reason: EndReason) -> String {
@@ -131,7 +139,19 @@ impl Phone {
             Event::Ended(reason) => {
                 self.set_state(State::Idle);
                 println!("Call ended: {}", describe(reason));
+                if let Some(report) = self.tone.as_ref()
+                    && let Ok(mut report) = report.lock()
+                {
+                    if report.seconds > 0.0 {
+                        println!(
+                            "Tone heard: {:.0} Hz, level {:.2}, {:.1} s",
+                            report.frequency, report.level, report.seconds
+                        );
+                    }
+                    *report = ToneReport::default();
+                }
             }
+            Event::Codec(codec) => println!("Codec: {codec}"),
             Event::Registration(state) => {
                 self.registration = state.to_string();
                 self.registered = matches!(state, RegistrationState::Registered { .. });
@@ -342,11 +362,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let no_audio = args.iter().any(|argument| argument == "--no-audio");
     let trace = args.iter().any(|argument| argument == "--trace");
+    let value = |name: &str| {
+        args.iter()
+            .find_map(|argument| argument.strip_prefix(name)?.strip_prefix('='))
+    };
+    let codecs = value("--codecs").map(Codec::parse_list);
+    let tone_hz = match value("--tone").map(str::parse::<f32>) {
+        Some(Ok(hz)) if (50.0..=3_400.0).contains(&hz) => Some(hz),
+        Some(_) => return Err("--tone takes a pitch from 50 to 3400 Hz".into()),
+        None => None,
+    };
     let positional: Vec<&String> = args
         .iter()
         .filter(|argument| !argument.starts_with("--"))
         .collect();
-    if positional.len() != 1 || args.len() - positional.len() > 2 {
+    if positional.len() != 1 || args.len() - positional.len() > 4 {
         println!("{HELP}");
         return Err("expected LOCAL_IP:SIP_PORT".into());
     }
@@ -356,7 +386,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("use a concrete local IP, not 0.0.0.0".into());
     }
 
-    let handle = if no_audio {
+    let tone = tone_hz.map(|_| Arc::new(Mutex::new(ToneReport::default())));
+    let handle = if let (Some(hz), Some(report)) = (tone_hz, tone.clone()) {
+        let make = move || ToneMedia::new(hz, Arc::clone(&report));
+        spawn_lines(local, "phone", Timers::default(), LINES, make)?
+    } else if no_audio {
         spawn_lines(local, "phone", Timers::default(), LINES, NullMedia::default)?
     } else {
         spawn_lines(local, "phone", Timers::default(), LINES, AudioMedia::new)?
@@ -365,11 +399,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     if trace {
         handle.send(UiCommand::Trace(true));
     }
+    if let Some(codecs) = codecs {
+        handle.send(UiCommand::Codecs(codecs));
+    }
     // With port 0 the system chose the port; report the real address.
     let local = handle.local_address();
     println!("Listening on {local}");
     println!("{COMMANDS}");
-    if no_audio {
+    if let Some(hz) = tone_hz {
+        println!("Sending a {hz} Hz test tone instead of the microphone.");
+    } else if no_audio {
         println!("Audio is disabled (--no-audio).");
     } else {
         println!("Use headphones. Incoming calls require answer.");
@@ -398,6 +437,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         registration: "not registered".to_owned(),
         registered: false,
         quitting: false,
+        tone,
     };
     let mut input_open = true;
 

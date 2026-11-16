@@ -5,6 +5,7 @@ use microsip_core::call_media::NullMedia;
 use microsip_core::call_runner::{
     CallHandle, EndReason, Event, Timers, TransferState, UiCommand, spawn_with_timers,
 };
+use microsip_core::codec::Codec;
 use microsip_core::dialog::{DialogConfig, EstablishedDialog};
 use microsip_core::registration::{Account, RegistrationState};
 use microsip_core::sip::digest::{DigestChallenge, authorization_header_with_cnonce};
@@ -551,11 +552,18 @@ fn offer_proposes_keypad_events_and_answer_follows_the_caller() {
     let local = handle.local_address();
     let address = server.address();
 
-    // Our own offer proposes both G.711 codecs and telephone-event.
+    // Our own offer proposes every codec in the default order, and
+    // telephone-event for the 8 kHz codecs and for the clock of Opus.
     assert!(handle.send(UiCommand::DialTarget(address.to_string())));
     let (invite, peer) = server.request("INVITE");
     let offer = std::str::from_utf8(&invite.body).unwrap();
-    assert!(offer.contains(" RTP/AVP 0 8 101\r\n"), "{offer}");
+    assert!(
+        offer.contains(" RTP/AVP 0 8 9 111 18 101 102\r\n"),
+        "{offer}"
+    );
+    assert!(offer.contains("a=rtpmap:9 G722/8000\r\n"), "{offer}");
+    assert!(offer.contains("a=rtpmap:111 opus/48000/2\r\n"), "{offer}");
+    assert!(offer.contains("a=rtpmap:102 telephone-event/48000\r\n"));
     assert!(offer.contains("a=rtpmap:8 PCMA/8000\r\n"), "{offer}");
     assert!(offer.contains("a=rtpmap:101 telephone-event/8000\r\n"));
     server.reply(&invite, peer, 486, &[], None);
@@ -873,31 +881,52 @@ fn caller_offering_only_pcma_is_answered_with_pcma() {
     assert!(!answer.contains("PCMU"), "{answer}");
 }
 
-#[test]
-fn caller_offering_no_g711_is_refused_with_488() {
-    let server = Server::new();
-    let handle = phone(fast_timers());
-    let local = handle.local_address();
+/// An INVITE from the server's address whose audio lists only `formats`.
+fn invite_offering(server: &Server, local: SocketAddr, call_id: &str, formats: &str) -> Request {
     let address = server.address();
-
-    let sdp = "v=0\r\no=raw 1 1 IN IP4 127.0.0.1\r\ns=raw\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
-               m=audio 40000 RTP/AVP 18\r\na=rtpmap:18 G729/8000\r\n";
-    let invite = InviteRequest::new(
+    let sdp = format!(
+        "v=0\r\no=raw 1 1 IN IP4 127.0.0.1\r\ns=raw\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+         m=audio 40000 RTP/AVP {formats}\r\n"
+    );
+    InviteRequest::new(
         format!("sip:phone@{local}"),
         format!("sip:bob@{address}"),
         format!("sip:phone@{local}"),
         format!("sip:bob@{address}"),
         address.to_string(),
-        "g729-only",
-        "z9hG4bK-g729-only",
+        call_id,
+        format!("z9hG4bK-{call_id}"),
         "bob-tag",
     )
-    .body(sdp.as_bytes().to_vec())
+    .body(sdp.into_bytes())
     .build()
-    .unwrap();
-    server.send(&invite, local);
+    .unwrap()
+}
+
+#[test]
+fn caller_offering_no_usable_codec_is_refused_with_488() {
+    let server = Server::new();
+    let handle = phone(fast_timers());
+    let local = handle.local_address();
+
+    // GSM (payload type 3) is a codec this phone does not have.
+    server.send(&invite_offering(&server, local, "gsm-only", "3"), local);
     let refused = server.response(488);
-    assert_eq!(refused.headers.get("call-id"), Some("g729-only"));
+    assert_eq!(refused.headers.get("call-id"), Some("gsm-only"));
+
+    // G.729 is there, so the same offer with it rings ...
+    server.send(&invite_offering(&server, local, "g729-rings", "18"), local);
+    server.response(180);
+    assert!(handle.send(UiCommand::Reject));
+    server.response(486);
+    wait_for(&handle, Event::Ended(EndReason::Rejected(486)));
+
+    // ... unless the user has switched it off.
+    assert!(handle.send(UiCommand::Codecs(vec![Codec::Pcmu, Codec::Pcma])));
+    std::thread::sleep(Duration::from_millis(150));
+    server.send(&invite_offering(&server, local, "g729-off", "18"), local);
+    let refused = server.response(488);
+    assert_eq!(refused.headers.get("call-id"), Some("g729-off"));
 }
 
 #[test]

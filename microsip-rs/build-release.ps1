@@ -205,7 +205,7 @@ PCMU/RTP audio in both directions.
 
 LIMITATIONS
 -----------
-UDP only; one call at a time; one account. Codecs: G.711 (PCMU, PCMA).
+UDP only; two lines; one account. Codecs: G.711 (PCMU, PCMA), G.722, Opus, G.729.
 Behind a router the phone registers the public address the server
 reports and sends keep-alives, but it uses no STUN: audio works only if
 the server sends it back to where the phone's audio comes from.

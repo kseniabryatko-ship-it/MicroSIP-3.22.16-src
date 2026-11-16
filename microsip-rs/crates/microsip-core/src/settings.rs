@@ -57,6 +57,9 @@ pub struct Settings {
     /// Ctrl+Alt+PageUp answers and Ctrl+Alt+PageDown hangs up, in any program.
     pub hotkeys: bool,
     pub light_theme: bool,
+    /// Codecs in use, in the order of preference: names separated by
+    /// commas (`PCMU,PCMA,G722,opus,G729`). Read with `Codec::parse_list`.
+    pub codecs: String,
 }
 
 impl Default for Settings {
@@ -87,6 +90,7 @@ impl Default for Settings {
             close_to_tray: true,
             hotkeys: true,
             light_theme: false,
+            codecs: crate::codec::Codec::format_list(&crate::codec::Codec::PREFERRED),
         }
     }
 }
@@ -132,6 +136,7 @@ impl Settings {
                 "close_to_tray" => settings.close_to_tray = value != "0",
                 "hotkeys" => settings.hotkeys = value != "0",
                 "light_theme" => settings.light_theme = value == "1",
+                "codecs" => settings.codecs = value,
                 "auto_answer_delay" => {
                     if let Some(delay) = value.parse::<u32>().ok().filter(|delay| *delay <= 60) {
                         settings.auto_answer_delay = delay;
@@ -204,6 +209,7 @@ impl Settings {
             ("close_to_tray", &close_to_tray),
             ("hotkeys", &hotkeys),
             ("light_theme", &light_theme),
+            ("codecs", &self.codecs),
         ] {
             text.push_str(key);
             text.push('=');
@@ -320,6 +326,7 @@ mod tests {
             close_to_tray: false,
             hotkeys: false,
             light_theme: true,
+            codecs: "opus,G722,PCMA".to_owned(),
         }
     }
 
@@ -358,7 +365,7 @@ mod tests {
              do_not_disturb=1\nauto_answer=1\nauto_answer_delay=5\n\
              forward=1\nforward_to=4011\n\
              ring_speaker=Speakers (Realtek)\nringtone=C:\\Sounds\\ring.wav\n\
-             close_to_tray=0\nhotkeys=0\nlight_theme=1\n"
+             close_to_tray=0\nhotkeys=0\nlight_theme=1\ncodecs=opus,G722,PCMA\n"
         );
         // No line holds the password itself; `save_password` and
         // `password_protected` are different keys.

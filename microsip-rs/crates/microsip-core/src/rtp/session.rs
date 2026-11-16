@@ -1,4 +1,5 @@
-use crate::codec::Codec;
+use crate::codec::{Codec, VoiceDecoder};
+use crate::resample::Resampler;
 use crate::rtp::order::{OrderStats, PacketOrderer, Released};
 use crate::rtp::{PcmuStream, RtpError, RtpPacket};
 use std::error::Error;
@@ -84,6 +85,8 @@ pub struct RtpSessionConfig {
     receive_timeout: Duration,
     dtmf_payload_type: Option<u8>,
     codec: Codec,
+    payload_type: Option<u8>,
+    receive_types: Vec<(u8, Codec)>,
 }
 
 impl RtpSessionConfig {
@@ -95,6 +98,8 @@ impl RtpSessionConfig {
             receive_timeout: DEFAULT_RECEIVE_TIMEOUT,
             dtmf_payload_type: None,
             codec: Codec::Pcmu,
+            payload_type: None,
+            receive_types: Vec::new(),
         }
     }
 
@@ -110,12 +115,33 @@ impl RtpSessionConfig {
         self
     }
 
-    /// The codec agreed in SDP for the voice this session sends. Received
-    /// voice is decoded by its own payload type, whichever of the supported
-    /// codecs it is.
+    /// The codec agreed in SDP for the voice this session sends. Decoded
+    /// sound comes out at this codec's sample rate. Received voice is
+    /// decoded by its own payload type: this codec's, any given with
+    /// [`RtpSessionConfig::with_receive_types`], and the fixed numbers of
+    /// G.711, G.722 and G.729.
     pub fn with_codec(mut self, codec: Codec) -> Self {
         self.codec = codec;
         self
+    }
+
+    /// The payload type agreed for the codec, where it is not the codec's
+    /// usual one (Opus has no fixed number).
+    pub fn with_payload_type(mut self, payload_type: u8) -> Self {
+        self.payload_type = Some(payload_type);
+        self
+    }
+
+    /// Payload types the other side may send besides the agreed one, as
+    /// listed in its SDP.
+    pub fn with_receive_types(mut self, types: Vec<(u8, Codec)>) -> Self {
+        self.receive_types = types;
+        self
+    }
+
+    /// Rate of the sound this session hands out.
+    pub fn decoded_sample_rate(&self) -> u32 {
+        self.codec.sample_rate()
     }
 
     pub fn with_receive_timeout(mut self, receive_timeout: Duration) -> Self {
@@ -181,11 +207,16 @@ impl RtpSession {
             receive_timeout,
             dtmf_payload_type,
             codec,
+            payload_type,
+            receive_types,
         } = config;
 
+        let payload_type = payload_type.unwrap_or(codec.payload_type());
         let mut pcmu_stream = PcmuStream::new(ssrc, source_sample_rate)?;
-        pcmu_stream.set_dtmf_payload_type(dtmf_payload_type);
         pcmu_stream.set_codec(codec);
+        pcmu_stream.set_payload_type(payload_type);
+        pcmu_stream.set_dtmf_payload_type(dtmf_payload_type);
+        let receiving = Receiving::new(codec, payload_type, receive_types);
         let control = Arc::new(SenderControl::default());
         let sender_control = Arc::clone(&control);
 
@@ -226,11 +257,14 @@ impl RtpSession {
             run_receiver(
                 receiver_socket,
                 expected_source,
-                decoded_sender,
                 receiver_stop,
                 receiver_counter,
                 receiver_order_stats,
-                sink,
+                match sink {
+                    Some(sink) => Output::Sink(sink),
+                    None => Output::Channel(decoded_sender),
+                },
+                receiving,
             )
         });
 
@@ -408,19 +442,27 @@ fn run_sender(
     Ok(())
 }
 
+/// Where the receiver hands the decoded sound.
+enum Output {
+    /// Kept until fetched with [`RtpSession::try_receive_decoded`].
+    Channel(mpsc::Sender<Vec<f32>>),
+    /// Handed over at once, on the receiver thread.
+    Sink(DecodedSink),
+}
+
 fn run_receiver(
     socket: UdpSocket,
     expected_source: Option<SocketAddr>,
-    decoded_sender: mpsc::Sender<Vec<f32>>,
     stop: Arc<AtomicBool>,
     received_packets: Arc<AtomicU64>,
     order_stats: Arc<Mutex<OrderStats>>,
-    mut sink: Option<DecodedSink>,
+    mut output: Output,
+    mut receiving: Receiving,
 ) -> Result<(), RtpSessionError> {
     let mut buffer = [0_u8; 65_535];
-    let mut orderer = PacketOrderer::<Vec<f32>>::default();
-    // The last packet played, for covering a lost one.
-    let mut previous: Option<Vec<f32>> = None;
+    // Packets wait here still encoded: G.722, G.729 and Opus must be
+    // decoded in the order they were sent.
+    let mut orderer = PacketOrderer::<(u8, Vec<u8>)>::default();
 
     while !stop.load(Ordering::Acquire) {
         match socket.recv_from(&mut buffer) {
@@ -432,39 +474,34 @@ fn run_receiver(
                 }
 
                 // One odd datagram must not end the audio of the whole call:
-                // anything that is not a G.711 voice packet is skipped. Servers
-                // send DTMF events (payload 101) and comfort noise (13) on the
-                // same port, and may use 10 or 30 ms packets instead of 20.
+                // anything that is not a voice packet of a known codec is
+                // skipped. Servers send DTMF events (payload 101) and comfort
+                // noise (13) on the same port, and may use 10 or 30 ms
+                // packets instead of 20.
                 let Ok(packet) = RtpPacket::parse(&buffer[..length]) else {
                     continue;
                 };
 
-                let Some(codec) = Codec::from_payload_type(packet.payload_type) else {
-                    continue;
-                };
-                if packet.payload.is_empty() {
+                if !receiving.knows(packet.payload_type) || packet.payload.is_empty() {
                     continue;
                 }
 
                 received_packets.fetch_add(1, Ordering::Relaxed);
 
-                let samples = codec.decode(&packet.payload);
-                for released in orderer.push(packet.ssrc, packet.sequence_number, samples) {
+                let encoded = (packet.payload_type, packet.payload);
+                for released in orderer.push(packet.ssrc, packet.sequence_number, encoded) {
                     let samples = match released {
-                        Released::Packet(samples) => {
-                            previous = Some(samples.clone());
-                            samples
+                        Released::Packet((payload_type, payload)) => {
+                            receiving.decode(payload_type, &payload)
                         }
-                        // Cover one lost packet with a quieter copy of the
-                        // packet before it; a longer loss becomes silence.
-                        Released::Lost => match previous.take() {
-                            Some(last) => last.iter().map(|sample| sample * 0.5).collect(),
-                            None => continue,
-                        },
+                        Released::Lost => receiving.lost(),
                     };
-                    match sink.as_mut() {
-                        Some(sink) => sink(samples),
-                        None => decoded_sender
+                    let Some(samples) = samples.filter(|samples| !samples.is_empty()) else {
+                        continue;
+                    };
+                    match &mut output {
+                        Output::Sink(sink) => sink(samples),
+                        Output::Channel(sender) => sender
                             .send(samples)
                             .map_err(|_| RtpSessionError::DecodedChannelDisconnected)?,
                     }
@@ -490,6 +527,109 @@ fn run_receiver(
     }
 
     Ok(())
+}
+
+/// One codec being received: its payload type, its decoder, and a
+/// converter when its sound is not at the session's rate.
+struct Decoding {
+    payload_type: u8,
+    decoder: VoiceDecoder,
+    resampler: Option<Resampler>,
+}
+
+/// The receiving side's codecs. Each payload type gets its decoder when
+/// its first packet arrives; all sound leaves at one sample rate.
+struct Receiving {
+    types: Vec<(u8, Codec)>,
+    rate: u32,
+    decoders: Vec<Decoding>,
+    /// Payload type of the packet decoded last.
+    last: Option<u8>,
+    /// The sound of that packet, for covering one lost packet where the
+    /// codec cannot do it itself.
+    previous: Option<Vec<f32>>,
+}
+
+impl Receiving {
+    fn new(codec: Codec, payload_type: u8, listed: Vec<(u8, Codec)>) -> Self {
+        let mut types = vec![(payload_type, codec)];
+        let fixed = Codec::PREFERRED
+            .into_iter()
+            .filter(|codec| codec.has_fixed_payload_type())
+            .map(|codec| (codec.payload_type(), codec));
+        // What was agreed comes first, then what the other side listed,
+        // then the numbers the standard fixes.
+        for entry in listed.into_iter().chain(fixed) {
+            if !types.iter().any(|(known, _)| *known == entry.0) {
+                types.push(entry);
+            }
+        }
+        Self {
+            types,
+            rate: codec.sample_rate(),
+            decoders: Vec::new(),
+            last: None,
+            previous: None,
+        }
+    }
+
+    fn knows(&self, payload_type: u8) -> bool {
+        self.types.iter().any(|(known, _)| *known == payload_type)
+    }
+
+    fn decoding(&mut self, payload_type: u8) -> Option<&mut Decoding> {
+        if let Some(index) = self
+            .decoders
+            .iter()
+            .position(|decoding| decoding.payload_type == payload_type)
+        {
+            return self.decoders.get_mut(index);
+        }
+        let codec = self
+            .types
+            .iter()
+            .find(|(known, _)| *known == payload_type)
+            .map(|(_, codec)| *codec)?;
+        let resampler = if codec.sample_rate() == self.rate {
+            None
+        } else {
+            Some(Resampler::new(codec.sample_rate(), self.rate)?)
+        };
+        self.decoders.push(Decoding {
+            payload_type,
+            decoder: VoiceDecoder::new(codec),
+            resampler,
+        });
+        self.decoders.last_mut()
+    }
+
+    fn decode(&mut self, payload_type: u8, payload: &[u8]) -> Option<Vec<f32>> {
+        let decoding = self.decoding(payload_type)?;
+        let mut samples = decoding.decoder.decode(payload);
+        if let Some(resampler) = decoding.resampler.as_mut() {
+            samples = resampler.push(&samples);
+        }
+        self.last = Some(payload_type);
+        self.previous = Some(samples.clone());
+        Some(samples)
+    }
+
+    /// Sound for the place of one lost packet. A codec that keeps state
+    /// makes it up from what came before; for G.711 it is a quieter copy
+    /// of the packet before, once, and a longer loss becomes silence.
+    fn lost(&mut self) -> Option<Vec<f32>> {
+        let payload_type = self.last?;
+        let decoding = self.decoding(payload_type)?;
+        let frame = decoding.decoder.codec().frame_samples();
+        if let Some(mut made) = decoding.decoder.conceal(frame) {
+            if let Some(resampler) = decoding.resampler.as_mut() {
+                made = resampler.push(&made);
+            }
+            return Some(made);
+        }
+        let last = self.previous.take()?;
+        Some(last.iter().map(|sample| sample * 0.5).collect())
+    }
 }
 
 #[cfg(test)]
@@ -761,6 +901,74 @@ mod tests {
         assert!(rest[..9].iter().all(|packet| packet.payload_type == 101));
         assert!(loud(&rest[11]));
         session.shutdown().expect("session should stop cleanly");
+    }
+
+    #[test]
+    fn receiver_knows_the_agreed_the_listed_and_the_fixed_payload_types() {
+        let receiving = Receiving::new(Codec::G722, 9, vec![(107, Codec::Opus)]);
+        for known in [9, 107, 0, 8, 18] {
+            assert!(receiving.knows(known), "{known}");
+        }
+        // Keypad events, comfort noise, GSM and Opus's usual number, which
+        // this call did not agree on.
+        for unknown in [101, 13, 3, 111] {
+            assert!(!receiving.knows(unknown), "{unknown}");
+        }
+        // A number the other side gave another meaning keeps that meaning.
+        let receiving = Receiving::new(Codec::Opus, 96, vec![(9, Codec::G722)]);
+        assert_eq!(receiving.types[0], (96, Codec::Opus));
+        assert_eq!(receiving.rate, 16_000);
+    }
+
+    #[test]
+    fn every_received_codec_comes_out_at_the_calls_sample_rate() {
+        // The call agreed on G.722 (16 kHz); PCMU arrives all the same.
+        let mut receiving = Receiving::new(Codec::G722, 9, Vec::new());
+        let mut wide = crate::codec::VoiceEncoder::new(Codec::G722);
+        let own = receiving.decode(9, &wide.encode(&[0.2; 320])).unwrap();
+        assert_eq!(own.len(), 320);
+
+        let mut narrow_total = 0;
+        for _ in 0..10 {
+            let narrow = receiving
+                .decode(0, &Codec::Pcmu.encode(&[0.2; 160]))
+                .unwrap();
+            narrow_total += narrow.len();
+        }
+        // Ten 8 kHz packets are ten 16 kHz packets, give or take the
+        // converter's delay.
+        assert!((3_100..=3_200).contains(&narrow_total), "{narrow_total}");
+        assert!(receiving.decode(101, &[1, 2, 3, 4]).is_none());
+    }
+
+    #[test]
+    fn lost_packets_are_covered_as_each_codec_allows() {
+        // G.711: one quieter copy of the packet before, then nothing.
+        let mut receiving = Receiving::new(Codec::Pcmu, 0, Vec::new());
+        assert!(receiving.lost().is_none());
+        receiving.decode(0, &Codec::Pcmu.encode(&[0.5; 160]));
+        let cover = receiving.lost().expect("one packet is covered");
+        assert_eq!(cover.len(), 160);
+        assert!(cover.iter().all(|sample| (sample - 0.25).abs() < 0.02));
+        assert!(receiving.lost().is_none());
+
+        // G.729 makes the missing sound up itself, packet after packet.
+        let mut receiving = Receiving::new(Codec::G729, 18, Vec::new());
+        let mut encoder = crate::codec::VoiceEncoder::new(Codec::G729);
+        for frame in 0..25 {
+            let tone: Vec<f32> = (0..160)
+                .map(|index| {
+                    let time = (frame * 160 + index) as f32 / 8_000.0;
+                    0.4 * (std::f32::consts::TAU * 440.0 * time).sin()
+                })
+                .collect();
+            let sound = receiving.decode(18, &encoder.encode(&tone)).unwrap();
+            assert_eq!(sound.len(), 160);
+        }
+        let first = receiving.lost().expect("concealed");
+        let second = receiving.lost().expect("concealed again");
+        assert_eq!((first.len(), second.len()), (160, 160));
+        assert!(first.iter().any(|sample| sample.abs() > 0.05));
     }
 
     #[test]

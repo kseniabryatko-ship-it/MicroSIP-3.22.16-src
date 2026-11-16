@@ -98,6 +98,11 @@ pub trait Media {
     /// Called before `start`; without it PCMU is used.
     fn set_codec(&mut self, _codec: Codec) {}
 
+    /// Tells the media the payload type agreed for that codec and what
+    /// else the other side listed and so may send. Called after
+    /// [`Media::set_codec`].
+    fn set_payload_types(&mut self, _payload_type: u8, _listed: Vec<(u8, Codec)>) {}
+
     /// Tells the media which telephone-event payload type the other side
     /// agreed to (`None`: digits go as tones in the voice). Called before
     /// `start`.
@@ -157,6 +162,206 @@ impl Media for NullMedia {
 
     fn stop(&mut self) {
         self.socket = None;
+    }
+}
+
+/// What a [`ToneMedia`] heard during its last call.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ToneReport {
+    /// Pitch of the sound heard in the last second, in Hz.
+    pub frequency: f32,
+    /// Its level: the peak of a steady tone, 0 for silence.
+    pub level: f32,
+    /// Seconds of sound received in all.
+    pub seconds: f32,
+}
+
+/// The last second of what was heard, for [`ToneReport`].
+#[derive(Default)]
+struct ToneMeter {
+    rate: u32,
+    recent: VecDeque<f32>,
+    total: u64,
+}
+
+impl ToneMeter {
+    fn push(&mut self, samples: &[f32], rate: u32) {
+        self.rate = rate;
+        self.total += samples.len() as u64;
+        self.recent.extend(samples.iter().copied());
+        let excess = self.recent.len().saturating_sub(rate as usize);
+        self.recent.drain(..excess);
+    }
+
+    fn report(&self) -> ToneReport {
+        if self.rate == 0 || self.recent.is_empty() {
+            return ToneReport::default();
+        }
+        let count = self.recent.len() as f32;
+        let power: f32 = self.recent.iter().map(|sample| sample * sample).sum();
+        // Each cycle of a tone crosses zero upwards once.
+        let crossings = self
+            .recent
+            .iter()
+            .zip(self.recent.iter().skip(1))
+            .filter(|(before, after)| **before < 0.0 && **after >= 0.0)
+            .count();
+        ToneReport {
+            frequency: crossings as f32 * self.rate as f32 / count,
+            level: (2.0 * power / count).sqrt(),
+            seconds: self.total as f32 / self.rate as f32,
+        }
+    }
+}
+
+/// Media without sound devices that sends a steady tone and measures the
+/// tone it hears. With two of them a call's whole audio path, codec
+/// included, can be checked on a machine that has no sound card.
+pub struct ToneMedia {
+    frequency: f32,
+    socket: Option<UdpSocket>,
+    codec: Codec,
+    payload_type: Option<u8>,
+    listed: Vec<(u8, Codec)>,
+    dtmf_payload_type: Option<u8>,
+    session: Option<RtpSession>,
+    feeder: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    meter: Arc<Mutex<ToneMeter>>,
+    report: Arc<Mutex<ToneReport>>,
+    next_ssrc: u32,
+}
+
+impl ToneMedia {
+    /// `frequency` is the tone to send, in Hz. What was heard is written to
+    /// `report` when a call's audio stops.
+    pub fn new(frequency: f32, report: Arc<Mutex<ToneReport>>) -> Self {
+        Self {
+            frequency,
+            socket: None,
+            codec: Codec::Pcmu,
+            payload_type: None,
+            listed: Vec::new(),
+            dtmf_payload_type: None,
+            session: None,
+            feeder: None,
+            meter: Arc::default(),
+            report,
+            next_ssrc: 0x7000_0000,
+        }
+    }
+}
+
+impl Media for ToneMedia {
+    fn prepare(&mut self, ip: IpAddr) -> Result<SocketAddr, MediaError> {
+        let socket = UdpSocket::bind(SocketAddr::new(ip, 0))?;
+        let address = socket.local_addr()?;
+        self.socket = Some(socket);
+        Ok(address)
+    }
+
+    fn start(&mut self, remote: SocketAddr) -> Result<(), MediaError> {
+        let socket = self
+            .socket
+            .take()
+            .ok_or("media was not prepared before start")?;
+        let rate = self.codec.sample_rate();
+        let config = RtpSessionConfig::new(remote, rate)
+            .with_dtmf_payload_type(self.dtmf_payload_type)
+            .with_codec(self.codec)
+            .with_payload_type(self.payload_type.unwrap_or(self.codec.payload_type()))
+            .with_receive_types(self.listed.clone());
+        if let Ok(mut meter) = self.meter.lock() {
+            *meter = ToneMeter::default();
+        }
+        let meter = Arc::clone(&self.meter);
+        self.next_ssrc = self.next_ssrc.wrapping_add(0x0101_0101).max(1);
+        let session = RtpSession::from_socket_with_sink(
+            socket,
+            config,
+            self.next_ssrc,
+            Some(Box::new(move |samples| {
+                if let Ok(mut meter) = meter.lock() {
+                    meter.push(&samples, rate);
+                }
+            })),
+        )?;
+        let input = session.pcm_input().ok_or("RTP session has no input")?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let frequency = self.frequency;
+        let feeder = thread::spawn(move || {
+            let frame = rate as usize / 50;
+            let started = Instant::now();
+            let mut position = 0_u64;
+            while !stopped.load(Ordering::Acquire) {
+                // One 20 ms block for every 20 ms that has passed.
+                while position * 1_000 / u64::from(rate) < started.elapsed().as_millis() as u64 {
+                    let block: Vec<f32> = (position..position + frame as u64)
+                        .map(|index| {
+                            let time = index as f32 / rate as f32;
+                            0.4 * (std::f32::consts::TAU * frequency * time).sin()
+                        })
+                        .collect();
+                    position += frame as u64;
+                    let _ = input.try_send(block);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        self.session = Some(session);
+        self.feeder = Some((stop, feeder));
+        Ok(())
+    }
+
+    fn pump(&mut self) -> Result<(), MediaError> {
+        Ok(())
+    }
+
+    fn stats(&self) -> MediaStats {
+        self.session
+            .as_ref()
+            .map(|session| MediaStats {
+                sent_packets: session.sent_packets(),
+                received_packets: session.received_packets(),
+            })
+            .unwrap_or_default()
+    }
+
+    fn set_codec(&mut self, codec: Codec) {
+        self.codec = codec;
+        self.payload_type = None;
+        self.listed.clear();
+    }
+
+    fn set_payload_types(&mut self, payload_type: u8, listed: Vec<(u8, Codec)>) {
+        self.payload_type = Some(payload_type);
+        self.listed = listed;
+    }
+
+    fn set_dtmf_payload_type(&mut self, payload_type: Option<u8>) {
+        self.dtmf_payload_type = payload_type;
+    }
+
+    fn send_dtmf(&mut self, digit: char) -> Result<(), MediaError> {
+        match self.session.as_ref() {
+            Some(session) if session.send_dtmf(digit) => Ok(()),
+            Some(_) => Err(format!("'{digit}' is not a keypad digit").into()),
+            None => Err("no call is connected".into()),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.socket = None;
+        if let Some((stop, feeder)) = self.feeder.take() {
+            stop.store(true, Ordering::Release);
+            let _ = feeder.join();
+        }
+        if let Some(mut session) = self.session.take() {
+            let _ = session.shutdown();
+            if let (Ok(meter), Ok(mut report)) = (self.meter.lock(), self.report.lock()) {
+                *report = meter.report();
+            }
+        }
     }
 }
 
@@ -382,6 +587,10 @@ pub struct AudioMedia {
     /// This line's number among the lines sharing `controls`.
     line: Option<usize>,
     codec: Codec,
+    /// Payload type agreed for `codec`; `None` is the codec's usual one.
+    payload_type: Option<u8>,
+    /// What else the other side may send.
+    listed: Vec<(u8, Codec)>,
     /// Playback reserve the last call ended with; the next call on the
     /// same connection starts from it instead of learning it again.
     reserve_ms: u32,
@@ -551,7 +760,13 @@ impl Media for AudioMedia {
         let (conference_in, conference_out) = (self.controls.clone(), self.controls.clone());
         let config = RtpSessionConfig::new(remote, format.sample_rate)
             .with_dtmf_payload_type(self.dtmf_payload_type)
-            .with_codec(self.codec);
+            .with_codec(self.codec)
+            .with_payload_type(self.payload_type.unwrap_or(self.codec.payload_type()))
+            .with_receive_types(self.listed.clone());
+        // The sound of this call: 8 kHz for G.711 and G.729, 16 kHz for
+        // G.722 and Opus.
+        let heard_rate = config.decoded_sample_rate();
+        let mut to_conference = Resampler::new(heard_rate, PCMU_CLOCK_RATE);
         self.next_ssrc = self.next_ssrc.wrapping_add(0x0101_0101).max(1);
         let session = RtpSession::from_socket_with_sink(
             socket,
@@ -560,9 +775,15 @@ impl Media for AudioMedia {
             Some(Box::new(move |samples| {
                 if conference_in.is_conference()
                     && let Some(heard) = heard.as_ref()
+                    && let Some(to_conference) = to_conference.as_mut()
                     && let Ok(mut heard) = heard.lock()
                 {
-                    heard.extend(samples.iter().copied());
+                    // The lines of a conference meet at 8 kHz.
+                    if heard_rate == PCMU_CLOCK_RATE {
+                        heard.extend(samples.iter().copied());
+                    } else {
+                        heard.extend(to_conference.push(&samples));
+                    }
                     if heard.len() > HEARD_LIMIT {
                         let excess = heard.len() - HEARD_LIMIT;
                         heard.drain(..excess);
@@ -571,10 +792,10 @@ impl Media for AudioMedia {
                 if let Ok(mut tap) = tap_remote.lock()
                     && let Some(input) = tap.as_mut()
                 {
-                    input.push(&samples, PCMU_CLOCK_RATE);
+                    input.push(&samples, heard_rate);
                 }
                 // A failure here means the speaker is gone; the call ends soon.
-                let _ = to_speaker.push(&samples, PCMU_CLOCK_RATE);
+                let _ = to_speaker.push(&samples, heard_rate);
             })),
         )?;
 
@@ -662,6 +883,13 @@ impl Media for AudioMedia {
 
     fn set_codec(&mut self, codec: Codec) {
         self.codec = codec;
+        self.payload_type = None;
+        self.listed.clear();
+    }
+
+    fn set_payload_types(&mut self, payload_type: u8, listed: Vec<(u8, Codec)>) {
+        self.payload_type = Some(payload_type);
+        self.listed = listed;
     }
 
     fn set_dtmf_payload_type(&mut self, payload_type: Option<u8>) {

@@ -4,6 +4,7 @@
 //! separate from the drawing code so it can be tested without a window.
 
 use crate::call_runner::{EndReason, Event};
+use crate::codec::Codec;
 use std::net::SocketAddr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -43,6 +44,7 @@ pub struct CallView {
     last_end: Option<EndReason>,
     held: bool,
     remote_held: bool,
+    codec: Option<Codec>,
 }
 
 impl CallView {
@@ -68,6 +70,11 @@ impl CallView {
 
     pub fn last_end(&self) -> Option<EndReason> {
         self.last_end
+    }
+
+    /// The codec of the call's audio, once it has started.
+    pub fn codec(&self) -> Option<Codec> {
+        self.codec
     }
 
     /// The connected call is on hold by this phone.
@@ -150,6 +157,7 @@ impl CallView {
                 }
             }
             Event::Established => self.phase = Phase::Connected,
+            Event::Codec(codec) => self.codec = Some(*codec),
             Event::MediaStats { sent, received } => self.stats = Some((*sent, *received)),
             Event::Hold(held) => self.held = *held,
             Event::RemoteHold(held) => self.remote_held = *held,
@@ -158,6 +166,7 @@ impl CallView {
                 self.last_end = Some(*reason);
                 self.held = false;
                 self.remote_held = false;
+                self.codec = None;
             }
             Event::AudioQuality(_)
             | Event::Recording(_)

@@ -14,7 +14,6 @@ use std::collections::VecDeque;
 use std::f32::consts::PI;
 
 const SAMPLE_RATE: f32 = 8_000.0;
-const FRAME_SAMPLES: usize = 160;
 /// Length of a digit: 8 frames of 20 ms.
 const TONE_FRAMES: u8 = 8;
 /// The final event packet is sent this many times in all (RFC 4733, 2.5.1.4).
@@ -79,7 +78,8 @@ pub enum DtmfFrame {
         /// RTP timestamp of the start of the digit, the same for all its packets.
         timestamp: u32,
     },
-    /// These samples (8 kHz) replace the microphone in the voice packet.
+    /// These samples (at the stream's sound rate) replace the microphone
+    /// in the voice packet.
     Tone(Vec<f32>),
     /// Silence replaces the microphone, to separate two in-band digits.
     Silence,
@@ -93,20 +93,41 @@ struct Active {
     start_timestamp: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DtmfSender {
     /// Negotiated telephone-event payload type; `None` sends tones in-band.
     payload_type: Option<u8>,
+    /// RTP timestamp units in one 20 ms frame of the stream.
+    frame_ticks: u16,
+    /// Rate of the sound an in-band tone is made at.
+    sample_rate: u32,
     queue: VecDeque<u8>,
     active: Option<Active>,
     gap_left: u8,
 }
 
+impl Default for DtmfSender {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
 impl DtmfSender {
+    /// A sender for an 8 kHz stream (G.711).
     pub fn new(payload_type: Option<u8>) -> Self {
+        Self::for_stream(payload_type, SAMPLE_RATE as u32, SAMPLE_RATE as u32)
+    }
+
+    /// A sender for a stream whose RTP clock runs at `clock_rate` and whose
+    /// sound is at `sample_rate`; the two differ for G.722 and Opus.
+    pub fn for_stream(payload_type: Option<u8>, clock_rate: u32, sample_rate: u32) -> Self {
         Self {
             payload_type,
-            ..Self::default()
+            frame_ticks: (clock_rate / 50) as u16,
+            sample_rate,
+            queue: VecDeque::new(),
+            active: None,
+            gap_left: 0,
         }
     }
 
@@ -158,7 +179,7 @@ impl DtmfSender {
                 // The duration grows with each packet and stops at the full
                 // length, which the end packets repeat.
                 let frames = u16::from((frame + 1).min(TONE_FRAMES));
-                let duration = frames * FRAME_SAMPLES as u16;
+                let duration = frames * self.frame_ticks;
                 let end = frame + 1 >= TONE_FRAMES;
                 let flags = if end { 0x80 } else { 0 } | EVENT_VOLUME;
                 let [high, low] = duration.to_be_bytes();
@@ -169,7 +190,7 @@ impl DtmfSender {
                     timestamp: start_timestamp,
                 }
             }
-            None => DtmfFrame::Tone(tone(code, frame)),
+            None => DtmfFrame::Tone(tone(code, frame, self.sample_rate)),
         };
 
         let last = match self.payload_type {
@@ -186,14 +207,16 @@ impl DtmfSender {
 
 /// One frame of the dual tone, continuous in phase from frame to frame and
 /// faded in at the start and out at the end of the digit.
-fn tone(code: u8, frame: u8) -> Vec<f32> {
+fn tone(code: u8, frame: u8, sample_rate: u32) -> Vec<f32> {
     let (low, high) = frequencies(code);
-    let fade = 40.0; // 5 ms
-    let total = f32::from(TONE_FRAMES) * FRAME_SAMPLES as f32;
-    (0..FRAME_SAMPLES)
+    let rate = sample_rate as f32;
+    let frame_samples = (sample_rate / 50) as usize;
+    let fade = rate * 0.005; // 5 ms
+    let total = f32::from(TONE_FRAMES) * frame_samples as f32;
+    (0..frame_samples)
         .map(|index| {
-            let position = f32::from(frame) * FRAME_SAMPLES as f32 + index as f32;
-            let time = position / SAMPLE_RATE;
+            let position = f32::from(frame) * frame_samples as f32 + index as f32;
+            let time = position / rate;
             let envelope = (position / fade)
                 .min((total - 1.0 - position) / fade)
                 .clamp(0.0, 1.0);
