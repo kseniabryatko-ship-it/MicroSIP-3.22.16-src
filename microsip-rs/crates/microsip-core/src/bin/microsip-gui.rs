@@ -19,15 +19,22 @@ use microsip_core::recording::recording_file_name;
 use microsip_core::registration::{Account, RegistrationState};
 use microsip_core::secret;
 use microsip_core::settings::{self, Settings, default_recordings_dir};
+use microsip_core::tones::Melody;
 use microsip_core::transport::{local_ip_towards, resolve_socket_address};
+use microsip_core::winshell::{self, Shell, ShellOptions};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 const LOG_LIMIT: usize = 1_000;
+const WINDOW_TITLE: &str = "MicroSIP Rust";
+/// Contacts offered under the number while it is typed.
+const SUGGESTIONS: usize = 4;
 const KEYPAD: [&str; 4] = ["123", "456", "789", "*0#"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +74,24 @@ enum Action {
     Erase,
     /// Opens a file or folder with the program Windows uses for it.
     Open(PathBuf),
+    /// Puts a contact's number into the number field.
+    Suggest(String),
+    /// The ring device or the melody file was changed.
+    RingChanged,
+    /// Shows a system dialog; its answer is taken when it closes.
+    Browse(Dialog),
+    Autostart(bool),
+    /// A box of the "Window" settings was changed.
+    WindowChanged,
+}
+
+/// What a system dialog was opened for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dialog {
+    RecordingsFolder,
+    Ringtone,
+    ImportContacts,
+    ExportContacts,
 }
 
 /// The call in progress, for the call list.
@@ -127,9 +152,26 @@ struct PhoneWindow {
     speakers: Vec<String>,
     controls: AudioControls,
 
+    /// Device and melody of the incoming ring.
+    ring_speaker: String,
+    ringtone: String,
+
     // Recording.
     record_calls: bool,
     recordings_dir: String,
+
+    // The window among other programs.
+    shell: Option<Shell>,
+    close_to_tray: bool,
+    hotkeys: bool,
+    light_theme: bool,
+    autostart: bool,
+    /// Started with Windows: the window goes out of the way once drawn.
+    start_hidden: bool,
+    /// A system dialog that is open now, and what it answers.
+    dialog: Option<(Dialog, Receiver<Option<PathBuf>>)>,
+    /// The number dialled last, offered again by an empty "Call".
+    last_dialled: String,
 
     // Call handling.
     do_not_disturb: bool,
@@ -173,7 +215,7 @@ struct PhoneWindow {
 }
 
 impl PhoneWindow {
-    fn new() -> Self {
+    fn new(ctx: &egui::Context, start_hidden: bool) -> Self {
         let settings_path = settings::default_path();
         let sibling = |name: &str| settings_path.as_ref().map(|path| path.with_file_name(name));
         let history_path = sibling("history.tsv");
@@ -226,7 +268,37 @@ impl PhoneWindow {
             String::new()
         };
 
+        let last_dialled = history
+            .records()
+            .iter()
+            .find(|record| record.direction == Direction::Outgoing)
+            .map(|record| record.number.clone())
+            .unwrap_or_default();
+        let shell = {
+            let repaint = ctx.clone();
+            Shell::start(
+                ShellOptions {
+                    window_title: WINDOW_TITLE.to_owned(),
+                    tip: WINDOW_TITLE.to_owned(),
+                    menu_open: "Открыть".to_owned(),
+                    menu_exit: "Выход".to_owned(),
+                    hotkeys: saved.hotkeys,
+                },
+                move || repaint.request_repaint(),
+            )
+        };
+
         let mut window = Self {
+            ring_speaker: saved.ring_speaker.clone(),
+            ringtone: saved.ringtone.clone(),
+            shell,
+            close_to_tray: saved.close_to_tray,
+            hotkeys: saved.hotkeys,
+            light_theme: saved.light_theme,
+            autostart: winshell::autostart_enabled(),
+            start_hidden,
+            dialog: None,
+            last_dialled,
             server: saved.server.clone(),
             domain: saved.domain.clone(),
             user: saved.user.clone(),
@@ -290,6 +362,8 @@ impl PhoneWindow {
             window.log(note);
         }
         window.apply_audio_settings();
+        window.apply_ring_settings();
+        window.apply_theme(ctx);
 
         // Like MicroSIP: go online at once when an account is set up.
         if window.account_is_set() && !window.password.is_empty() {
@@ -342,6 +416,41 @@ impl PhoneWindow {
         self.controls.set_output_device(Some(self.speaker.clone()));
     }
 
+    /// Tells the sound where and what to ring. A melody that cannot be
+    /// played is reported and the built-in ring stays.
+    fn apply_ring_settings(&mut self) {
+        self.controls
+            .set_ring_device(Some(self.ring_speaker.clone()));
+        let file = self.ringtone.trim().to_owned();
+        if file.is_empty() {
+            return self.controls.set_ringtone(None);
+        }
+        match Melody::load(std::path::Path::new(&file)) {
+            Ok(melody) => self.controls.set_ringtone(Some(melody)),
+            Err(error) => {
+                self.controls.set_ringtone(None);
+                let reason = melody_error_text(&error);
+                self.error(format!("Мелодия звонка не подходит: {reason}"));
+            }
+        }
+    }
+
+    fn apply_theme(&self, ctx: &egui::Context) {
+        ctx.set_visuals(if self.light_theme {
+            let mut light = egui::Visuals::light();
+            // White text fields are lost on the almost white window.
+            light.extreme_bg_color = egui::Color32::from_gray(228);
+            light
+        } else {
+            egui::Visuals::dark()
+        });
+    }
+
+    /// A colour for marks and states that reads on the current theme.
+    fn tint(&self, on_dark: egui::Color32, on_light: egui::Color32) -> egui::Color32 {
+        if self.light_theme { on_light } else { on_dark }
+    }
+
     fn port(&self) -> u16 {
         self.local_port.trim().parse().unwrap_or(0)
     }
@@ -382,6 +491,11 @@ impl PhoneWindow {
             auto_answer_delay: self.auto_answer_delay,
             forward: self.forward,
             forward_to: self.forward_to.trim().to_owned(),
+            ring_speaker: self.ring_speaker.clone(),
+            ringtone: self.ringtone.trim().to_owned(),
+            close_to_tray: self.close_to_tray,
+            hotkeys: self.hotkeys,
+            light_theme: self.light_theme,
         };
         if current == self.saved {
             return;
@@ -457,6 +571,9 @@ impl PhoneWindow {
         handle.send(UiCommand::DoNotDisturb(self.do_not_disturb));
         handle.send(UiCommand::Forward(self.forward_target()));
         handle.send(UiCommand::Register(account));
+        if let Some(shell) = self.shell.as_ref() {
+            shell.watch_ringing(Some(handle.ringing_flag()));
+        }
         self.local = Some(local);
         self.handle = Some(handle);
         self.reset_lines();
@@ -464,6 +581,9 @@ impl PhoneWindow {
     }
 
     fn disconnect(&mut self) {
+        if let Some(shell) = self.shell.as_ref() {
+            shell.watch_ringing(None);
+        }
         if let Some(handle) = self.handle.take() {
             // Dropping the handle ends a call and removes the registration.
             drop(handle);
@@ -516,6 +636,13 @@ impl PhoneWindow {
         // Brackets, spaces and dashes of a pasted number are not dialled.
         let target = dialable(&target);
         if target.is_empty() {
+            // "Call" on an empty field brings back the last number; a
+            // second press dials it.
+            if !self.last_dialled.is_empty() && self.lines[self.at].view.can_dial() {
+                self.number = self.last_dialled.clone();
+                self.number_changed = true;
+                self.tab = Tab::Dialpad;
+            }
             return;
         }
         // During a call, a new one goes out on the free line; the phone
@@ -539,6 +666,7 @@ impl PhoneWindow {
         }
         self.last_error = None;
         self.number = target.clone();
+        self.last_dialled = target.clone();
         self.save_settings();
         let name = self.contacts.name_of(&target).unwrap_or("").to_owned();
         self.log(format!("Вызов {target}"));
@@ -571,6 +699,14 @@ impl PhoneWindow {
     }
 
     fn reject(&mut self) {
+        // As with answering, the ringing call may be on the other line.
+        if !self.lines[self.at].view.can_reject()
+            && let Some(line) = (0..LINES).find(|line| self.lines[*line].view.can_reject())
+        {
+            self.at = line;
+            self.send(UiCommand::SelectLine(line));
+            self.selected = line;
+        }
         if self.lines[self.at].view.can_reject() {
             self.send(UiCommand::Reject);
         }
@@ -948,6 +1084,177 @@ impl PhoneWindow {
                 }
             }
             Action::Open(path) => self.open(path),
+            Action::Suggest(number) => {
+                self.number = number;
+                self.number_changed = true;
+                self.focus_number = true;
+            }
+            Action::RingChanged => {
+                self.last_error = None;
+                self.apply_ring_settings();
+                self.save_settings();
+            }
+            Action::Browse(dialog) => self.browse(dialog),
+            Action::Autostart(on) => match winshell::set_autostart(on) {
+                Ok(()) => self.autostart = on,
+                Err(error) => {
+                    self.autostart = winshell::autostart_enabled();
+                    self.error(format!("Не удалось изменить автозапуск: {error}"));
+                }
+            },
+            Action::WindowChanged => self.save_settings(),
+        }
+    }
+
+    // ----- system dialogs, contacts as a table -----------------------------
+
+    /// Opens a system dialog without stopping the phone's window: the
+    /// dialog runs beside it and its answer is picked up when it closes.
+    fn browse(&mut self, dialog: Dialog) {
+        if self.dialog.is_some() {
+            return;
+        }
+        if !winshell::is_available() {
+            // No system dialogs here: the contacts table lives next to the
+            // settings, and folders and files are typed in by hand.
+            let table = self
+                .contacts_path
+                .as_ref()
+                .map(|path| path.with_file_name("contacts.csv"));
+            return match (dialog, table) {
+                (Dialog::ImportContacts, Some(path)) => self.import_contacts(&path),
+                (Dialog::ExportContacts, Some(path)) => self.export_contacts(&path),
+                _ => self.error("Выбор в окне доступен только в Windows — впишите путь вручную"),
+            };
+        }
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let chosen = match dialog {
+                Dialog::RecordingsFolder => winshell::pick_folder(),
+                Dialog::Ringtone => winshell::pick_open_file("wav"),
+                Dialog::ImportContacts => winshell::pick_open_file("csv"),
+                Dialog::ExportContacts => winshell::pick_save_file("contacts.csv", "csv"),
+            };
+            let _ = sender.send(chosen);
+        });
+        self.dialog = Some((dialog, receiver));
+    }
+
+    /// Takes the answer of a closed dialog.
+    fn poll_dialog(&mut self) {
+        let Some((dialog, receiver)) = self.dialog.as_ref() else {
+            return;
+        };
+        let dialog = *dialog;
+        let chosen = match receiver.try_recv() {
+            Ok(chosen) => chosen,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.dialog = None;
+        let Some(path) = chosen else {
+            return;
+        };
+        match dialog {
+            Dialog::RecordingsFolder => {
+                self.recordings_dir = path.display().to_string();
+                self.save_settings();
+            }
+            Dialog::Ringtone => {
+                self.ringtone = path.display().to_string();
+                self.last_error = None;
+                self.apply_ring_settings();
+                self.save_settings();
+            }
+            Dialog::ImportContacts => self.import_contacts(&path),
+            Dialog::ExportContacts => self.export_contacts(&path),
+        }
+    }
+
+    fn import_contacts(&mut self, path: &std::path::Path) {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let taken = self.contacts.import_csv(&bytes);
+                if taken > 0 {
+                    self.save_contacts();
+                    self.last_error = None;
+                    self.log(format!("Импорт контактов: {taken} из {}", path.display()));
+                } else {
+                    self.error(format!("В файле {} контактов не найдено", path.display()));
+                }
+            }
+            Err(error) => self.error(format!("Не удалось прочитать {}: {error}", path.display())),
+        }
+    }
+
+    fn export_contacts(&mut self, path: &std::path::Path) {
+        match std::fs::write(path, self.contacts.to_csv()) {
+            Ok(()) => {
+                self.last_error = None;
+                self.log(format!("Контакты сохранены в {}", path.display()));
+            }
+            Err(error) => self.error(format!("Не удалось записать {}: {error}", path.display())),
+        }
+    }
+
+    // ----- tray, keys, closing ---------------------------------------------
+
+    fn any_line(&self, phase: Phase) -> bool {
+        self.lines.iter().any(|line| line.view.phase() == phase)
+    }
+
+    /// Keys of the window itself and of the whole system, and what the
+    /// icon next to the clock asked for.
+    fn keys_and_tray(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let ringing = self.any_line(Phase::Incoming);
+        // Enter answers and Esc refuses a ringing call, unless a text is
+        // being typed somewhere.
+        if ringing && !ctx.wants_keyboard_input() {
+            if ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
+                actions.push(Action::Answer);
+            } else if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                actions.push(Action::Reject);
+            }
+        }
+        let Some(signals) = self.shell.as_ref().map(|shell| shell.signals().clone()) else {
+            return;
+        };
+        if signals.answer.swap(false, Ordering::Relaxed) && ringing {
+            actions.push(Action::Answer);
+        }
+        if signals.hangup.swap(false, Ordering::Relaxed) {
+            actions.push(if ringing {
+                Action::Reject
+            } else {
+                Action::Hangup
+            });
+        }
+        if signals.paste.swap(false, Ordering::Relaxed) {
+            self.tab = Tab::Dialpad;
+            self.settings_open = false;
+            self.log_open = false;
+            actions.push(Action::Paste);
+        }
+
+        // Closing the window only hides it; "Exit" of the icon's menu and a
+        // phone without an icon really close.
+        if ctx.input(|input| input.viewport().close_requested())
+            && self.close_to_tray
+            && !signals.exit.load(Ordering::Relaxed)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.save_settings();
+            if let Some(shell) = self.shell.as_ref() {
+                shell.hide_window();
+            }
+        }
+        // Started with Windows: out of the way once the window exists.
+        if self.start_hidden && ctx.cumulative_pass_nr() >= 3 {
+            self.start_hidden = false;
+            match self.shell.as_ref() {
+                Some(shell) if self.close_to_tray => shell.hide_window(),
+                _ => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            }
         }
     }
 
@@ -960,7 +1267,9 @@ impl PhoneWindow {
                     (egui::Color32::from_rgb(60, 180, 75), "В сети".to_owned())
                 }
                 Some(RegistrationState::Registering) => {
-                    (egui::Color32::YELLOW, "Подключение…".to_owned())
+                    let yellow =
+                        self.tint(egui::Color32::YELLOW, egui::Color32::from_rgb(200, 140, 0));
+                    (yellow, "Подключение…".to_owned())
                 }
                 Some(state @ RegistrationState::Failed(_)) => {
                     (egui::Color32::RED, registration_text(state))
@@ -1128,6 +1437,20 @@ impl PhoneWindow {
         }
         if idle && let Some(name) = self.contacts.name_of(&self.number) {
             ui.label(name.to_owned());
+        } else if idle && self.number.trim().chars().count() >= 2 {
+            // Contacts that fit what has been typed so far; a click puts
+            // the number into the field.
+            let found = self.contacts.matching(&self.number);
+            if !found.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    for contact in found.into_iter().take(SUGGESTIONS) {
+                        let label = format!("{} {}", contact.name, contact.number);
+                        if ui.small_button(label).clicked() {
+                            actions.push(Action::Suggest(contact.number.clone()));
+                        }
+                    }
+                });
+            }
         }
         ui.add_space(6.0);
 
@@ -1311,8 +1634,20 @@ impl PhoneWindow {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (index, record) in self.history.records().iter().enumerate() {
                 let (mark, color) = match record.direction {
-                    Direction::Outgoing => ("Исх.", egui::Color32::LIGHT_BLUE),
-                    Direction::Incoming => ("Вх.", egui::Color32::LIGHT_GREEN),
+                    Direction::Outgoing => (
+                        "Исх.",
+                        self.tint(
+                            egui::Color32::LIGHT_BLUE,
+                            egui::Color32::from_rgb(30, 90, 170),
+                        ),
+                    ),
+                    Direction::Incoming => (
+                        "Вх.",
+                        self.tint(
+                            egui::Color32::LIGHT_GREEN,
+                            egui::Color32::from_rgb(30, 130, 50),
+                        ),
+                    ),
                     Direction::Missed => ("Проп.", egui::Color32::RED),
                 };
                 // A contact saved later names old calls too.
@@ -1370,12 +1705,34 @@ impl PhoneWindow {
             ui.label("Номер");
             ui.add(egui::TextEdit::singleline(&mut self.new_contact_number).desired_width(110.0));
         });
-        if ui.button("Сохранить контакт").clicked() {
-            actions.push(Action::SaveContact(
-                self.new_contact_name.clone(),
-                self.new_contact_number.clone(),
-            ));
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Сохранить контакт").clicked() {
+                actions.push(Action::SaveContact(
+                    self.new_contact_name.clone(),
+                    self.new_contact_number.clone(),
+                ));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let free = self.dialog.is_none();
+                if ui
+                    .add_enabled(
+                        free && !self.contacts.is_empty(),
+                        egui::Button::new("Экспорт…"),
+                    )
+                    .on_hover_text("Сохранить контакты в файл CSV (открывается в Excel)")
+                    .clicked()
+                {
+                    actions.push(Action::Browse(Dialog::ExportContacts));
+                }
+                if ui
+                    .add_enabled(free, egui::Button::new("Импорт…"))
+                    .on_hover_text("Добавить контакты из файла CSV: имя и номер")
+                    .clicked()
+                {
+                    actions.push(Action::Browse(Dialog::ImportContacts));
+                }
+            });
+        });
         ui.separator();
         ui.add(
             egui::TextEdit::singleline(&mut self.contact_search)
@@ -1418,115 +1775,200 @@ impl PhoneWindow {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.heading("Аккаунт");
-                egui::Grid::new("account").num_columns(2).show(ui, |ui| {
-                    ui.label("SIP-сервер");
-                    ui.text_edit_singleline(&mut self.server);
-                    ui.end_row();
-                    ui.label("Номер (пользователь)");
-                    ui.text_edit_singleline(&mut self.user);
-                    ui.end_row();
-                    ui.label("Пароль");
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.password)
-                                .password(!self.show_password)
-                                .desired_width(150.0),
-                        );
-                        ui.checkbox(&mut self.show_password, "Показать");
+                // The settings are taller than the phone's window.
+                let room = (ui.ctx().screen_rect().height() - 70.0).max(200.0);
+                egui::ScrollArea::vertical()
+                    .max_height(room)
+                    .show(ui, |ui| {
+                        ui.heading("Аккаунт");
+                        egui::Grid::new("account").num_columns(2).show(ui, |ui| {
+                            ui.label("SIP-сервер");
+                            ui.text_edit_singleline(&mut self.server);
+                            ui.end_row();
+                            ui.label("Номер (пользователь)");
+                            ui.text_edit_singleline(&mut self.user);
+                            ui.end_row();
+                            ui.label("Пароль");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.password)
+                                        .password(!self.show_password)
+                                        .desired_width(150.0),
+                                );
+                                ui.checkbox(&mut self.show_password, "Показать");
+                            });
+                            ui.end_row();
+                            ui.label("Домен (если отличается)");
+                            ui.text_edit_singleline(&mut self.domain);
+                            ui.end_row();
+                            ui.label("Логин (если отличается)");
+                            ui.text_edit_singleline(&mut self.auth_user);
+                            ui.end_row();
+                            ui.label("Локальный порт");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.local_port)
+                                    .hint_text("автоматически")
+                                    .desired_width(100.0),
+                            );
+                            ui.end_row();
+                        });
+                        if secret::is_available() {
+                            ui.checkbox(&mut self.save_password, "Запомнить пароль");
+                            ui.weak(
+                                "Пароль хранится зашифрованным для этого пользователя Windows.",
+                            );
+                        } else {
+                            ui.weak("На этой системе пароль не сохраняется.");
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Сохранить и подключить").clicked() {
+                                actions.push(Action::Connect);
+                            }
+                            if ui
+                                .add_enabled(self.handle.is_some(), egui::Button::new("Отключить"))
+                                .clicked()
+                            {
+                                actions.push(Action::Disconnect);
+                            }
+                        });
+                        if let Some(local) = self.local {
+                            ui.weak(format!("Адрес телефона: {local}"));
+                        }
+
+                        ui.separator();
+                        ui.heading("Звук");
+                        let before = (self.microphone.clone(), self.speaker.clone());
+                        device_picker(ui, "Микрофон", &mut self.microphone, &self.microphones);
+                        device_picker(ui, "Динамик", &mut self.speaker, &self.speakers);
+                        if ui.button("Обновить список устройств").clicked() {
+                            self.microphones = input_device_names();
+                            self.speakers = output_device_names();
+                        }
+                        if before != (self.microphone.clone(), self.speaker.clone()) {
+                            actions.push(Action::AudioChanged);
+                        }
+                        ui.weak("Новое устройство используется со следующего звонка.");
+                        let before = (self.ring_speaker.clone(), self.ringtone.clone());
+                        device_picker(ui, "Звонок", &mut self.ring_speaker, &self.speakers);
+                        ui.horizontal(|ui| {
+                            ui.label("Мелодия");
+                            let field = egui::TextEdit::singleline(&mut self.ringtone)
+                                .hint_text("встроенный звонок")
+                                .desired_width(170.0);
+                            let typed = ui.add(field).lost_focus();
+                            if ui
+                                .add_enabled(self.dialog.is_none(), egui::Button::new("Обзор…"))
+                                .clicked()
+                            {
+                                actions.push(Action::Browse(Dialog::Ringtone));
+                            }
+                            if ui.button("Сбросить").clicked() {
+                                self.ringtone.clear();
+                            }
+                            let changed =
+                                before != (self.ring_speaker.clone(), self.ringtone.clone());
+                            // A path being typed is read when the typing is over.
+                            let typing = ui.ctx().wants_keyboard_input() && !typed;
+                            if (changed || typed) && !typing && self.ring_is_unsaved() {
+                                actions.push(Action::RingChanged);
+                            }
+                        });
+                        ui.weak(
+                    "Мелодия — файл WAV. «Звонок» на «По умолчанию» звучит там же, где разговор.",
+                );
+
+                        ui.separator();
+                        ui.heading("Входящие вызовы");
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.auto_answer, "Автоответ через");
+                            ui.add(egui::DragValue::new(&mut self.auto_answer_delay).range(0..=60));
+                            ui.label("с");
+                        });
+                        ui.weak("«Не беспокоить» включается галочкой в верхней строке окна.");
+                        let before = (self.forward, self.forward_to.clone());
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.forward, "Переадресация на номер");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.forward_to)
+                                    .desired_width(140.0),
+                            );
+                        });
+                        if before != (self.forward, self.forward_to.clone()) {
+                            actions.push(Action::ForwardChanged);
+                        }
+
+                        ui.separator();
+                        ui.heading("Запись разговоров");
+                        ui.checkbox(&mut self.record_calls, "Записывать все разговоры");
+                        let default = default_recordings_dir()
+                            .map(|folder| folder.display().to_string())
+                            .unwrap_or_default();
+                        ui.horizontal(|ui| {
+                            ui.label("Папка");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.recordings_dir)
+                                    .hint_text(default)
+                                    .desired_width(200.0),
+                            );
+                            if ui
+                                .add_enabled(self.dialog.is_none(), egui::Button::new("Обзор…"))
+                                .clicked()
+                            {
+                                actions.push(Action::Browse(Dialog::RecordingsFolder));
+                            }
+                        });
+                        if ui.button("Открыть папку с записями").clicked()
+                            && let Some(folder) = self.recordings_folder()
+                        {
+                            // The folder appears with the first recording; make it
+                            // now so that there is something to open.
+                            let _ = std::fs::create_dir_all(&folder);
+                            actions.push(Action::Open(folder));
+                        }
+                        ui.weak("Файлы WAV: слева ваш голос, справа собеседник.");
+
+                        ui.separator();
+                        ui.heading("Окно");
+                        let before = (self.close_to_tray, self.hotkeys, self.light_theme);
+                        ui.checkbox(&mut self.light_theme, "Светлая тема");
+                        if self.shell.is_some() {
+                            ui.checkbox(
+                                &mut self.close_to_tray,
+                                "При закрытии сворачивать к часам (в трей)",
+                            );
+                            let mut autostart = self.autostart;
+                            if ui
+                                .checkbox(&mut autostart, "Запускать вместе с Windows")
+                                .changed()
+                            {
+                                actions.push(Action::Autostart(autostart));
+                            }
+                            ui.checkbox(&mut self.hotkeys, "Горячие клавиши в любой программе");
+                            ui.weak(
+                                "Ctrl+Alt+PageUp — ответить, Ctrl+Alt+PageDown — завершить или \
+                         отклонить, Ctrl+Alt+Insert — номер из буфера обмена.\n\
+                         Галочка клавиш действует после перезапуска программы.",
+                            );
+                        } else {
+                            ui.weak(
+                                "Значок у часов, автозапуск и общие клавиши есть только в Windows.",
+                            );
+                        }
+                        ui.weak("В окне: Enter — ответить, Esc — отклонить входящий.");
+                        if before != (self.close_to_tray, self.hotkeys, self.light_theme) {
+                            if before.2 != self.light_theme {
+                                self.apply_theme(ui.ctx());
+                            }
+                            actions.push(Action::WindowChanged);
+                        }
                     });
-                    ui.end_row();
-                    ui.label("Домен (если отличается)");
-                    ui.text_edit_singleline(&mut self.domain);
-                    ui.end_row();
-                    ui.label("Логин (если отличается)");
-                    ui.text_edit_singleline(&mut self.auth_user);
-                    ui.end_row();
-                    ui.label("Локальный порт");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.local_port)
-                            .hint_text("автоматически")
-                            .desired_width(100.0),
-                    );
-                    ui.end_row();
-                });
-                if secret::is_available() {
-                    ui.checkbox(&mut self.save_password, "Запомнить пароль");
-                    ui.weak("Пароль хранится зашифрованным для этого пользователя Windows.");
-                } else {
-                    ui.weak("На этой системе пароль не сохраняется.");
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("Сохранить и подключить").clicked() {
-                        actions.push(Action::Connect);
-                    }
-                    if ui
-                        .add_enabled(self.handle.is_some(), egui::Button::new("Отключить"))
-                        .clicked()
-                    {
-                        actions.push(Action::Disconnect);
-                    }
-                });
-                if let Some(local) = self.local {
-                    ui.weak(format!("Адрес телефона: {local}"));
-                }
-
-                ui.separator();
-                ui.heading("Звук");
-                let before = (self.microphone.clone(), self.speaker.clone());
-                device_picker(ui, "Микрофон", &mut self.microphone, &self.microphones);
-                device_picker(ui, "Динамик", &mut self.speaker, &self.speakers);
-                if ui.button("Обновить список устройств").clicked() {
-                    self.microphones = input_device_names();
-                    self.speakers = output_device_names();
-                }
-                if before != (self.microphone.clone(), self.speaker.clone()) {
-                    actions.push(Action::AudioChanged);
-                }
-                ui.weak("Новое устройство используется со следующего звонка.");
-
-                ui.separator();
-                ui.heading("Входящие вызовы");
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.auto_answer, "Автоответ через");
-                    ui.add(egui::DragValue::new(&mut self.auto_answer_delay).range(0..=60));
-                    ui.label("с");
-                });
-                ui.weak("«Не беспокоить» включается галочкой в верхней строке окна.");
-                let before = (self.forward, self.forward_to.clone());
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.forward, "Переадресация на номер");
-                    ui.add(egui::TextEdit::singleline(&mut self.forward_to).desired_width(140.0));
-                });
-                if before != (self.forward, self.forward_to.clone()) {
-                    actions.push(Action::ForwardChanged);
-                }
-
-                ui.separator();
-                ui.heading("Запись разговоров");
-                ui.checkbox(&mut self.record_calls, "Записывать все разговоры");
-                let default = default_recordings_dir()
-                    .map(|folder| folder.display().to_string())
-                    .unwrap_or_default();
-                ui.horizontal(|ui| {
-                    ui.label("Папка");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.recordings_dir)
-                            .hint_text(default)
-                            .desired_width(260.0),
-                    );
-                });
-                if ui.button("Открыть папку с записями").clicked()
-                    && let Some(folder) = self.recordings_folder()
-                {
-                    // The folder appears with the first recording; make it
-                    // now so that there is something to open.
-                    let _ = std::fs::create_dir_all(&folder);
-                    actions.push(Action::Open(folder));
-                }
-                ui.weak("Файлы WAV: слева ваш голос, справа собеседник.");
             });
         self.settings_open = open;
+    }
+
+    /// The ring device or melody differs from what is saved and in use.
+    fn ring_is_unsaved(&self) -> bool {
+        self.ring_speaker != self.saved.ring_speaker || self.ringtone.trim() != self.saved.ringtone
     }
 
     fn log_window(&mut self, ctx: &egui::Context) {
@@ -1633,6 +2075,21 @@ fn error_text(message: &str) -> String {
     message.to_owned()
 }
 
+/// Why a melody file was refused, in the user's language.
+fn melody_error_text(error: &str) -> String {
+    match error {
+        "not a WAV file" => "это не файл WAV".to_owned(),
+        "the file is larger than 20 MB" => "файл больше 20 МБ".to_owned(),
+        "the WAV file has no sound in it" | "the WAV file has no format" => {
+            "в файле нет звука".to_owned()
+        }
+        other if other.starts_with("this kind of WAV") => {
+            "сжатый WAV не поддерживается — сохраните его как обычный PCM".to_owned()
+        }
+        other => format!("файл не читается ({other})"),
+    }
+}
+
 fn registration_text(state: &RegistrationState) -> String {
     match state {
         RegistrationState::Registering => "подключение…".to_owned(),
@@ -1661,8 +2118,10 @@ impl Drop for PhoneWindow {
 impl eframe::App for PhoneWindow {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
+        self.poll_dialog();
         ctx.request_repaint_after(Duration::from_millis(100));
         let mut actions = Vec::new();
+        self.keys_and_tray(ctx, &mut actions);
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -1706,6 +2165,8 @@ impl eframe::App for PhoneWindow {
 }
 
 fn main() -> eframe::Result<()> {
+    // Windows starts the phone with this word when it starts by itself.
+    let start_hidden = std::env::args().any(|argument| argument == "--minimized");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([400.0, 640.0])
@@ -1713,8 +2174,8 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "MicroSIP Rust",
+        WINDOW_TITLE,
         options,
-        Box::new(|_creation_context| Ok(Box::new(PhoneWindow::new()))),
+        Box::new(move |creation| Ok(Box::new(PhoneWindow::new(&creation.egui_ctx, start_hidden)))),
     )
 }

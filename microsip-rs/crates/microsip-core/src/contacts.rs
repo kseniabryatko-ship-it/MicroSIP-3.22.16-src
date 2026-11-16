@@ -99,6 +99,46 @@ impl Contacts {
             .collect()
     }
 
+    /// The list as a table for Excel and other programs: `name;number`
+    /// rows under a heading, in UTF-8 with the mark Excel needs to see it.
+    pub fn to_csv(&self) -> String {
+        let mut text = String::from("\u{feff}Name;Number\r\n");
+        for contact in &self.list {
+            text.push_str(&csv_cell(&contact.name));
+            text.push(';');
+            text.push_str(&csv_cell(&contact.number));
+            text.push_str("\r\n");
+        }
+        text
+    }
+
+    /// Adds the contacts of a table file (as exported here, by MicroSIP or
+    /// by Excel) and returns how many rows were taken. The first two columns
+    /// are the name and the number, in either order; a heading row and rows
+    /// without a number are skipped. The file may be UTF-8 or Windows-1251.
+    pub fn import_csv(&mut self, bytes: &[u8]) -> usize {
+        let text = decode_text(bytes);
+        let separator = csv_separator(&text);
+        let mut taken = 0;
+        for row in csv_rows(&text, separator) {
+            let mut cells = row.iter().map(|cell| cell.trim());
+            let (Some(first), Some(second)) = (cells.next(), cells.next()) else {
+                continue;
+            };
+            let (name, number) = if looks_like_number(second) {
+                (first, second)
+            } else if looks_like_number(first) {
+                (second, first)
+            } else {
+                continue;
+            };
+            if self.set(name, number) {
+                taken += 1;
+            }
+        }
+        taken
+    }
+
     /// Loads the file; a missing file is an empty list.
     pub fn load(path: &Path) -> io::Result<Self> {
         match fs::read_to_string(path) {
@@ -110,6 +150,87 @@ impl Contacts {
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
         crate::settings::write_through_temporary(path, &self.serialize())
+    }
+}
+
+fn csv_cell(value: &str) -> String {
+    if value.contains([';', ',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+/// A telephone number or an extension: it has digits and no letters.
+fn looks_like_number(cell: &str) -> bool {
+    cell.chars().any(|c| c.is_ascii_digit()) && !cell.chars().any(char::is_alphabetic)
+}
+
+/// The separator that splits the first lines of a table into columns.
+fn csv_separator(text: &str) -> char {
+    let sample: String = text.lines().take(5).collect::<Vec<_>>().join("\n");
+    [';', '\t', ',']
+        .into_iter()
+        .max_by_key(|separator| sample.matches(*separator).count())
+        .filter(|separator| sample.contains(*separator))
+        .unwrap_or(';')
+}
+
+/// Splits a table into rows of cells; a cell in quotes may hold the
+/// separator, line breaks and doubled quotes.
+fn csv_rows(text: &str, separator: char) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut cell = String::new();
+    let mut quoted = false;
+    let mut characters = text.trim_start_matches('\u{feff}').chars().peekable();
+    while let Some(character) = characters.next() {
+        if quoted {
+            match character {
+                '"' if characters.peek() == Some(&'"') => {
+                    characters.next();
+                    cell.push('"');
+                }
+                '"' => quoted = false,
+                other => cell.push(other),
+            }
+        } else if character == '"' && cell.is_empty() {
+            quoted = true;
+        } else if character == separator {
+            row.push(std::mem::take(&mut cell));
+        } else if character == '\n' {
+            row.push(std::mem::take(&mut cell));
+            rows.push(std::mem::take(&mut row));
+        } else if character != '\r' {
+            cell.push(character);
+        }
+    }
+    if !cell.is_empty() || !row.is_empty() {
+        row.push(cell);
+        rows.push(row);
+    }
+    rows
+}
+
+/// Text of a file that is UTF-8 or, failing that, Windows-1251 (what older
+/// Russian programs and Excel's plain "CSV" write).
+fn decode_text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(_) => bytes
+            .iter()
+            .map(|byte| match *byte {
+                byte @ 0..=0x7F => char::from(byte),
+                0xA8 => 'Ё',
+                0xB8 => 'ё',
+                0xB9 => '№',
+                0xA0 => ' ',
+                byte @ 0xC0..=0xFF => {
+                    char::from_u32(0x0410 + u32::from(byte - 0xC0)).unwrap_or('?')
+                }
+                _ => '?',
+            })
+            .collect(),
     }
 }
 
@@ -242,6 +363,52 @@ mod tests {
         let parsed = Contacts::parse("\u{feff}Вера\t4012\nбез номера\n\t4013\nГлеб\t\n");
         assert_eq!(parsed.list().len(), 1);
         assert_eq!(parsed.list()[0].name, "Вера");
+    }
+
+    #[test]
+    fn exported_table_reads_back() {
+        let mut contacts = sample();
+        assert!(contacts.set("ООО \"Ромашка\"; склад", "4012"));
+        let csv = contacts.to_csv();
+        assert!(csv.starts_with("\u{feff}Name;Number\r\nанна;4010\r\n"));
+        assert!(csv.contains("\"ООО \"\"Ромашка\"\"; склад\";4012\r\n"));
+
+        let mut imported = Contacts::default();
+        assert_eq!(imported.import_csv(csv.as_bytes()), 4);
+        assert_eq!(imported, contacts);
+    }
+
+    #[test]
+    fn import_understands_other_programs_tables() {
+        // Commas, the number first, a heading, empty and broken rows.
+        let mut contacts = Contacts::default();
+        let text = "Number,Name,Note\n4010,Анна,бухгалтерия\n\n,пусто\nтолько имя\n\
+                    +7 (495) 999-99-99,\"Такси, город\",\n";
+        assert_eq!(contacts.import_csv(text.as_bytes()), 2);
+        assert_eq!(contacts.name_of("4010"), Some("Анна"));
+        assert_eq!(contacts.name_of("84959999999"), Some("Такси, город"));
+
+        // Tabs, as this program's own contacts file.
+        let mut contacts = Contacts::default();
+        assert_eq!(
+            contacts.import_csv("Борис\t4011\r\nВера\t4012".as_bytes()),
+            2
+        );
+        assert_eq!(contacts.name_of("4012"), Some("Вера"));
+
+        // Importing again changes nothing; an existing number is renamed.
+        assert_eq!(contacts.import_csv("Борис Петрович;4011".as_bytes()), 1);
+        assert_eq!(contacts.list().len(), 2);
+        assert_eq!(contacts.name_of("4011"), Some("Борис Петрович"));
+    }
+
+    #[test]
+    fn import_reads_windows_1251_files() {
+        // "Ёж №1;4010" as an old Russian program writes it.
+        let bytes = [0xA8, 0xE6, 0x20, 0xB9, 0x31, b';', b'4', b'0', b'1', b'0'];
+        let mut contacts = Contacts::default();
+        assert_eq!(contacts.import_csv(&bytes), 1);
+        assert_eq!(contacts.name_of("4010"), Some("Ёж №1"));
     }
 
     #[test]

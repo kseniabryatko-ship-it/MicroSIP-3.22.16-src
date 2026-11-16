@@ -34,6 +34,8 @@ use std::error::Error;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -220,10 +222,18 @@ pub struct CallHandle {
     commands: Sender<UiCommand>,
     events: Receiver<Event>,
     local: SocketAddr,
+    ringing: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl CallHandle {
+    /// True while an incoming call is ringing on any line. It can be
+    /// watched from another thread without reading the events, for example
+    /// to bring a hidden window back when someone calls.
+    pub fn ringing_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.ringing)
+    }
+
     pub fn local_address(&self) -> SocketAddr {
         self.local
     }
@@ -317,8 +327,11 @@ where
     let (event_sender, event_receiver) = mpsc::channel();
     let user = user.to_owned();
 
+    let ringing = Arc::new(AtomicBool::new(false));
+    let shared_ringing = Arc::clone(&ringing);
     let thread = thread::spawn(move || {
-        let runner = Runner::new(socket, local, user, timers, make_medias(), event_sender);
+        let mut runner = Runner::new(socket, local, user, timers, make_medias(), event_sender);
+        runner.ringing = shared_ringing;
         runner.run(&command_receiver);
     });
 
@@ -326,6 +339,7 @@ where
         commands: command_sender,
         events: event_receiver,
         local,
+        ringing,
         thread: Some(thread),
     })
 }
@@ -473,6 +487,8 @@ struct Line<M: Media> {
     media: M,
     media_running: bool,
     pending: VecDeque<Input>,
+    /// An incoming call is ringing here.
+    rings: bool,
 }
 
 impl<M: Media> Line<M> {
@@ -483,6 +499,7 @@ impl<M: Media> Line<M> {
             media,
             media_running: false,
             pending: VecDeque::new(),
+            rings: false,
         }
     }
 }
@@ -504,6 +521,8 @@ struct Runner<M: Media> {
     conference: bool,
     /// Where all incoming calls are sent instead of ringing here.
     forward_to: Option<String>,
+    /// Shared with [`CallHandle::ringing_flag`].
+    ringing: Arc<AtomicBool>,
     events: Sender<Event>,
     registration: Option<Registration>,
     trace: bool,
@@ -534,6 +553,7 @@ impl<M: Media> Runner<M> {
             told_line: std::cell::Cell::new(0),
             conference: false,
             forward_to: None,
+            ringing: Arc::new(AtomicBool::new(false)),
             events,
             registration: None,
             trace: false,
@@ -746,9 +766,24 @@ impl<M: Media> Runner<M> {
         }
     }
 
+    /// Notes whether the current line rings, for [`CallHandle::ringing_flag`].
+    fn set_rings(&mut self, rings: bool) {
+        self.lines[self.cur].rings = rings;
+        let any = self.lines.iter().any(|line| line.rings);
+        self.ringing.store(any, Ordering::Relaxed);
+    }
+
+    /// Stops the current line's audio; its ringing stops with it.
+    fn stop_media(&mut self) {
+        self.lines[self.cur].media.stop();
+        self.lines[self.cur].media_running = false;
+        self.set_rings(false);
+    }
+
     /// Starts or stops the phone's own ringing. A phone that cannot ring
     /// (no speaker) still works, so a failure is only reported.
     fn ring(&mut self, tone: Option<Tone>) {
+        self.set_rings(tone == Some(Tone::Ringtone));
         if let Err(error) = self.lines[self.cur].media.ring(tone) {
             self.report(format!("Cannot play the ringing sound: {error}"));
         }
@@ -1149,14 +1184,12 @@ impl<M: Media> Runner<M> {
                         self.emit(Event::AudioQuality(quality));
                     }
                 }
-                self.lines[self.cur].media.stop();
-                self.lines[self.cur].media_running = false;
+                self.stop_media();
             }
             Action::ReportEstablished => self.emit(Event::Established),
             Action::ReportEnded => {
                 // Also releases a reserved RTP port when media never started.
-                self.lines[self.cur].media.stop();
-                self.lines[self.cur].media_running = false;
+                self.stop_media();
                 let reason = self.lines[self.cur]
                     .call
                     .as_ref()

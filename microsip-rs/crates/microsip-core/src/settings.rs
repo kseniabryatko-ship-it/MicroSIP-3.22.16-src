@@ -48,6 +48,15 @@ pub struct Settings {
     /// Send every incoming call on to `forward_to` instead of ringing.
     pub forward: bool,
     pub forward_to: String,
+    /// Device the ring of an incoming call plays on; empty means `speaker`.
+    pub ring_speaker: String,
+    /// WAV file played as the ring; empty means the built-in ring.
+    pub ringtone: String,
+    /// Closing the window keeps the phone running next to the clock.
+    pub close_to_tray: bool,
+    /// Ctrl+Alt+PageUp answers and Ctrl+Alt+PageDown hangs up, in any program.
+    pub hotkeys: bool,
+    pub light_theme: bool,
 }
 
 impl Default for Settings {
@@ -73,6 +82,11 @@ impl Default for Settings {
             auto_answer_delay: 3,
             forward: false,
             forward_to: String::new(),
+            ring_speaker: String::new(),
+            ringtone: String::new(),
+            close_to_tray: true,
+            hotkeys: true,
+            light_theme: false,
         }
     }
 }
@@ -113,6 +127,11 @@ impl Settings {
                 "auto_answer" => settings.auto_answer = value == "1",
                 "forward" => settings.forward = value == "1",
                 "forward_to" => settings.forward_to = value,
+                "ring_speaker" => settings.ring_speaker = value,
+                "ringtone" => settings.ringtone = value,
+                "close_to_tray" => settings.close_to_tray = value != "0",
+                "hotkeys" => settings.hotkeys = value != "0",
+                "light_theme" => settings.light_theme = value == "1",
                 "auto_answer_delay" => {
                     if let Some(delay) = value.parse::<u32>().ok().filter(|delay| *delay <= 60) {
                         settings.auto_answer_delay = delay;
@@ -150,6 +169,9 @@ impl Settings {
         let auto_answer = flag(self.auto_answer);
         let auto_answer_delay = self.auto_answer_delay.to_string();
         let forward = flag(self.forward);
+        let close_to_tray = flag(self.close_to_tray);
+        let hotkeys = flag(self.hotkeys);
+        let light_theme = flag(self.light_theme);
         // Without permission to remember it, no form of the password is written.
         let password_protected = if self.save_password {
             self.password_protected.clone()
@@ -177,6 +199,11 @@ impl Settings {
             ("auto_answer_delay", &auto_answer_delay),
             ("forward", &forward),
             ("forward_to", &self.forward_to),
+            ("ring_speaker", &self.ring_speaker),
+            ("ringtone", &self.ringtone),
+            ("close_to_tray", &close_to_tray),
+            ("hotkeys", &hotkeys),
+            ("light_theme", &light_theme),
         ] {
             text.push_str(key);
             text.push('=');
@@ -288,6 +315,11 @@ mod tests {
             auto_answer_delay: 5,
             forward: true,
             forward_to: "4011".to_owned(),
+            ring_speaker: "Speakers (Realtek)".to_owned(),
+            ringtone: r"C:\Sounds\ring.wav".to_owned(),
+            close_to_tray: false,
+            hotkeys: false,
+            light_theme: true,
         }
     }
 
@@ -324,7 +356,9 @@ mod tests {
              local_port=5062\nsave_password=1\npassword_protected=0a1b2c\n\
              record_calls=1\nrecordings_dir=D:\\Записи звонков\n\
              do_not_disturb=1\nauto_answer=1\nauto_answer_delay=5\n\
-             forward=1\nforward_to=4011\n"
+             forward=1\nforward_to=4011\n\
+             ring_speaker=Speakers (Realtek)\nringtone=C:\\Sounds\\ring.wav\n\
+             close_to_tray=0\nhotkeys=0\nlight_theme=1\n"
         );
         // No line holds the password itself; `save_password` and
         // `password_protected` are different keys.

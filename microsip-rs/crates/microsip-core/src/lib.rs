@@ -18,6 +18,7 @@ pub mod settings;
 pub mod sip;
 pub mod tones;
 pub mod transport;
+pub mod winshell;
 
 #[path = "sip/transaction_headers.rs"]
 pub mod transaction_headers;

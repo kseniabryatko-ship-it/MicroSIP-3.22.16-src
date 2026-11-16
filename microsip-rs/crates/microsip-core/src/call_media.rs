@@ -8,7 +8,7 @@ use crate::recording::{CallRecorder, RecorderInput};
 use crate::resample::Resampler;
 use crate::rtp::PCMU_CLOCK_RATE;
 use crate::rtp::session::{RtpSession, RtpSessionConfig};
-use crate::tones::{TONE_RATE, Tone, ToneGenerator};
+use crate::tones::{Melody, MelodyPlayer, TONE_RATE, Tone, ToneGenerator};
 use std::collections::VecDeque;
 use std::error::Error;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -184,6 +184,8 @@ struct ControlsInner {
     microphone_percent: AtomicU32,
     input_device: Mutex<Option<String>>,
     output_device: Mutex<Option<String>>,
+    ring_device: Mutex<Option<String>>,
+    ringtone: Mutex<Option<Arc<Melody>>>,
 }
 
 impl Default for AudioControls {
@@ -196,6 +198,8 @@ impl Default for AudioControls {
                 microphone_percent: AtomicU32::new(100),
                 input_device: Mutex::new(None),
                 output_device: Mutex::new(None),
+                ring_device: Mutex::new(None),
+                ringtone: Mutex::new(None),
             }),
         }
     }
@@ -244,6 +248,30 @@ impl AudioControls {
 
     pub fn output_device(&self) -> Option<String> {
         self.inner.output_device.lock().ok()?.clone()
+    }
+
+    /// Device the ring of an incoming call plays on, so that it can be
+    /// heard from loudspeakers while the conversation is in a headset.
+    /// `None` or an empty name means the same device as the conversation.
+    pub fn set_ring_device(&self, name: Option<String>) {
+        if let Ok(mut device) = self.inner.ring_device.lock() {
+            *device = name.filter(|name| !name.is_empty());
+        }
+    }
+
+    pub fn ring_device(&self) -> Option<String> {
+        self.inner.ring_device.lock().ok()?.clone()
+    }
+
+    /// Melody played for an incoming call; `None` is the built-in ring.
+    pub fn set_ringtone(&self, melody: Option<Melody>) {
+        if let Ok(mut ringtone) = self.inner.ringtone.lock() {
+            *ringtone = melody.map(Arc::new);
+        }
+    }
+
+    pub fn ringtone(&self) -> Option<Arc<Melody>> {
+        self.inner.ringtone.lock().ok()?.clone()
     }
 
     fn speaker_volume_handle(&self) -> Arc<AtomicU32> {
@@ -370,11 +398,21 @@ struct Ringer {
 
 impl Ringer {
     fn start(tone: Tone, controls: &AudioControls) -> Result<Self, MediaError> {
-        let speaker = Speaker::start_on(
-            controls.output_device().as_deref(),
-            controls.speaker_volume_handle(),
-            0,
-        )?;
+        let incoming = tone == Tone::Ringtone;
+        // Only the ring of an incoming call has a device and a melody of
+        // its own; the ringback belongs to the conversation.
+        let ring_device = incoming.then(|| controls.ring_device()).flatten();
+        let volume = controls.speaker_volume_handle();
+        let speaker = match ring_device {
+            // A ring device that was unplugged must not silence the phone.
+            Some(device) => Speaker::start_on(Some(&device), Arc::clone(&volume), 0)
+                .or_else(|_| Speaker::start_on(controls.output_device().as_deref(), volume, 0)),
+            None => Speaker::start_on(controls.output_device().as_deref(), volume, 0),
+        }?;
+        let mut melody = incoming
+            .then(|| controls.ringtone())
+            .flatten()
+            .map(MelodyPlayer::new);
         let mut sink = speaker.sink();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
@@ -384,9 +422,18 @@ impl Ringer {
             while !stopped.load(Ordering::Acquire) {
                 // Stay a little ahead of the clock, as a network stream would.
                 let wanted = started.elapsed().as_millis() as u64 + 120;
-                while generator.produced_ms() < wanted {
-                    let block = generator.next_block(TONE_RATE as usize / 50);
-                    if sink.push(&block, TONE_RATE).is_err() {
+                loop {
+                    let (block, rate) = match melody.as_mut() {
+                        Some(player) if player.produced_ms() < wanted => {
+                            let rate = player.rate();
+                            (player.next_block(rate as usize / 50), rate)
+                        }
+                        None if generator.produced_ms() < wanted => {
+                            (generator.next_block(TONE_RATE as usize / 50), TONE_RATE)
+                        }
+                        _ => break,
+                    };
+                    if sink.push(&block, rate).is_err() {
                         return;
                     }
                 }

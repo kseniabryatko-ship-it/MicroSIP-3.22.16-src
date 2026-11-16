@@ -432,3 +432,50 @@ fn media_counters_are_reported_when_audio_stops() {
     );
     wait_for(&a, Event::Ended(EndReason::Completed));
 }
+
+/// Waits until the phone's "a call is ringing" flag has the given value.
+fn ringing_becomes(handle: &CallHandle, expected: bool) -> bool {
+    let flag = handle.ringing_flag();
+    for _ in 0..500 {
+        if flag.load(Ordering::Relaxed) == expected {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+#[test]
+fn ringing_flag_is_up_only_while_an_incoming_call_rings() {
+    let (a, _) = default_phone();
+    let (b, _) = default_phone();
+    assert!(!b.ringing_flag().load(Ordering::Relaxed));
+
+    // Answered: the flag goes down with the answer.
+    a.send(UiCommand::Dial(b.local_address()));
+    assert!(ringing_becomes(&b, true));
+    // The caller hears ringback, but nobody is calling the caller.
+    wait_for(&a, Event::Ringing);
+    assert!(!a.ringing_flag().load(Ordering::Relaxed));
+    b.send(UiCommand::Answer);
+    wait_for(&b, Event::Established);
+    assert!(ringing_becomes(&b, false));
+    a.send(UiCommand::Hangup);
+    wait_for(&b, Event::Ended(EndReason::Completed));
+    wait_for(&a, Event::Ended(EndReason::Completed));
+
+    // Given up by the caller.
+    a.send(UiCommand::Dial(b.local_address()));
+    assert!(ringing_becomes(&b, true));
+    a.send(UiCommand::Hangup);
+    wait_for(&b, Event::Ended(EndReason::Cancelled));
+    assert!(ringing_becomes(&b, false));
+    wait_for(&a, Event::Ended(EndReason::Cancelled));
+
+    // Rejected here.
+    a.send(UiCommand::Dial(b.local_address()));
+    assert!(ringing_becomes(&b, true));
+    b.send(UiCommand::Reject);
+    wait_for(&b, Event::Ended(EndReason::Rejected(486)));
+    assert!(ringing_becomes(&b, false));
+}
