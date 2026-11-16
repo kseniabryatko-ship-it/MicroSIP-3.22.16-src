@@ -23,12 +23,15 @@ use crate::call_media::{Media, MediaQuality};
 use crate::codec::Codec;
 use crate::dialog::{DialogConfig, EstablishedDialog};
 use crate::invite_control::{build_cancel, build_failure_ack};
-use crate::registration::{Account, Output, Registration, RegistrationState, add_rport};
+use crate::registration::{
+    Account, Output, RETRY_DELAY, Registration, RegistrationState, add_rport,
+};
 use crate::sip::message::{Headers, InviteRequest, Message, Request, Response, ResponseBuilder};
 use crate::sip::sdp::{MediaKind, Sdp};
+use crate::stream::{LinkEvent, StreamLink, with_via_transport};
 use crate::tones::Tone;
 use crate::transaction_headers::TransactionHeaders;
-use crate::transport::resolve_socket_address;
+use crate::transport::{local_ip_towards, resolve_socket_address};
 use std::collections::VecDeque;
 use std::error::Error;
 use std::io;
@@ -45,6 +48,10 @@ type Result<T> = std::result::Result<T, BoxError>;
 
 const TICK: Duration = Duration::from_millis(10);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// How often the route to the server is looked at for a change of network.
+const NETWORK_CHECK: Duration = Duration::from_secs(3);
+/// Pause before a lost connection to the server is made again.
+const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 /// Double CRLF, the keep-alive of RFC 5626; SIP servers ignore or echo it.
 const KEEPALIVE: &[u8] = b"\r\n\r\n";
 
@@ -194,6 +201,9 @@ pub enum Event {
     Ended(EndReason),
     /// The account's registration changed state.
     Registration(RegistrationState),
+    /// The phone moved to another local address, because the computer's
+    /// network changed.
+    LocalAddress(SocketAddr),
     /// A SIP message as sent or received, for diagnostics. The Digest
     /// `response` value is replaced, so the text holds no credentials.
     Trace {
@@ -566,6 +576,28 @@ struct Runner<M: Media> {
     ringing: Arc<AtomicBool>,
     events: Sender<Event>,
     registration: Option<Registration>,
+    /// The account being kept registered, for registering again after the
+    /// connection or the network was lost.
+    account: Option<Account>,
+    /// Where that account's messages go: the registrar or the proxy.
+    server: Option<SocketAddr>,
+    /// The TCP or TLS connection to `server`, when the account uses one.
+    link: Option<StreamLink>,
+    /// When to try registering again after the connection failed.
+    register_retry: Option<Instant>,
+    /// The registration of the address the phone has just left, while it
+    /// is being removed from the server.
+    leaving: Option<Registration>,
+    /// The phone has just moved to another address and has not been
+    /// accepted there yet.
+    moved: bool,
+    /// Connection attempts that failed in a row.
+    connect_failures: u32,
+    next_network_check: Instant,
+    /// The phone is closing: nothing is started anew.
+    stopping: bool,
+    /// The last error of the SIP socket, so that it is reported once.
+    socket_error: Option<io::ErrorKind>,
     trace: bool,
     do_not_disturb: bool,
     retx: Vec<Retx>,
@@ -598,6 +630,16 @@ impl<M: Media> Runner<M> {
             ringing: Arc::new(AtomicBool::new(false)),
             events,
             registration: None,
+            account: None,
+            server: None,
+            link: None,
+            register_retry: None,
+            leaving: None,
+            moved: false,
+            connect_failures: 0,
+            next_network_check: Instant::now() + NETWORK_CHECK,
+            stopping: false,
+            socket_error: None,
             trace: false,
             do_not_disturb: false,
             retx: Vec::new(),
@@ -625,10 +667,19 @@ impl<M: Media> Runner<M> {
                 }
             }
 
-            if let Err(error) = self.receive_one() {
-                self.report(format!("SIP socket failed: {error}"));
-                break;
+            // A socket that fails (its network went away) is not the end of
+            // the phone: the network check below moves it to a new address.
+            match self.receive_one() {
+                Ok(()) => self.socket_error = None,
+                Err(error) => {
+                    if self.socket_error != Some(error.kind()) {
+                        self.socket_error = Some(error.kind());
+                        self.report(format!("SIP socket failed: {error}"));
+                    }
+                    thread::sleep(TICK);
+                }
             }
+            self.receive_from_link();
             for line in 0..self.lines.len() {
                 self.cur = line;
                 self.pump_media();
@@ -659,6 +710,7 @@ impl<M: Media> Runner<M> {
     }
 
     fn begin_shutdown(&mut self) {
+        self.stopping = true;
         self.unregister();
         for line in 0..self.lines.len() {
             self.cur = line;
@@ -934,9 +986,12 @@ impl<M: Media> Runner<M> {
         // address the server reaches this phone at.
         match self.registration.as_ref() {
             Some(registration) => format!(
-                "<sip:{}@{}>",
+                "<sip:{}@{}{}>",
                 registration.username(),
-                registration.contact_address()
+                registration.contact_address(),
+                self.link
+                    .as_ref()
+                    .map_or("", |link| link.transport().uri_parameter())
             ),
             None => format!("<sip:{}@{}>", self.user, self.local),
         }
@@ -959,36 +1014,75 @@ impl<M: Media> Runner<M> {
             self.stop_retx(&id, &[RetxKind::Register]);
         }
 
+        self.register_retry = None;
+        self.link = None;
         let seed = self.unique();
-        let created = account
-            .server_host_port()
-            .and_then(|(host, port)| {
-                // Name resolution blocks this thread; it happens once per command.
-                resolve_socket_address(&host, port)
-                    .map_err(|error| format!("cannot resolve {host}: {error}"))
-            })
-            .and_then(|server| {
-                // A loopback socket cannot send to another machine at all.
-                if self.local.ip().is_loopback() && !server.ip().is_loopback() {
-                    return Err(format!(
-                        "the phone listens on {}, which cannot reach {server}; \
-                         start it on this computer's network address",
-                        self.local.ip()
-                    ));
+        let resolved = account.connect_host_port().and_then(|(host, port)| {
+            // Name resolution blocks this thread; it happens once per command.
+            let server = resolve_socket_address(&host, port)
+                .map_err(|error| format!("cannot resolve {host}: {error}"))?;
+            // A loopback socket cannot send to another machine at all.
+            if self.local.ip().is_loopback() && !server.ip().is_loopback() {
+                return Err(format!(
+                    "the phone listens on {}, which cannot reach {server}; \
+                     start it on this computer's network address",
+                    self.local.ip()
+                ));
+            }
+            Ok((host, server))
+        });
+        let (host, server) = match resolved {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                return self.emit(Event::Registration(RegistrationState::Failed(reason)));
+            }
+        };
+        self.account = Some(account.clone());
+        self.server = Some(server);
+
+        // Over TCP or TLS the phone is known to the server by its end of
+        // the connection, which the server also answers and calls through.
+        let mut local = self.local;
+        let transport = account.transport;
+        if transport.is_stream() {
+            match StreamLink::connect(server, transport, &host, account.tls_verify) {
+                Ok(link) => {
+                    local = link.local();
+                    self.link = Some(link);
+                    self.connect_failures = 0;
                 }
-                Registration::new(account, server, self.local, &seed)
-            });
-        match created {
+                Err(error) => {
+                    // Soon at first, for a server that is only restarting;
+                    // then at the usual pace of registration retries.
+                    let pause = RECONNECT_DELAY * 2_u32.pow(self.connect_failures.min(4));
+                    self.connect_failures += 1;
+                    self.register_retry = Some(Instant::now() + pause.min(RETRY_DELAY));
+                    let reason = format!("cannot connect to {server} over {transport}: {error}");
+                    return self.emit(Event::Registration(RegistrationState::Failed(reason)));
+                }
+            }
+        }
+        match Registration::new(account, server, local, &seed) {
             Ok(mut registration) => {
                 let outputs = registration.start();
                 self.registration = Some(registration);
                 self.apply_registration(outputs);
             }
-            Err(reason) => self.emit(Event::Registration(RegistrationState::Failed(reason))),
+            Err(reason) => {
+                self.link = None;
+                self.account = None;
+                self.emit(Event::Registration(RegistrationState::Failed(reason)));
+            }
         }
     }
 
     fn unregister(&mut self) {
+        // The user wants the account off: nothing registers it again.
+        self.account = None;
+        self.register_retry = None;
+        if self.registration.is_none() {
+            self.link = None;
+        }
         if let Some(registration) = self.registration.as_mut() {
             let outputs = registration.unregister();
             self.apply_registration(outputs);
@@ -1019,7 +1113,28 @@ impl<M: Media> Runner<M> {
                         self.timers.t2,
                     );
                 }
-                Output::State(state) => self.emit(Event::Registration(state)),
+                Output::State(RegistrationState::Failed(reason))
+                    if self.moved && reason.starts_with("403") =>
+                {
+                    // Refused at the new address: the server allows one
+                    // telephone and still counts the old address. Every
+                    // binding of the account is removed, once, and the
+                    // phone registers again.
+                    self.moved = false;
+                    if let Some(mut refused) = self.registration.take() {
+                        self.stop_retx(&id, &[RetxKind::Register]);
+                        let outputs = refused.unregister_all();
+                        self.leaving = Some(refused);
+                        self.apply_leaving(outputs);
+                    }
+                    return;
+                }
+                Output::State(state) => {
+                    if matches!(state, RegistrationState::Registered { .. }) {
+                        self.moved = false;
+                    }
+                    self.emit(Event::Registration(state));
+                }
             }
         }
         if self
@@ -1029,6 +1144,166 @@ impl<M: Media> Runner<M> {
         {
             self.stop_retx(&id, &[RetxKind::Register]);
             self.registration = None;
+            // The connection was for the account; it goes with it.
+            if self.account.is_none() {
+                self.link = None;
+            }
+        }
+    }
+
+    // ----- the connection to the server and the network --------------------
+
+    /// Hands over what the TCP or TLS connection received.
+    fn receive_from_link(&mut self) {
+        loop {
+            let Some(link) = self.link.as_ref() else {
+                return;
+            };
+            let peer = link.peer();
+            match link.try_event() {
+                Some(LinkEvent::Message(data)) => {
+                    self.cur = self.selected;
+                    self.on_datagram(&data, peer);
+                }
+                Some(LinkEvent::Closed(reason)) => return self.on_link_closed(&reason),
+                None => return,
+            }
+        }
+    }
+
+    /// The connection to the server ended: the account is registered again
+    /// over a new one, soon.
+    fn on_link_closed(&mut self, reason: &str) {
+        self.link = None;
+        if let Some(old) = self.registration.take() {
+            let id = old.call_id().to_owned();
+            self.stop_retx(&id, &[RetxKind::Register]);
+        }
+        if self.account.is_some() && !self.stopping {
+            self.register_retry = Some(Instant::now() + RECONNECT_DELAY);
+            self.emit(Event::Registration(RegistrationState::Failed(format!(
+                "the connection to the SIP server was lost: {reason}"
+            ))));
+        } else {
+            self.account = None;
+            self.emit(Event::Registration(RegistrationState::Unregistered));
+        }
+    }
+
+    /// Registers again when a failed connection is due for another try, and
+    /// follows the computer to another network address.
+    fn watch_network(&mut self, now: Instant) {
+        if self.stopping {
+            return;
+        }
+        if self.register_retry.is_some_and(|due| now >= due) {
+            self.register_retry = None;
+            if let Some(account) = self.account.clone() {
+                self.registration = None;
+                self.register(account);
+            }
+        }
+        if now < self.next_network_check || self.leaving.is_some() {
+            return;
+        }
+        self.next_network_check = now + NETWORK_CHECK;
+        let idle = self
+            .lines
+            .iter()
+            .all(|line| line.engine.state() == State::Idle);
+        let (Some(server), true) = (self.server, idle && self.account.is_some()) else {
+            return;
+        };
+        // No route at all (the network is down) changes nothing: the
+        // registration keeps trying from where it is.
+        if let Ok(ip) = local_ip_towards(server)
+            && ip != self.local.ip()
+            && !ip.is_unspecified()
+        {
+            self.move_to(ip);
+        }
+    }
+
+    /// Moves the phone to another local address and registers from there.
+    /// The old registration cannot be removed, its network is gone; the
+    /// server forgets it when it expires.
+    fn move_to(&mut self, ip: IpAddr) {
+        let bound = UdpSocket::bind(SocketAddr::new(ip, self.local.port()))
+            .or_else(|_| UdpSocket::bind(SocketAddr::new(ip, 0)))
+            .and_then(|socket| {
+                socket.set_read_timeout(Some(TICK))?;
+                let local = socket.local_addr()?;
+                Ok((socket, local))
+            });
+        let Ok((socket, local)) = bound else {
+            return;
+        };
+        self.socket = socket;
+        self.local = local;
+        self.socket_error = None;
+        self.link = None;
+        self.moved = true;
+        self.emit(Event::LocalAddress(local));
+        let old = self.registration.take();
+        if let Some(old) = old.as_ref() {
+            let id = old.call_id().to_owned();
+            self.stop_retx(&id, &[RetxKind::Register]);
+        }
+        let Some(account) = self.account.clone() else {
+            return;
+        };
+        // The server still holds the old address. It is taken off first,
+        // from the new address: a server that allows one telephone per
+        // account would otherwise refuse the new one until the old expires.
+        if let Some(mut old) = old.filter(Registration::is_bound) {
+            let server = old.server();
+            let connected = !account.transport.is_stream()
+                || account
+                    .connect_host_port()
+                    .map_err(io::Error::other)
+                    .and_then(|(host, _)| {
+                        StreamLink::connect(server, account.transport, &host, account.tls_verify)
+                    })
+                    .map(|link| self.link = Some(link))
+                    .is_ok();
+            if connected {
+                let outputs = old.unregister();
+                self.leaving = Some(old);
+                return self.apply_leaving(outputs);
+            }
+        }
+        self.register(account);
+    }
+
+    /// Sends what removing the old address needs; once that is done (or
+    /// the server did not answer) the phone registers from the new one.
+    fn apply_leaving(&mut self, outputs: Vec<Output>) {
+        let Some((server, id)) = self
+            .leaving
+            .as_ref()
+            .map(|leaving| (leaving.server(), leaving.call_id().to_owned()))
+        else {
+            return;
+        };
+        for output in outputs {
+            if let Output::Send(bytes) = output {
+                self.stop_retx(&id, &[RetxKind::Register]);
+                let _ = self.send(&bytes, server);
+                self.start_retx(
+                    RetxKind::Register,
+                    id.clone(),
+                    bytes,
+                    server,
+                    self.timers.t2,
+                );
+            }
+        }
+        if self.leaving.as_ref().is_some_and(Registration::is_finished) {
+            self.stop_retx(&id, &[RetxKind::Register]);
+            self.leaving = None;
+            if let Some(account) = self.account.clone() {
+                self.register(account);
+            }
         }
     }
 
@@ -1039,6 +1314,19 @@ impl<M: Media> Runner<M> {
         headers: &TransactionHeaders,
         source: SocketAddr,
     ) -> bool {
+        if headers.method == "REGISTER"
+            && let Some(leaving) = self.leaving.as_mut()
+            && headers.call_id == leaving.call_id()
+        {
+            if let Some(outputs) = leaving.on_response(response, headers, Instant::now()) {
+                if response.status_code >= 200 {
+                    let id = headers.call_id.clone();
+                    self.stop_retx(&id, &[RetxKind::Register]);
+                }
+                self.apply_leaving(outputs);
+            }
+            return true;
+        }
         let Some(registration) = self.registration.as_mut() else {
             return false;
         };
@@ -1654,8 +1942,19 @@ impl<M: Media> Runner<M> {
     // ----- sending and timers ---------------------------------------------
 
     fn send(&self, bytes: &[u8], peer: SocketAddr) -> Result<()> {
-        self.trace_message(true, peer, bytes);
-        self.socket.send_to(bytes, peer)?;
+        // What is for the server goes through the connection to it, when
+        // the account uses one; everything else is a datagram.
+        match self.link.as_ref().filter(|link| link.peer() == peer) {
+            Some(link) => {
+                let bytes = with_via_transport(bytes, link.transport());
+                self.trace_message(true, peer, &bytes);
+                link.send(&bytes)?;
+            }
+            None => {
+                self.trace_message(true, peer, bytes);
+                self.socket.send_to(bytes, peer)?;
+            }
+        }
         Ok(())
     }
 
@@ -1709,11 +2008,13 @@ impl<M: Media> Runner<M> {
     fn tick_timers(&mut self) {
         self.cur = self.selected;
         let now = Instant::now();
+        self.watch_network(now);
+        let reliable = self.link.as_ref().map(StreamLink::peer);
         let mut expired = Vec::new();
         for retx in &mut self.retx {
             if now >= retx.deadline {
                 expired.push((retx.kind, retx.call_id.clone()));
-            } else if now >= retx.next {
+            } else if now >= retx.next && Some(retx.peer) != reliable {
                 // A lost retransmission is repaired by the next one.
                 if self.trace {
                     let _ = self.events.send(Event::Trace {
@@ -1733,7 +2034,15 @@ impl<M: Media> Runner<M> {
         if let Some(registration) = self.registration.as_mut() {
             if registration.keepalive_due(now) {
                 // Keeps the router's mapping open; a lost one does not matter.
-                let _ = self.socket.send_to(KEEPALIVE, registration.server());
+                let server = registration.server();
+                match self.link.as_ref().filter(|link| link.peer() == server) {
+                    Some(link) => {
+                        let _ = link.send(KEEPALIVE);
+                    }
+                    None => {
+                        let _ = self.socket.send_to(KEEPALIVE, server);
+                    }
+                }
             }
             let outputs = registration.poll(now);
             self.apply_registration(outputs);
@@ -1741,6 +2050,15 @@ impl<M: Media> Runner<M> {
 
         for (kind, call_id) in expired {
             if kind == RetxKind::Register {
+                if let Some(leaving) = self
+                    .leaving
+                    .as_mut()
+                    .filter(|leaving| leaving.call_id() == call_id)
+                {
+                    let outputs = leaving.on_timeout(now);
+                    self.apply_leaving(outputs);
+                    continue;
+                }
                 if let Some(registration) = self
                     .registration
                     .as_mut()
@@ -2287,9 +2605,12 @@ impl<M: Media> Runner<M> {
         let peer = registration.server();
         let from_uri = format!("sip:{}@{}", registration.username(), registration.domain());
         let contact_uri = format!(
-            "sip:{}@{}",
+            "sip:{}@{}{}",
             registration.username(),
-            registration.contact_address()
+            registration.contact_address(),
+            self.link
+                .as_ref()
+                .map_or("", |link| link.transport().uri_parameter())
         );
         self.start_call(peer, target, from_uri, contact_uri, true)
     }

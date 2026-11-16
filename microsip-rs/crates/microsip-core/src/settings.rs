@@ -60,6 +60,13 @@ pub struct Settings {
     /// Codecs in use, in the order of preference: names separated by
     /// commas (`PCMU,PCMA,G722,opus,G729`). Read with `Codec::parse_list`.
     pub codecs: String,
+    /// How SIP travels to the server: `UDP`, `TCP` or `TLS`.
+    pub transport: String,
+    /// Address everything is sent through instead of the server; usually
+    /// empty.
+    pub proxy: String,
+    /// With TLS: refuse a server whose certificate cannot be trusted.
+    pub tls_verify: bool,
 }
 
 impl Default for Settings {
@@ -91,6 +98,9 @@ impl Default for Settings {
             hotkeys: true,
             light_theme: false,
             codecs: crate::codec::Codec::format_list(&crate::codec::Codec::PREFERRED),
+            transport: "UDP".to_owned(),
+            proxy: String::new(),
+            tls_verify: true,
         }
     }
 }
@@ -137,6 +147,9 @@ impl Settings {
                 "hotkeys" => settings.hotkeys = value != "0",
                 "light_theme" => settings.light_theme = value == "1",
                 "codecs" => settings.codecs = value,
+                "transport" => settings.transport = value,
+                "proxy" => settings.proxy = value,
+                "tls_verify" => settings.tls_verify = value != "0",
                 "auto_answer_delay" => {
                     if let Some(delay) = value.parse::<u32>().ok().filter(|delay| *delay <= 60) {
                         settings.auto_answer_delay = delay;
@@ -177,6 +190,7 @@ impl Settings {
         let close_to_tray = flag(self.close_to_tray);
         let hotkeys = flag(self.hotkeys);
         let light_theme = flag(self.light_theme);
+        let tls_verify = flag(self.tls_verify);
         // Without permission to remember it, no form of the password is written.
         let password_protected = if self.save_password {
             self.password_protected.clone()
@@ -210,6 +224,9 @@ impl Settings {
             ("hotkeys", &hotkeys),
             ("light_theme", &light_theme),
             ("codecs", &self.codecs),
+            ("transport", &self.transport),
+            ("proxy", &self.proxy),
+            ("tls_verify", &tls_verify),
         ] {
             text.push_str(key);
             text.push('=');
@@ -327,6 +344,9 @@ mod tests {
             hotkeys: false,
             light_theme: true,
             codecs: "opus,G722,PCMA".to_owned(),
+            transport: "TLS".to_owned(),
+            proxy: "proxy.example.com:5061".to_owned(),
+            tls_verify: false,
         }
     }
 
@@ -365,7 +385,8 @@ mod tests {
              do_not_disturb=1\nauto_answer=1\nauto_answer_delay=5\n\
              forward=1\nforward_to=4011\n\
              ring_speaker=Speakers (Realtek)\nringtone=C:\\Sounds\\ring.wav\n\
-             close_to_tray=0\nhotkeys=0\nlight_theme=1\ncodecs=opus,G722,PCMA\n"
+             close_to_tray=0\nhotkeys=0\nlight_theme=1\ncodecs=opus,G722,PCMA\n\
+             transport=TLS\nproxy=proxy.example.com:5061\ntls_verify=0\n"
         );
         // No line holds the password itself; `save_password` and
         // `password_protected` are different keys.

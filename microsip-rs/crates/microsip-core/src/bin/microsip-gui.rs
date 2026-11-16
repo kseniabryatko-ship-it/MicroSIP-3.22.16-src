@@ -20,6 +20,7 @@ use microsip_core::recording::recording_file_name;
 use microsip_core::registration::{Account, RegistrationState};
 use microsip_core::secret;
 use microsip_core::settings::{self, Settings, default_recordings_dir};
+use microsip_core::stream::SipTransport;
 use microsip_core::tones::Melody;
 use microsip_core::transport::{local_ip_towards, resolve_socket_address};
 use microsip_core::winshell::{self, Shell, ShellOptions};
@@ -145,6 +146,9 @@ struct PhoneWindow {
     show_password: bool,
     save_password: bool,
     local_port: String,
+    transport: SipTransport,
+    proxy: String,
+    tls_verify: bool,
 
     // Sound.
     microphone: String,
@@ -312,6 +316,9 @@ impl PhoneWindow {
             password,
             show_password: false,
             save_password: saved.save_password,
+            transport: SipTransport::from_name(&saved.transport),
+            proxy: saved.proxy.clone(),
+            tls_verify: saved.tls_verify,
             local_port: if saved.local_port == 0 {
                 String::new()
             } else {
@@ -503,6 +510,9 @@ impl PhoneWindow {
             hotkeys: self.hotkeys,
             light_theme: self.light_theme,
             codecs: Codec::format_list(&self.codecs),
+            transport: self.transport.name().to_owned(),
+            proxy: self.proxy.trim().to_owned(),
+            tls_verify: self.tls_verify,
         };
         if current == self.saved {
             return;
@@ -550,8 +560,11 @@ impl PhoneWindow {
         self.save_settings();
         let account = Account::new(self.server.trim(), self.user.trim(), self.password.trim())
             .with_domain(self.domain.trim())
-            .with_auth_username(self.auth_user.trim());
-        let server = match account.server_host_port().and_then(|(host, port)| {
+            .with_auth_username(self.auth_user.trim())
+            .with_transport(self.transport)
+            .with_proxy(self.proxy.trim())
+            .with_tls_verify(self.tls_verify);
+        let server = match account.connect_host_port().and_then(|(host, port)| {
             resolve_socket_address(&host, port)
                 .map_err(|error| format!("сервер {host} не найден: {error}"))
         }) {
@@ -941,6 +954,10 @@ impl PhoneWindow {
                 Event::Registration(state) => {
                     self.log(format!("Аккаунт: {}", registration_text(&state)));
                     self.registration = Some(state);
+                }
+                Event::LocalAddress(address) => {
+                    self.local = Some(address);
+                    self.log(format!("Сеть изменилась: телефон теперь на {address}"));
                 }
                 Event::Trace {
                     outgoing,
@@ -1819,6 +1836,20 @@ impl PhoneWindow {
                             ui.label("Логин (если отличается)");
                             ui.text_edit_singleline(&mut self.auth_user);
                             ui.end_row();
+ui.label("Транспорт");
+ui.horizontal(|ui| {
+    for transport in SipTransport::ALL {
+        ui.radio_value(&mut self.transport, transport, transport.name());
+    }
+});
+ui.end_row();
+ui.label("Прокси (если есть)");
+ui.add(
+    egui::TextEdit::singleline(&mut self.proxy)
+        .hint_text("не используется")
+        .desired_width(170.0),
+);
+ui.end_row();
                             ui.label("Локальный порт");
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.local_port)
@@ -1827,6 +1858,12 @@ impl PhoneWindow {
                             );
                             ui.end_row();
                         });
+if self.transport == SipTransport::Tls {
+    ui.checkbox(&mut self.tls_verify, "Проверять сертификат сервера (TLS)");
+    if !self.tls_verify {
+        ui.weak("Без проверки связь шифруется, но сервер может оказаться подменённым.");
+    }
+}
                         if secret::is_available() {
                             ui.checkbox(&mut self.save_password, "Запомнить пароль");
                             ui.weak(
@@ -2180,11 +2217,17 @@ fn registration_text(state: &RegistrationState) -> String {
         RegistrationState::Unregistered => "не в сети".to_owned(),
         RegistrationState::Failed(reason) => {
             let reason = if reason.starts_with("wrong user name or password") {
-                "неверный номер или пароль"
+                "неверный номер или пароль".to_owned()
             } else if reason.starts_with("no response") {
-                "сервер не отвечает"
+                "сервер не отвечает".to_owned()
+            } else if reason.contains("certificate") {
+                "сертификат сервера не прошёл проверку (TLS)".to_owned()
+            } else if reason.starts_with("cannot connect") {
+                "не удалось соединиться с сервером, пробую снова".to_owned()
+            } else if reason.starts_with("the connection to the SIP server was lost") {
+                "соединение с сервером прервалось, подключаюсь снова".to_owned()
             } else {
-                reason.as_str()
+                reason.clone()
             };
             format!("Ошибка: {reason}")
         }

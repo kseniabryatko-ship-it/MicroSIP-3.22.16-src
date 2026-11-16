@@ -842,7 +842,16 @@ impl RegisterRequest {
             .header("to", format_angle_uri(&self.aor))?
             .header("call-id", self.call_id)?
             .header("cseq", format!("{} REGISTER", self.cseq))?
-            .header("contact", format_angle_uri(&self.contact))?
+            // `*` with a lifetime of zero removes every binding of the
+            // address of record (RFC 3261, 10.2.2).
+            .header(
+                "contact",
+                if self.contact == "*" {
+                    self.contact.clone()
+                } else {
+                    format_angle_uri(&self.contact)
+                },
+            )?
             .header("max-forwards", "70")?;
 
         if let Some(expires) = self.expires {

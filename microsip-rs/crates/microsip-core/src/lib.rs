@@ -16,6 +16,7 @@ pub mod rtp;
 pub mod secret;
 pub mod settings;
 pub mod sip;
+pub mod stream;
 pub mod tones;
 pub mod transport;
 pub mod winshell;

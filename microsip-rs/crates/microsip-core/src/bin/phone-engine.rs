@@ -7,6 +7,7 @@ use microsip_core::call_media::{AudioMedia, NullMedia, ToneMedia, ToneReport};
 use microsip_core::call_runner::{CallHandle, EndReason, Event, Timers, UiCommand, spawn_lines};
 use microsip_core::codec::Codec;
 use microsip_core::registration::{Account, RegistrationState};
+use microsip_core::stream::SipTransport;
 use std::error::Error;
 use std::io::{self, BufRead};
 use std::net::SocketAddr;
@@ -16,7 +17,8 @@ use std::thread;
 use std::time::Duration;
 
 const HELP: &str = "Usage: phone-engine.exe LOCAL_IP:SIP_PORT [--no-audio] [--trace]\n\
-       [--codecs=LIST] [--tone=HZ]\n\
+       [--codecs=LIST] [--tone=HZ] [--transport=udp|tcp|tls]\n\
+       [--proxy=HOST[:PORT]] [--tls-insecure]\n\
 Port 0 picks a free port; the chosen address is printed on the first line.\n\
 Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit\n\
           register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister\n\
@@ -28,7 +30,10 @@ USER@DOMAIN) dials through it.\n\
 (the Digest response value is hidden).\n\
 --codecs=opus,G722,PCMA sets the codecs and their order (PCMU, PCMA, G722,\n\
 opus, G729). --tone=440 needs no sound devices: it sends a tone of that\n\
-pitch and prints what was heard when the call ends.";
+pitch and prints what was heard when the call ends.\n\
+--transport sets how register talks to the server (default udp); --proxy\n\
+sends everything through that address instead; --tls-insecure accepts a\n\
+TLS certificate that cannot be checked.";
 
 const COMMANDS: &str = "Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit | \
 register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister | dtmf DIGITS | mute | unmute | hold | resume | transfer NUMBER | dnd on|off | line 1|2 | join | conference on|off | forward NUMBER|off";
@@ -66,6 +71,11 @@ struct Phone {
     registration: String,
     registered: bool,
     quitting: bool,
+    /// How `register` reaches the server: --transport, --proxy,
+    /// --tls-insecure.
+    transport: SipTransport,
+    proxy: String,
+    tls_verify: bool,
     /// With --tone: what the test tone's receiver heard in the last call.
     tone: Option<Arc<Mutex<ToneReport>>>,
 }
@@ -152,6 +162,10 @@ impl Phone {
                 }
             }
             Event::Codec(codec) => println!("Codec: {codec}"),
+            Event::LocalAddress(address) => {
+                self.local = address;
+                println!("Moved to {address}");
+            }
             Event::Registration(state) => {
                 self.registration = state.to_string();
                 self.registered = matches!(state, RegistrationState::Registered { .. });
@@ -218,8 +232,11 @@ impl Phone {
                     println!("Usage: register SERVER[:PORT] USER PASSWORD [DOMAIN]");
                     return;
                 };
-                let account =
-                    Account::new(server, user, password).with_domain(parts.next().unwrap_or(""));
+                let account = Account::new(server, user, password)
+                    .with_domain(parts.next().unwrap_or(""))
+                    .with_transport(self.transport)
+                    .with_proxy(self.proxy.clone())
+                    .with_tls_verify(self.tls_verify);
                 self.handle.send(UiCommand::Register(account));
             }
             Some("dtmf") => match parts.next() {
@@ -367,6 +384,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             .find_map(|argument| argument.strip_prefix(name)?.strip_prefix('='))
     };
     let codecs = value("--codecs").map(Codec::parse_list);
+    let transport = value("--transport").map_or(SipTransport::Udp, SipTransport::from_name);
+    let proxy = value("--proxy").unwrap_or("").to_owned();
+    let tls_verify = !args.iter().any(|argument| argument == "--tls-insecure");
     let tone_hz = match value("--tone").map(str::parse::<f32>) {
         Some(Ok(hz)) if (50.0..=3_400.0).contains(&hz) => Some(hz),
         Some(_) => return Err("--tone takes a pitch from 50 to 3400 Hz".into()),
@@ -376,7 +396,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|argument| !argument.starts_with("--"))
         .collect();
-    if positional.len() != 1 || args.len() - positional.len() > 4 {
+    if positional.len() != 1 || args.len() - positional.len() > 7 {
         println!("{HELP}");
         return Err("expected LOCAL_IP:SIP_PORT".into());
     }
@@ -437,6 +457,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         registration: "not registered".to_owned(),
         registered: false,
         quitting: false,
+        transport,
+        proxy,
+        tls_verify,
         tone,
     };
     let mut input_open = true;

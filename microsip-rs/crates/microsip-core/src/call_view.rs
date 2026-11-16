@@ -178,6 +178,7 @@ impl CallView {
             | Event::Declined { .. }
             | Event::Caller { .. }
             | Event::Registration(_)
+            | Event::LocalAddress(_)
             | Event::Trace { .. }
             | Event::Error(_) => {}
         }

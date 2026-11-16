@@ -577,3 +577,89 @@ fn trace_reports_both_directions_without_the_digest_response() {
     assert!(received[0].contains("nonce=\"nonce-1\""));
     assert!(received[1].starts_with("SIP/2.0 200"));
 }
+
+/// A phone on another loopback address than the one the system uses to
+/// reach the registrar: to the phone this is what a changed network looks
+/// like, so it must move.
+#[test]
+fn phone_follows_the_computer_to_another_address_and_registers_there() {
+    let registrar = Registrar::new();
+    let handle = spawn_with_timers(
+        "127.0.0.2:0".parse().unwrap(),
+        "phone",
+        Timers::default(),
+        NullMedia::default,
+    )
+    .expect("executor should start");
+    let old = handle.local_address();
+    assert!(handle.send(UiCommand::Register(registrar.account(PASSWORD))));
+    let (first, peer) = registrar.next_register(None);
+    assert_eq!(peer, old);
+    registrar.reply(&first, peer, 200, &[("expires", "120")]);
+
+    // The old address is taken off the server from the new one ...
+    let (removal, peer) = registrar.next_register(Some(&first));
+    let new: SocketAddr = format!("127.0.0.1:{}", old.port()).parse().unwrap();
+    assert_eq!(peer, new);
+    assert_eq!(removal.headers.get("expires"), Some("0"));
+    assert_eq!(
+        removal.headers.get("contact"),
+        Some(format!("<sip:alice@{old}>").as_str())
+    );
+    registrar.reply(&removal, peer, 200, &[]);
+
+    // ... and the phone registers its new address. This registrar still
+    // counts the old one and refuses.
+    let (moved, peer) = registrar.next_register(None);
+    assert_eq!(peer, new);
+    assert_eq!(
+        moved.headers.get("contact"),
+        Some(format!("<sip:alice@{new}>").as_str())
+    );
+    assert_eq!(moved.headers.get("expires"), Some("120"));
+    registrar.reply(&moved, peer, 403, &[]);
+
+    // So every binding of the account is removed, once ...
+    let (clearing, peer) = registrar.next_register(None);
+    assert_eq!(clearing.headers.get("contact"), Some("*"));
+    assert_eq!(clearing.headers.get("expires"), Some("0"));
+    registrar.reply(&clearing, peer, 200, &[]);
+
+    // ... and the new address is accepted.
+    let (again, peer) = registrar.next_register(None);
+    assert_eq!(
+        again.headers.get("contact"),
+        Some(format!("<sip:alice@{new}>").as_str())
+    );
+    registrar.reply(&again, peer, 200, &[("expires", "120")]);
+
+    // The interface was told about the move and the final success, and
+    // never saw the refusal in between.
+    let deadline = Instant::now() + WAIT;
+    let mut moved_to = None;
+    let mut states = Vec::new();
+    while Instant::now() < deadline
+        && states.last() != Some(&RegistrationState::Registered { expires: 120 })
+        || moved_to.is_none() && Instant::now() < deadline
+    {
+        match handle.wait_event(Duration::from_millis(50)) {
+            Some(Event::LocalAddress(address)) => {
+                moved_to = Some(address);
+                states.clear();
+            }
+            Some(Event::Registration(state)) => states.push(state),
+            _ => {}
+        }
+    }
+    assert_eq!(moved_to, Some(new));
+    assert_eq!(
+        states.last(),
+        Some(&RegistrationState::Registered { expires: 120 })
+    );
+    assert!(
+        states
+            .iter()
+            .all(|state| !matches!(state, RegistrationState::Failed(_))),
+        "{states:?}"
+    );
+}

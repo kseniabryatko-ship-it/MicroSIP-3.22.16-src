@@ -17,6 +17,7 @@
 
 use crate::sip::digest::{DigestChallenge, authorization_header};
 use crate::sip::message::{Headers, RegisterRequest, Response};
+use crate::stream::SipTransport;
 use crate::transaction_headers::TransactionHeaders;
 use std::fmt;
 use std::net::SocketAddr;
@@ -53,6 +54,13 @@ pub struct Account {
     pub password: String,
     /// Requested registration lifetime in seconds.
     pub expires: u32,
+    /// How SIP messages travel to the server.
+    pub transport: SipTransport,
+    /// Where to send everything instead of straight to `server`, written
+    /// like `server`; empty means no proxy.
+    pub proxy: String,
+    /// With TLS: refuse a server whose certificate cannot be trusted.
+    pub tls_verify: bool,
 }
 
 impl Account {
@@ -68,6 +76,34 @@ impl Account {
             auth_username: String::new(),
             password: password.into(),
             expires: DEFAULT_EXPIRES,
+            transport: SipTransport::Udp,
+            proxy: String::new(),
+            tls_verify: true,
+        }
+    }
+
+    pub fn with_transport(mut self, transport: SipTransport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    pub fn with_proxy(mut self, proxy: impl Into<String>) -> Self {
+        self.proxy = proxy.into();
+        self
+    }
+
+    pub fn with_tls_verify(mut self, verify: bool) -> Self {
+        self.tls_verify = verify;
+        self
+    }
+
+    /// Host and port messages are really sent to: the proxy when there is
+    /// one, the registrar otherwise.
+    pub fn connect_host_port(&self) -> Result<(String, u16), String> {
+        if self.proxy.trim().is_empty() {
+            self.server_host_port()
+        } else {
+            host_port(&self.proxy, self.transport.default_port(), "SIP proxy")
         }
     }
 
@@ -86,38 +122,10 @@ impl Account {
         self
     }
 
-    /// Host and port of the registrar, for name resolution.
+    /// Host and port of the registrar, for name resolution. Without a port
+    /// it is the usual one of the transport: 5060, or 5061 for TLS.
     pub fn server_host_port(&self) -> Result<(String, u16), String> {
-        let server = self.server.trim();
-        if server.is_empty() {
-            return Err("the SIP server is empty".to_owned());
-        }
-        if let Ok(address) = server.parse::<SocketAddr>() {
-            return Ok((address.ip().to_string(), address.port()));
-        }
-        if let Some(inner) = server
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            return Ok((inner.to_owned(), DEFAULT_SIP_PORT));
-        }
-        let (host, port) = match server.rsplit_once(':') {
-            // More than one colon without brackets is a bare IPv6 address.
-            Some((host, _)) if host.contains(':') => (server, DEFAULT_SIP_PORT),
-            Some((host, port)) => {
-                let port = port
-                    .parse::<u16>()
-                    .ok()
-                    .filter(|port| *port != 0)
-                    .ok_or_else(|| format!("invalid SIP server port: {port}"))?;
-                (host, port)
-            }
-            None => (server, DEFAULT_SIP_PORT),
-        };
-        if host.is_empty() || host.contains(char::is_whitespace) || host.contains('@') {
-            return Err(format!("invalid SIP server: {server}"));
-        }
-        Ok((host.to_owned(), port))
+        host_port(&self.server, self.transport.default_port(), "SIP server")
     }
 
     /// The SIP domain used in the address of record.
@@ -239,6 +247,8 @@ pub struct Registration {
     next_attempt: Option<Instant>,
     reported: Option<RegistrationState>,
     finished: bool,
+    /// Removing every binding of the account, not only this phone's.
+    wildcard: bool,
 }
 
 impl Registration {
@@ -280,6 +290,7 @@ impl Registration {
             next_attempt: None,
             reported: None,
             finished: false,
+            wildcard: false,
         })
     }
 
@@ -391,6 +402,18 @@ impl Registration {
             self.finish(&mut outputs);
         }
         outputs
+    }
+
+    /// Removes every binding the server holds for the account, whichever
+    /// address made it, and finishes. For a phone that moved to another
+    /// address and is refused there because the server still counts the
+    /// old one.
+    pub fn unregister_all(&mut self) -> Vec<Output> {
+        self.wildcard = true;
+        self.bound = true;
+        self.transaction = None;
+        self.next_attempt = None;
+        self.unregister()
     }
 
     /// Starts a refresh or a retry when it is due.
@@ -626,7 +649,15 @@ impl Registration {
     }
 
     fn contact_uri(&self) -> String {
-        format!("sip:{}@{}", self.username, self.contact)
+        if self.wildcard {
+            return "*".to_owned();
+        }
+        format!(
+            "sip:{}@{}{}",
+            self.username,
+            self.contact,
+            self.account.transport.uri_parameter()
+        )
     }
 
     fn authorization(&self, response: &Response) -> Result<(&'static str, String), String> {
@@ -653,6 +684,41 @@ impl Registration {
             outputs.push(Output::State(state));
         }
     }
+}
+
+/// Splits `host`, `host:port`, `ip:port` or `[ipv6]:port`; `what` names the
+/// setting in error messages.
+fn host_port(text: &str, default_port: u16, what: &str) -> Result<(String, u16), String> {
+    let server = text.trim();
+    if server.is_empty() {
+        return Err(format!("the {what} is empty"));
+    }
+    if let Ok(address) = server.parse::<SocketAddr>() {
+        return Ok((address.ip().to_string(), address.port()));
+    }
+    if let Some(inner) = server
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        return Ok((inner.to_owned(), default_port));
+    }
+    let (host, port) = match server.rsplit_once(':') {
+        // More than one colon without brackets is a bare IPv6 address.
+        Some((host, _)) if host.contains(':') => (server, default_port),
+        Some((host, port)) => {
+            let port = port
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or_else(|| format!("invalid {what} port: {port}"))?;
+            (host, port)
+        }
+        None => (server, default_port),
+    };
+    if host.is_empty() || host.contains(char::is_whitespace) || host.contains('@') {
+        return Err(format!("invalid {what}: {server}"));
+    }
+    Ok((host.to_owned(), port))
 }
 
 /// Asks the server to answer to the source port of the request and to report
@@ -746,6 +812,69 @@ fn granted_expires(headers: &Headers, contact_uri: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_and_proxy_decide_where_messages_go() {
+        let plain = Account::new("pbx.example.com", "alice", "x");
+        assert_eq!(
+            plain.connect_host_port(),
+            Ok(("pbx.example.com".to_owned(), 5060))
+        );
+        // TLS has a usual port of its own; a port that is given stays.
+        let tls = plain.clone().with_transport(SipTransport::Tls);
+        assert_eq!(
+            tls.server_host_port(),
+            Ok(("pbx.example.com".to_owned(), 5061))
+        );
+        let tls =
+            Account::new("pbx.example.com:5070", "alice", "x").with_transport(SipTransport::Tls);
+        assert_eq!(
+            tls.connect_host_port(),
+            Ok(("pbx.example.com".to_owned(), 5070))
+        );
+        // A proxy takes the messages; the domain stays the server's.
+        let proxied = plain.clone().with_proxy(" 10.0.0.9:5080 ");
+        assert_eq!(
+            proxied.connect_host_port(),
+            Ok(("10.0.0.9".to_owned(), 5080))
+        );
+        assert_eq!(proxied.effective_domain(), Ok("pbx.example.com".to_owned()));
+        assert!(
+            plain
+                .with_proxy("bad host")
+                .connect_host_port()
+                .unwrap_err()
+                .contains("SIP proxy")
+        );
+    }
+
+    #[test]
+    fn contact_names_the_transport_and_all_bindings_can_be_removed() {
+        let server: SocketAddr = "192.0.2.1:5060".parse().unwrap();
+        let local: SocketAddr = "192.0.2.7:40123".parse().unwrap();
+        let account = Account::new("192.0.2.1", "alice", "x").with_transport(SipTransport::Tcp);
+        let mut registration = Registration::new(account, server, local, "seed").unwrap();
+        let sent = |outputs: Vec<Output>| -> String {
+            outputs
+                .into_iter()
+                .find_map(|output| match output {
+                    Output::Send(bytes) => Some(String::from_utf8(bytes).unwrap()),
+                    Output::State(_) => None,
+                })
+                .expect("a request")
+        };
+        let first = sent(registration.start());
+        assert!(
+            first
+                .to_lowercase()
+                .contains("contact: <sip:alice@192.0.2.7:40123;transport=tcp>\r\n"),
+            "{first}"
+        );
+
+        let removal = sent(registration.unregister_all()).to_lowercase();
+        assert!(removal.contains("contact: *\r\n"), "{removal}");
+        assert!(removal.contains("expires: 0\r\n"), "{removal}");
+    }
     use crate::sip::message::{Message, Request, ResponseBuilder};
 
     const CHALLENGE: &str = "Digest realm=\"pbx\", nonce=\"abc123\", qop=\"auth\", algorithm=MD5";
