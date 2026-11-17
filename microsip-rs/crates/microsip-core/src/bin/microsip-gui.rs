@@ -20,6 +20,7 @@ use microsip_core::recording::recording_file_name;
 use microsip_core::registration::{Account, RegistrationState};
 use microsip_core::secret;
 use microsip_core::settings::{self, Settings, default_recordings_dir};
+use microsip_core::srtp::MediaEncryption;
 use microsip_core::stream::SipTransport;
 use microsip_core::tones::Melody;
 use microsip_core::transport::{local_ip_towards, resolve_socket_address};
@@ -149,6 +150,8 @@ struct PhoneWindow {
     transport: SipTransport,
     proxy: String,
     tls_verify: bool,
+    encryption: MediaEncryption,
+    stun: String,
 
     // Sound.
     microphone: String,
@@ -319,6 +322,8 @@ impl PhoneWindow {
             transport: SipTransport::from_name(&saved.transport),
             proxy: saved.proxy.clone(),
             tls_verify: saved.tls_verify,
+            encryption: MediaEncryption::from_name(&saved.media_encryption),
+            stun: saved.stun.clone(),
             local_port: if saved.local_port == 0 {
                 String::new()
             } else {
@@ -513,6 +518,8 @@ impl PhoneWindow {
             transport: self.transport.name().to_owned(),
             proxy: self.proxy.trim().to_owned(),
             tls_verify: self.tls_verify,
+            media_encryption: self.encryption.name().to_owned(),
+            stun: self.stun.trim().to_owned(),
         };
         if current == self.saved {
             return;
@@ -591,6 +598,8 @@ impl PhoneWindow {
         handle.send(UiCommand::DoNotDisturb(self.do_not_disturb));
         handle.send(UiCommand::Forward(self.forward_target()));
         handle.send(UiCommand::Codecs(self.codecs.clone()));
+        handle.send(UiCommand::Encryption(self.encryption));
+        handle.send(UiCommand::Stun(Some(self.stun.trim().to_owned())));
         handle.send(UiCommand::Register(account));
         if let Some(shell) = self.shell.as_ref() {
             shell.watch_ringing(Some(handle.ringing_flag()));
@@ -964,7 +973,7 @@ impl PhoneWindow {
                     peer,
                     text,
                 } => self.trace(outgoing, peer, &text),
-                Event::Line(_) | Event::Codec(_) => {}
+                Event::Line(_) | Event::Codec(_) | Event::Encrypted(_) => {}
                 Event::Selected(line) => self.selected = line.min(LINES - 1),
                 Event::Conference(on) => {
                     self.conference = on;
@@ -1605,9 +1614,14 @@ impl PhoneWindow {
             let state = match (phase, call.connected) {
                 (Phase::Connected, Some(connected)) => {
                     let time = format_duration(connected.elapsed().as_secs());
+                    let secure = if self.lines[self.at].view.is_encrypted() {
+                        " · шифруется"
+                    } else {
+                        ""
+                    };
                     match self.lines[self.at].view.codec() {
-                        Some(codec) => format!("Разговор {time} · {codec}"),
-                        None => format!("Разговор {time}"),
+                        Some(codec) => format!("Разговор {time} · {codec}{secure}"),
+                        None => format!("Разговор {time}{secure}"),
                     }
                 }
                 _ => phase_text(phase).to_owned(),
@@ -1842,6 +1856,23 @@ ui.horizontal(|ui| {
         ui.radio_value(&mut self.transport, transport, transport.name());
     }
 });
+ui.end_row();
+ui.label("STUN-сервер");
+ui.add(
+    egui::TextEdit::singleline(&mut self.stun)
+        .hint_text("не используется")
+        .desired_width(170.0),
+);
+ui.end_row();
+ui.label("Шифрование (SRTP)");
+egui::ComboBox::from_id_salt("media-encryption")
+    .selected_text(encryption_text(self.encryption))
+    .width(170.0)
+    .show_ui(ui, |ui| {
+        for mode in MediaEncryption::ALL {
+            ui.selectable_value(&mut self.encryption, mode, encryption_text(mode));
+        }
+    });
 ui.end_row();
 ui.label("Прокси (если есть)");
 ui.add(
@@ -2148,7 +2179,7 @@ fn end_reason_text(reason: EndReason) -> String {
 /// Messages of the phone's core, in Russian where they are known. The text
 /// after the first colon (a system detail) is kept as it is.
 fn error_text(message: &str) -> String {
-    const KNOWN: [(&str, &str); 12] = [
+    const KNOWN: [(&str, &str); 13] = [
         (
             "Cannot play the ringing sound",
             "Не удалось воспроизвести звонок",
@@ -2171,6 +2202,7 @@ fn error_text(message: &str) -> String {
             "Нет регистрации на сервере — позвонить на номер нельзя",
         ),
         ("invalid number or SIP address", "Неверный номер"),
+        ("STUN server", "STUN-сервер"),
         ("a call is already in progress", "Уже идёт вызов"),
         (
             "digits can be sent only during a connected call",
@@ -2183,6 +2215,15 @@ fn error_text(message: &str) -> String {
         }
     }
     message.to_owned()
+}
+
+/// The encryption modes as the settings list them.
+fn encryption_text(mode: MediaEncryption) -> &'static str {
+    match mode {
+        MediaEncryption::Off => "выключено",
+        MediaEncryption::Optional => "если АТС умеет",
+        MediaEncryption::Required => "обязательно",
+    }
 }
 
 /// A few words on what a codec is good for.

@@ -8,6 +8,7 @@ use crate::recording::{CallRecorder, RecorderInput};
 use crate::resample::Resampler;
 use crate::rtp::PCMU_CLOCK_RATE;
 use crate::rtp::session::{RtpSession, RtpSessionConfig};
+use crate::srtp::SrtpKeys;
 use crate::tones::{Melody, MelodyPlayer, TONE_RATE, Tone, ToneGenerator};
 use std::collections::VecDeque;
 use std::error::Error;
@@ -73,6 +74,13 @@ pub trait Media {
     /// Reserves a local RTP port and returns the address to advertise in SDP.
     fn prepare(&mut self, ip: IpAddr) -> Result<SocketAddr, MediaError>;
 
+    /// Asks a STUN server under which address the reserved port is seen
+    /// from the internet. `None` when there is no port, the server does
+    /// not answer, or this media cannot ask. Called after `prepare`.
+    fn public_address(&mut self, _stun: SocketAddr) -> Option<SocketAddr> {
+        None
+    }
+
     /// Starts sending and receiving audio. Called after `prepare`.
     fn start(&mut self, remote: SocketAddr) -> Result<(), MediaError>;
 
@@ -102,6 +110,10 @@ pub trait Media {
     /// else the other side listed and so may send. Called after
     /// [`Media::set_codec`].
     fn set_payload_types(&mut self, _payload_type: u8, _listed: Vec<(u8, Codec)>) {}
+
+    /// Tells the media the keys for encrypting the call's audio (SRTP);
+    /// `None` for a call in the clear. Called before `start`.
+    fn set_srtp(&mut self, _keys: Option<SrtpKeys>) {}
 
     /// Tells the media which telephone-event payload type the other side
     /// agreed to (`None`: digits go as tones in the voice). Called before
@@ -154,6 +166,10 @@ impl Media for NullMedia {
         let address = socket.local_addr()?;
         self.socket = Some(socket);
         Ok(address)
+    }
+
+    fn public_address(&mut self, stun: SocketAddr) -> Option<SocketAddr> {
+        crate::stun::query(self.socket.as_ref()?, stun).ok()
     }
 
     fn start(&mut self, _remote: SocketAddr) -> Result<(), MediaError> {
@@ -223,6 +239,7 @@ pub struct ToneMedia {
     codec: Codec,
     payload_type: Option<u8>,
     listed: Vec<(u8, Codec)>,
+    srtp: Option<SrtpKeys>,
     dtmf_payload_type: Option<u8>,
     session: Option<RtpSession>,
     feeder: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
@@ -241,6 +258,7 @@ impl ToneMedia {
             codec: Codec::Pcmu,
             payload_type: None,
             listed: Vec::new(),
+            srtp: None,
             dtmf_payload_type: None,
             session: None,
             feeder: None,
@@ -259,6 +277,10 @@ impl Media for ToneMedia {
         Ok(address)
     }
 
+    fn public_address(&mut self, stun: SocketAddr) -> Option<SocketAddr> {
+        crate::stun::query(self.socket.as_ref()?, stun).ok()
+    }
+
     fn start(&mut self, remote: SocketAddr) -> Result<(), MediaError> {
         let socket = self
             .socket
@@ -269,7 +291,8 @@ impl Media for ToneMedia {
             .with_dtmf_payload_type(self.dtmf_payload_type)
             .with_codec(self.codec)
             .with_payload_type(self.payload_type.unwrap_or(self.codec.payload_type()))
-            .with_receive_types(self.listed.clone());
+            .with_receive_types(self.listed.clone())
+            .with_srtp(self.srtp.clone());
         if let Ok(mut meter) = self.meter.lock() {
             *meter = ToneMeter::default();
         }
@@ -336,6 +359,10 @@ impl Media for ToneMedia {
     fn set_payload_types(&mut self, payload_type: u8, listed: Vec<(u8, Codec)>) {
         self.payload_type = Some(payload_type);
         self.listed = listed;
+    }
+
+    fn set_srtp(&mut self, keys: Option<SrtpKeys>) {
+        self.srtp = keys;
     }
 
     fn set_dtmf_payload_type(&mut self, payload_type: Option<u8>) {
@@ -591,6 +618,8 @@ pub struct AudioMedia {
     payload_type: Option<u8>,
     /// What else the other side may send.
     listed: Vec<(u8, Codec)>,
+    /// Keys of an encrypted call.
+    srtp: Option<SrtpKeys>,
     /// Playback reserve the last call ended with; the next call on the
     /// same connection starts from it instead of learning it again.
     reserve_ms: u32,
@@ -724,6 +753,10 @@ impl Media for AudioMedia {
         Ok(address)
     }
 
+    fn public_address(&mut self, stun: SocketAddr) -> Option<SocketAddr> {
+        crate::stun::query(self.socket.as_ref()?, stun).ok()
+    }
+
     fn start(&mut self, remote: SocketAddr) -> Result<(), MediaError> {
         // The call's own audio takes the speaker over from the ringing.
         self.ringer = None;
@@ -762,7 +795,8 @@ impl Media for AudioMedia {
             .with_dtmf_payload_type(self.dtmf_payload_type)
             .with_codec(self.codec)
             .with_payload_type(self.payload_type.unwrap_or(self.codec.payload_type()))
-            .with_receive_types(self.listed.clone());
+            .with_receive_types(self.listed.clone())
+            .with_srtp(self.srtp.clone());
         // The sound of this call: 8 kHz for G.711 and G.729, 16 kHz for
         // G.722 and Opus.
         let heard_rate = config.decoded_sample_rate();
@@ -890,6 +924,10 @@ impl Media for AudioMedia {
     fn set_payload_types(&mut self, payload_type: u8, listed: Vec<(u8, Codec)>) {
         self.payload_type = Some(payload_type);
         self.listed = listed;
+    }
+
+    fn set_srtp(&mut self, keys: Option<SrtpKeys>) {
+        self.srtp = keys;
     }
 
     fn set_dtmf_payload_type(&mut self, payload_type: Option<u8>) {

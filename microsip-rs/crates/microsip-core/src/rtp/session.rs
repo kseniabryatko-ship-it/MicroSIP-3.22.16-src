@@ -2,6 +2,7 @@ use crate::codec::{Codec, VoiceDecoder};
 use crate::resample::Resampler;
 use crate::rtp::order::{OrderStats, PacketOrderer, Released};
 use crate::rtp::{PcmuStream, RtpError, RtpPacket};
+use crate::srtp::{SrtpKeys, SrtpReceiver, SrtpSender};
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -87,6 +88,7 @@ pub struct RtpSessionConfig {
     codec: Codec,
     payload_type: Option<u8>,
     receive_types: Vec<(u8, Codec)>,
+    srtp: Option<SrtpKeys>,
 }
 
 impl RtpSessionConfig {
@@ -100,6 +102,7 @@ impl RtpSessionConfig {
             codec: Codec::Pcmu,
             payload_type: None,
             receive_types: Vec::new(),
+            srtp: None,
         }
     }
 
@@ -136,6 +139,13 @@ impl RtpSessionConfig {
     /// listed in its SDP.
     pub fn with_receive_types(mut self, types: Vec<(u8, Codec)>) -> Self {
         self.receive_types = types;
+        self
+    }
+
+    /// Encrypts and signs the packets both ways (SRTP) with the keys
+    /// agreed in SDP. Received packets that fail the check are dropped.
+    pub fn with_srtp(mut self, keys: Option<SrtpKeys>) -> Self {
+        self.srtp = keys;
         self
     }
 
@@ -209,6 +219,7 @@ impl RtpSession {
             codec,
             payload_type,
             receive_types,
+            srtp,
         } = config;
 
         let payload_type = payload_type.unwrap_or(codec.payload_type());
@@ -216,7 +227,16 @@ impl RtpSession {
         pcmu_stream.set_codec(codec);
         pcmu_stream.set_payload_type(payload_type);
         pcmu_stream.set_dtmf_payload_type(dtmf_payload_type);
-        let receiving = Receiving::new(codec, payload_type, receive_types);
+        let mut receiving = Receiving::new(codec, payload_type, receive_types);
+        receiving.srtp = srtp
+            .as_ref()
+            .map(|keys| SrtpReceiver::new(&keys.remote, keys.suite));
+        let outgoing = Outgoing {
+            stream: pcmu_stream,
+            srtp: srtp
+                .as_ref()
+                .map(|keys| SrtpSender::new(&keys.local, keys.suite)),
+        };
         let control = Arc::new(SenderControl::default());
         let sender_control = Arc::clone(&control);
 
@@ -234,7 +254,7 @@ impl RtpSession {
             run_sender(
                 sender_socket,
                 sample_receiver,
-                pcmu_stream,
+                outgoing,
                 remote_address,
                 sender_counter,
                 sender_stop,
@@ -400,10 +420,17 @@ struct SenderControl {
     digits: Mutex<Vec<char>>,
 }
 
+/// The sending side: sound into packets, and the packets encrypted when
+/// the call uses SRTP.
+struct Outgoing {
+    stream: PcmuStream,
+    srtp: Option<SrtpSender>,
+}
+
 fn run_sender(
     socket: UdpSocket,
     samples: Receiver<Vec<f32>>,
-    mut pcmu_stream: PcmuStream,
+    mut outgoing: Outgoing,
     remote_address: SocketAddr,
     sent_packets: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
@@ -422,16 +449,23 @@ fn run_sender(
         };
         if let Ok(mut digits) = control.digits.lock() {
             for digit in digits.drain(..) {
-                pcmu_stream.queue_dtmf(digit);
+                outgoing.stream.queue_dtmf(digit);
             }
         }
         if control.muted.load(Ordering::Acquire) {
             samples.fill(0.0);
         }
-        let packets = pcmu_stream.push_pcm(&samples);
+        let packets = outgoing.stream.push_pcm(&samples);
 
         for packet in packets {
-            let bytes = packet.serialize()?;
+            let mut bytes = packet.serialize()?;
+            if let Some(srtp) = outgoing.srtp.as_mut() {
+                // A packet that cannot be protected is not sent in the clear.
+                match srtp.protect(&bytes) {
+                    Some(protected) => bytes = protected,
+                    None => continue,
+                }
+            }
 
             socket.send_to(&bytes, remote_address)?;
 
@@ -478,7 +512,20 @@ fn run_receiver(
                 // skipped. Servers send DTMF events (payload 101) and comfort
                 // noise (13) on the same port, and may use 10 or 30 ms
                 // packets instead of 20.
-                let Ok(packet) = RtpPacket::parse(&buffer[..length]) else {
+                // With SRTP, what does not carry the other side's signature
+                // is not listened to.
+                let plain;
+                let datagram = match receiving.srtp.as_mut() {
+                    Some(srtp) => match srtp.unprotect(&buffer[..length]) {
+                        Some(unprotected) => {
+                            plain = unprotected;
+                            &plain[..]
+                        }
+                        None => continue,
+                    },
+                    None => &buffer[..length],
+                };
+                let Ok(packet) = RtpPacket::parse(datagram) else {
                     continue;
                 };
 
@@ -548,6 +595,8 @@ struct Receiving {
     /// The sound of that packet, for covering one lost packet where the
     /// codec cannot do it itself.
     previous: Option<Vec<f32>>,
+    /// Checks and decrypts the packets when the call uses SRTP.
+    srtp: Option<SrtpReceiver>,
 }
 
 impl Receiving {
@@ -570,6 +619,7 @@ impl Receiving {
             decoders: Vec::new(),
             last: None,
             previous: None,
+            srtp: None,
         }
     }
 

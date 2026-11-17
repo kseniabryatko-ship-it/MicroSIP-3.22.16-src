@@ -28,6 +28,7 @@ use crate::registration::{
 };
 use crate::sip::message::{Headers, InviteRequest, Message, Request, Response, ResponseBuilder};
 use crate::sip::sdp::{MediaKind, Sdp};
+use crate::srtp::{CryptoLine, MasterKey, MediaEncryption, SrtpKeys, Suite};
 use crate::stream::{LinkEvent, StreamLink, with_via_transport};
 use crate::tones::Tone;
 use crate::transaction_headers::TransactionHeaders;
@@ -52,6 +53,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const NETWORK_CHECK: Duration = Duration::from_secs(3);
 /// Pause before a lost connection to the server is made again.
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+/// How long a STUN server that did not answer is left alone.
+const STUN_REST: Duration = Duration::from_secs(60);
 /// Double CRLF, the keep-alive of RFC 5626; SIP servers ignore or echo it.
 const KEEPALIVE: &[u8] = b"\r\n\r\n";
 
@@ -95,6 +98,12 @@ pub enum UiCommand {
     /// Sets the codecs offered and accepted from the next call on, in the
     /// order of preference. An empty list means all of them.
     Codecs(Vec<Codec>),
+    /// Sets whether the audio of calls is encrypted (SRTP), from the next
+    /// call on.
+    Encryption(MediaEncryption),
+    /// Sets the STUN server (`host` or `host:port`) asked for the public
+    /// address of each call's audio; `None` or an empty name uses none.
+    Stun(Option<String>),
     /// Records the connected call to this WAV file, or stops recording with
     /// `None`. Reported with [`Event::Recording`]; the recording also stops
     /// when the call ends.
@@ -164,6 +173,8 @@ pub enum Event {
     Established,
     /// The codec the call's audio started with.
     Codec(Codec),
+    /// Whether the call's audio is encrypted (SRTP); follows `Codec`.
+    Encrypted(bool),
     /// RTP packet counters, sent just before the media stops.
     MediaStats {
         sent: u64,
@@ -406,6 +417,12 @@ struct Call {
     codec_payload_type: u8,
     /// Every codec of ours the other side listed, with its payload type.
     listed: Vec<(u8, Codec)>,
+    /// Our `a=crypto` line, when this phone offered or accepted SRTP.
+    crypto_local: Option<CryptoLine>,
+    /// The other side's, when it did.
+    crypto_remote: Option<CryptoLine>,
+    /// The audio is announced as RTP/SAVP: encryption is not optional.
+    savp: bool,
     local_tag: String,
     dialog: Option<EstablishedDialog>,
     last_invite_response: Option<Response>,
@@ -476,6 +493,9 @@ impl Call {
             codec: Codec::Pcmu,
             codec_payload_type: Codec::Pcmu.payload_type(),
             listed: Vec::new(),
+            crypto_local: None,
+            crypto_remote: None,
+            savp: false,
             local_tag,
             dialog: None,
             last_invite_response: None,
@@ -509,12 +529,29 @@ impl Call {
     /// Takes over what an SDP body agreed about the audio.
     fn agree(&mut self, agreed: Agreed, body: &[u8]) {
         self.remote_rtp = Some(agreed.address);
+        self.crypto_remote = agreed.crypto;
         self.codec = agreed.codec;
         self.codec_payload_type = agreed.payload_type;
         self.listed = agreed.listed;
         let event = telephone_event_payload_type(body, agreed.codec.clock_rate());
         self.dtmf_payload_type = event.map(|(payload_type, _)| payload_type);
         self.dtmf_clock = event.map_or(8_000, |(_, clock)| clock);
+    }
+
+    /// What our SDP says about encryption: the crypto line and whether the
+    /// audio is announced as RTP/SAVP.
+    fn sdp_crypto(&self) -> Option<(&CryptoLine, bool)> {
+        self.crypto_local.as_ref().map(|line| (line, self.savp))
+    }
+
+    /// The keys of the call's audio, once both sides have named theirs.
+    fn srtp_keys(&self) -> Option<SrtpKeys> {
+        let (local, remote) = (self.crypto_local.as_ref()?, self.crypto_remote.as_ref()?);
+        (local.suite == remote.suite).then(|| SrtpKeys {
+            suite: local.suite,
+            local: local.key.clone(),
+            remote: remote.key.clone(),
+        })
     }
 
     /// The one codec of this call, as written in our SDP.
@@ -572,6 +609,13 @@ struct Runner<M: Media> {
     forward_to: Option<String>,
     /// Codecs offered and accepted, in the user's order of preference.
     codecs: Vec<Codec>,
+    /// Whether calls' audio is encrypted.
+    encryption: MediaEncryption,
+    /// The STUN server asked for the public address of each call's audio.
+    stun: Option<SocketAddr>,
+    /// After the server failed to answer it is left alone until then, so
+    /// that calls are not held up by it one after another.
+    stun_rest_until: Option<Instant>,
     /// Shared with [`CallHandle::ringing_flag`].
     ringing: Arc<AtomicBool>,
     events: Sender<Event>,
@@ -627,6 +671,9 @@ impl<M: Media> Runner<M> {
             conference: false,
             forward_to: None,
             codecs: Codec::PREFERRED.to_vec(),
+            encryption: MediaEncryption::Off,
+            stun: None,
+            stun_rest_until: None,
             ringing: Arc::new(AtomicBool::new(false)),
             events,
             registration: None,
@@ -810,6 +857,31 @@ impl<M: Media> Runner<M> {
             }
             UiCommand::Conference(on) => self.set_conference(on),
             UiCommand::TransferToLine(line) => self.transfer_to_line(line),
+            UiCommand::Stun(server) => {
+                self.stun_rest_until = None;
+                self.stun = None;
+                match server
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                {
+                    // Name resolution blocks this thread, once per command.
+                    Some(name) => match crate::stun::resolve(name) {
+                        Ok(address) => {
+                            self.stun = Some(address);
+                            Ok(())
+                        }
+                        Err(error) => {
+                            Err(format!("STUN server {name} was not found: {error}").into())
+                        }
+                    },
+                    None => Ok(()),
+                }
+            }
+            UiCommand::Encryption(mode) => {
+                self.encryption = mode;
+                Ok(())
+            }
             UiCommand::Codecs(codecs) => {
                 // The phone is never left without a codec.
                 self.codecs = if codecs.is_empty() {
@@ -1151,6 +1223,32 @@ impl<M: Media> Runner<M> {
         }
     }
 
+    /// The address to announce for a call's audio: what the STUN server
+    /// sees the just reserved port as, when one is set and answers; the
+    /// port's own address otherwise.
+    fn audio_address(&mut self, local_rtp: SocketAddr) -> SocketAddr {
+        let now = Instant::now();
+        let Some(stun) = self
+            .stun
+            .filter(|_| self.stun_rest_until.is_none_or(|until| now >= until))
+        else {
+            return local_rtp;
+        };
+        match self.lines[self.cur].media.public_address(stun) {
+            Some(public) => {
+                self.stun_rest_until = None;
+                public
+            }
+            None => {
+                self.stun_rest_until = Some(now + STUN_REST);
+                self.report(format!(
+                    "STUN server {stun} did not answer; the call uses the local address"
+                ));
+                local_rtp
+            }
+        }
+    }
+
     // ----- the connection to the server and the network --------------------
 
     /// Hands over what the TCP or TLS connection received.
@@ -1430,6 +1528,7 @@ impl<M: Media> Runner<M> {
                     call.local_rtp,
                     &call.sdp_codecs(),
                     &call.sdp_events(),
+                    call.sdp_crypto(),
                     1,
                     "sendrecv",
                 );
@@ -1495,11 +1594,17 @@ impl<M: Media> Runner<M> {
                 let (remote_rtp, dtmf) = (call.remote_rtp, call.dtmf_payload_type);
                 let codec = call.codec;
                 let (payload_type, listed) = (call.codec_payload_type, call.listed.clone());
+                let keys = call.srtp_keys();
+                let encrypted = keys.is_some();
+                // Encryption that was promised (RTP/SAVP) but cannot be
+                // kept is a failed call, never a call in the clear.
+                let remote_rtp = remote_rtp.filter(|_| encrypted || !call.savp);
                 let started = match remote_rtp {
                     Some(remote) => {
                         let media = &mut self.lines[self.cur].media;
                         media.set_codec(codec);
                         media.set_payload_types(payload_type, listed);
+                        media.set_srtp(keys);
                         media.set_dtmf_payload_type(dtmf);
                         media.start(remote)
                     }
@@ -1509,6 +1614,7 @@ impl<M: Media> Runner<M> {
                     Ok(()) => {
                         self.lines[self.cur].media_running = true;
                         self.emit(Event::Codec(codec));
+                        self.emit(Event::Encrypted(encrypted));
                     }
                     Err(error) => {
                         self.report(format!("Cannot start audio: {error}"));
@@ -1564,7 +1670,19 @@ impl<M: Media> Runner<M> {
 
         // In an answer the first codec listed is the one the other side uses.
         match negotiate(&response.body, false, &Codec::PREFERRED) {
-            Ok(agreed) => call.agree(agreed, &response.body),
+            Ok(agreed) => {
+                // The answer must take the suite that was offered; without
+                // a usable answer to our crypto line the call is plain.
+                let offered = call.crypto_local.as_ref().map(|line| line.suite);
+                let usable = agreed.crypto.as_ref().map(|line| line.suite) == offered;
+                call.agree(agreed, &response.body);
+                if !usable || offered.is_none() {
+                    call.crypto_remote = None;
+                    if !call.savp {
+                        call.crypto_local = None;
+                    }
+                }
+            }
             Err(_) => call.remote_rtp = None,
         }
         // The caller uses the recorded route in reverse order.
@@ -1639,6 +1757,7 @@ impl<M: Media> Runner<M> {
             call.local_rtp,
             &call.sdp_codecs(),
             &call.sdp_events(),
+            call.sdp_crypto(),
             call.sdp_version,
             direction,
         );
@@ -1905,6 +2024,7 @@ impl<M: Media> Runner<M> {
             call.local_rtp,
             &call.sdp_codecs(),
             &call.sdp_events(),
+            call.sdp_crypto(),
             call.sdp_version,
             ours,
         );
@@ -2320,11 +2440,32 @@ impl<M: Media> Runner<M> {
                 return self.reply_stateless(request, source, 488, "Not Acceptable Here");
             }
         };
+        // Encryption: taken when offered and allowed here; a caller that
+        // insists on it where it is off, or cannot do it where it is
+        // required, is refused.
+        let encrypt = agreed.crypto.is_some() && self.encryption != MediaEncryption::Off;
+        let acceptable = if encrypt {
+            true
+        } else {
+            !agreed.savp && self.encryption != MediaEncryption::Required
+        };
+        let answer_crypto = match (encrypt, agreed.crypto.as_ref()) {
+            (true, Some(theirs)) => MasterKey::generate().ok().map(|key| CryptoLine {
+                tag: theirs.tag,
+                suite: theirs.suite,
+                key,
+            }),
+            _ => None,
+        };
+        if !acceptable || (encrypt && answer_crypto.is_none()) {
+            return self.reply_stateless(request, source, 488, "Not Acceptable Here");
+        }
+        let savp = agreed.savp;
         if contact_uri(&request.headers).is_err() {
             return self.reply_stateless(request, source, 400, "Bad Request");
         }
         let local_rtp = match self.lines[self.cur].media.prepare(self.local.ip()) {
-            Ok(address) => address,
+            Ok(address) => self.audio_address(address),
             Err(error) => {
                 self.report(format!("Cannot reserve audio port: {error}"));
                 return self.reply_stateless(request, source, 500, "Server Internal Error");
@@ -2334,6 +2475,11 @@ impl<M: Media> Runner<M> {
         let tag = format!("rs-{}", self.unique());
         let mut call = Call::new(source, request.clone(), local_rtp, tag)?;
         call.agree(agreed, &request.body);
+        if answer_crypto.is_none() {
+            call.crypto_remote = None;
+        }
+        call.crypto_local = answer_crypto;
+        call.savp = savp;
         // The called side uses the recorded route in the order received.
         call.route_set = record_routes(&request.headers);
         self.lines[self.cur].call = Some(call);
@@ -2627,10 +2773,26 @@ impl<M: Media> Runner<M> {
             return Err("a call is already in progress".into());
         }
         let local_rtp = self.lines[self.cur].media.prepare(self.local.ip())?;
+        let local_rtp = self.audio_address(local_rtp);
         let local = self.local;
         let call_id = format!("{}@{}", self.unique(), local.ip());
         let branch = self.branch();
         let from_tag = self.unique();
+        // A key of our own for the call, when its audio may be encrypted.
+        let crypto = match self.encryption {
+            MediaEncryption::Off => None,
+            _ => Some(CryptoLine {
+                tag: 1,
+                suite: Suite::AesCm128HmacSha1_80,
+                key: MasterKey::generate()?,
+            }),
+        };
+        let savp = self.encryption == MediaEncryption::Required;
+        let offer = offer_sdp(
+            local_rtp,
+            &self.codecs,
+            crypto.as_ref().map(|line| (line, savp)),
+        );
         let mut invite = InviteRequest::new(
             target.clone(),
             from_uri.clone(),
@@ -2641,12 +2803,14 @@ impl<M: Media> Runner<M> {
             branch,
             from_tag.clone(),
         )
-        .body(offer_sdp(local_rtp, &self.codecs).into_bytes())
+        .body(offer.into_bytes())
         .build()?;
         add_rport(&mut invite.headers)?;
 
         let local_tag = format!("rs-{}", self.unique());
         let mut call = Call::new(peer, invite, local_rtp, local_tag)?;
+        call.crypto_local = crypto;
+        call.savp = savp;
         if through_server {
             call.server = Some(ServerCall {
                 target,
@@ -2748,7 +2912,7 @@ impl<M: Media> Runner<M> {
             server.from_tag.clone(),
         )
         .cseq(old_headers.cseq + 1)
-        .body(offer_sdp(call.local_rtp, &self.codecs).into_bytes())
+        .body(offer_sdp(call.local_rtp, &self.codecs, call.sdp_crypto()).into_bytes())
         .build()?;
         invite.headers.insert(name, value)?;
         add_rport(&mut invite.headers)?;
@@ -3008,7 +3172,7 @@ const OFFERED_WIDE_DTMF_PAYLOAD_TYPE: u8 = 102;
 
 /// The first offer of a call: every codec this phone has, in its order of
 /// preference, and telephone-event.
-fn offer_sdp(address: SocketAddr, codecs: &[Codec]) -> String {
+fn offer_sdp(address: SocketAddr, codecs: &[Codec], crypto: Option<(&CryptoLine, bool)>) -> String {
     let offered: Vec<(Codec, u8)> = codecs
         .iter()
         .map(|codec| (*codec, codec.payload_type()))
@@ -3018,18 +3182,21 @@ fn offer_sdp(address: SocketAddr, codecs: &[Codec]) -> String {
     if codecs.contains(&Codec::Opus) {
         events.push((OFFERED_WIDE_DTMF_PAYLOAD_TYPE, Codec::Opus.clock_rate()));
     }
-    make_sdp(address, &offered, &events, 1, "sendrecv")
+    make_sdp(address, &offered, &events, crypto, 1, "sendrecv")
 }
 
 /// Audio with the given codecs (each with its payload type), plus
 /// telephone-event with the given payload types and clock rates when the
 /// digits may be sent as RFC 4733 events. `version` must grow whenever the
 /// description changes; `direction` is `sendrecv`, `sendonly` (hold),
-/// `recvonly` or `inactive`.
+/// `recvonly` or `inactive`. `crypto` is this phone's SRTP key line and
+/// whether the audio is announced as RTP/SAVP (encryption required) or as
+/// RTP/AVP with the key added (encryption if the other side can).
 fn make_sdp(
     address: SocketAddr,
     codecs: &[(Codec, u8)],
     events: &[(u8, u32)],
+    crypto: Option<(&CryptoLine, bool)>,
     version: u32,
     direction: &str,
 ) -> String {
@@ -3051,9 +3218,16 @@ fn make_sdp(
             "a=rtpmap:{payload} telephone-event/{clock}\r\na=fmtp:{payload} 0-16\r\n"
         ));
     }
+    let protocol = match crypto {
+        Some((line, savp)) => {
+            lines.push_str(&format!("a=crypto:{}\r\n", line.format()));
+            if savp { "RTP/SAVP" } else { "RTP/AVP" }
+        }
+        None => "RTP/AVP",
+    };
     format!(
         "v=0\r\no=phone 1 {version} IN {family} {ip}\r\ns=Rust direct call\r\n\
-         c=IN {family} {ip}\r\nt=0 0\r\nm=audio {port} RTP/AVP{formats}\r\n\
+         c=IN {family} {ip}\r\nt=0 0\r\nm=audio {port} {protocol}{formats}\r\n\
          {lines}a={direction}\r\n"
     )
 }
@@ -3135,6 +3309,10 @@ struct Agreed {
     payload_type: u8,
     /// Every codec of this phone the other side listed.
     listed: Vec<(u8, Codec)>,
+    /// The other side's first SRTP key line this phone can use.
+    crypto: Option<CryptoLine>,
+    /// The audio is announced as RTP/SAVP: it must be encrypted.
+    savp: bool,
 }
 
 /// Audio address from an SDP body; see [`negotiate`].
@@ -3150,9 +3328,16 @@ fn media_address(body: &[u8]) -> Result<SocketAddr> {
 fn negotiate(body: &[u8], is_offer: bool, enabled: &[Codec]) -> Result<Agreed> {
     let sdp = Sdp::parse(std::str::from_utf8(body)?)?;
     let audio = sdp.media(&MediaKind::Audio).ok_or("no audio in SDP")?;
-    if audio.port == 0 || audio.protocol != "RTP/AVP" {
-        return Err("audio must be enabled RTP/AVP".into());
+    let savp = audio.protocol == "RTP/SAVP";
+    if audio.port == 0 || (audio.protocol != "RTP/AVP" && !savp) {
+        return Err("audio must be enabled RTP/AVP or RTP/SAVP".into());
     }
+    let crypto = audio
+        .attributes
+        .iter()
+        .filter(|attribute| attribute.name.eq_ignore_ascii_case("crypto"))
+        .filter_map(|attribute| CryptoLine::parse(attribute.value.as_deref()?))
+        .next();
     let listed = Codec::listed(&audio.formats, &rtpmaps(audio));
     let (codec, payload_type) =
         Codec::choose(&listed, enabled, is_offer).ok_or("no common codec with the other side")?;
@@ -3170,6 +3355,8 @@ fn negotiate(body: &[u8], is_offer: bool, enabled: &[Codec]) -> Result<Agreed> {
         codec,
         payload_type,
         listed,
+        crypto,
+        savp,
     })
 }
 
@@ -3202,7 +3389,7 @@ mod tests {
     #[test]
     fn first_offer_lists_the_enabled_codecs_and_an_answer_names_one() {
         let address = "192.0.2.5:40000".parse().unwrap();
-        let offer = offer_sdp(address, &Codec::PREFERRED);
+        let offer = offer_sdp(address, &Codec::PREFERRED, None);
         assert!(
             offer.contains("m=audio 40000 RTP/AVP 0 8 9 111 18 101 102\r\n"),
             "{offer}"
@@ -3217,14 +3404,14 @@ mod tests {
         assert!(offer.contains("a=rtpmap:102 telephone-event/48000\r\n"));
 
         // Only what the user left switched on is offered, in their order.
-        let narrow = offer_sdp(address, &[Codec::Pcma, Codec::Pcmu]);
+        let narrow = offer_sdp(address, &[Codec::Pcma, Codec::Pcmu], None);
         assert!(
             narrow.contains("m=audio 40000 RTP/AVP 8 0 101\r\n"),
             "{narrow}"
         );
         assert!(!narrow.contains("opus") && !narrow.contains("48000"));
 
-        let answer = make_sdp(address, &[(Codec::Pcma, 8)], &[], 1, "sendrecv");
+        let answer = make_sdp(address, &[(Codec::Pcma, 8)], &[], None, 1, "sendrecv");
         assert!(answer.contains("m=audio 40000 RTP/AVP 8\r\n"), "{answer}");
         assert!(answer.contains("a=rtpmap:8 PCMA/8000\r\n"));
         assert!(!answer.contains("PCMU"));
@@ -3233,6 +3420,7 @@ mod tests {
             address,
             &[(Codec::Opus, 107)],
             &[(110, 48_000)],
+            None,
             1,
             "sendrecv",
         );
@@ -3298,7 +3486,14 @@ mod tests {
     fn direction_and_version_are_written_and_read_back() {
         let address = "192.0.2.5:40000".parse().unwrap();
         for direction in ["sendrecv", "sendonly", "recvonly", "inactive"] {
-            let sdp = make_sdp(address, &[(Codec::Pcmu, 0)], &[(101, 8_000)], 7, direction);
+            let sdp = make_sdp(
+                address,
+                &[(Codec::Pcmu, 0)],
+                &[(101, 8_000)],
+                None,
+                7,
+                direction,
+            );
             assert!(sdp.contains("o=phone 1 7 IN IP4 192.0.2.5\r\n"));
             assert_eq!(sdp_direction(sdp.as_bytes()), Some(direction));
         }
@@ -3317,7 +3512,14 @@ mod tests {
     #[test]
     fn offer_lists_telephone_event_and_stays_valid_pcmu() {
         let address = "192.0.2.5:40000".parse().unwrap();
-        let offer = make_sdp(address, &[(Codec::Pcmu, 0)], &[(101, 8_000)], 1, "sendrecv");
+        let offer = make_sdp(
+            address,
+            &[(Codec::Pcmu, 0)],
+            &[(101, 8_000)],
+            None,
+            1,
+            "sendrecv",
+        );
         assert!(offer.contains("m=audio 40000 RTP/AVP 0 101\r\n"));
         assert!(offer.contains("a=rtpmap:101 telephone-event/8000\r\n"));
         assert!(offer.contains("a=fmtp:101 0-16\r\n"));
@@ -3328,14 +3530,14 @@ mod tests {
             Some((101, 8_000))
         );
 
-        let plain = make_sdp(address, &[(Codec::Pcmu, 0)], &[], 1, "sendrecv");
+        let plain = make_sdp(address, &[(Codec::Pcmu, 0)], &[], None, 1, "sendrecv");
         assert!(plain.contains("m=audio 40000 RTP/AVP 0\r\n"));
         assert!(!plain.contains("telephone-event"));
         assert_eq!(telephone_event_payload_type(plain.as_bytes(), 8_000), None);
 
         // The full offer is accepted by ourselves too, with the events of
         // each clock found.
-        let full = offer_sdp(address, &Codec::PREFERRED);
+        let full = offer_sdp(address, &Codec::PREFERRED, None);
         assert_eq!(media_address(full.as_bytes()).unwrap(), address);
         assert_eq!(
             telephone_event_payload_type(full.as_bytes(), 8_000),

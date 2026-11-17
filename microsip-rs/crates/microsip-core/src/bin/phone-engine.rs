@@ -7,6 +7,7 @@ use microsip_core::call_media::{AudioMedia, NullMedia, ToneMedia, ToneReport};
 use microsip_core::call_runner::{CallHandle, EndReason, Event, Timers, UiCommand, spawn_lines};
 use microsip_core::codec::Codec;
 use microsip_core::registration::{Account, RegistrationState};
+use microsip_core::srtp::MediaEncryption;
 use microsip_core::stream::SipTransport;
 use std::error::Error;
 use std::io::{self, BufRead};
@@ -18,7 +19,8 @@ use std::time::Duration;
 
 const HELP: &str = "Usage: phone-engine.exe LOCAL_IP:SIP_PORT [--no-audio] [--trace]\n\
        [--codecs=LIST] [--tone=HZ] [--transport=udp|tcp|tls]\n\
-       [--proxy=HOST[:PORT]] [--tls-insecure]\n\
+       [--proxy=HOST[:PORT]] [--tls-insecure] [--srtp=off|optional|required]\n\
+       [--stun=HOST[:PORT]]\n\
 Port 0 picks a free port; the chosen address is printed on the first line.\n\
 Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit\n\
           register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister\n\
@@ -33,7 +35,9 @@ opus, G729). --tone=440 needs no sound devices: it sends a tone of that\n\
 pitch and prints what was heard when the call ends.\n\
 --transport sets how register talks to the server (default udp); --proxy\n\
 sends everything through that address instead; --tls-insecure accepts a\n\
-TLS certificate that cannot be checked.";
+TLS certificate that cannot be checked. --srtp encrypts the audio of calls:\n\
+optional when the other side can, required always (default off). --stun\n\
+asks that server for the public address of each call's audio.";
 
 const COMMANDS: &str = "Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit | \
 register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister | dtmf DIGITS | mute | unmute | hold | resume | transfer NUMBER | dnd on|off | line 1|2 | join | conference on|off | forward NUMBER|off";
@@ -162,6 +166,8 @@ impl Phone {
                 }
             }
             Event::Codec(codec) => println!("Codec: {codec}"),
+            Event::Encrypted(true) => println!("Audio is encrypted (SRTP)."),
+            Event::Encrypted(false) => {}
             Event::LocalAddress(address) => {
                 self.local = address;
                 println!("Moved to {address}");
@@ -384,6 +390,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .find_map(|argument| argument.strip_prefix(name)?.strip_prefix('='))
     };
     let codecs = value("--codecs").map(Codec::parse_list);
+    let encryption = value("--srtp").map(MediaEncryption::from_name);
     let transport = value("--transport").map_or(SipTransport::Udp, SipTransport::from_name);
     let proxy = value("--proxy").unwrap_or("").to_owned();
     let tls_verify = !args.iter().any(|argument| argument == "--tls-insecure");
@@ -396,7 +403,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|argument| !argument.starts_with("--"))
         .collect();
-    if positional.len() != 1 || args.len() - positional.len() > 7 {
+    if positional.len() != 1 || args.len() - positional.len() > 9 {
         println!("{HELP}");
         return Err("expected LOCAL_IP:SIP_PORT".into());
     }
@@ -421,6 +428,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if let Some(codecs) = codecs {
         handle.send(UiCommand::Codecs(codecs));
+    }
+    if let Some(encryption) = encryption {
+        handle.send(UiCommand::Encryption(encryption));
+    }
+    if let Some(stun) = value("--stun") {
+        handle.send(UiCommand::Stun(Some(stun.to_owned())));
     }
     // With port 0 the system chose the port; report the real address.
     let local = handle.local_address();

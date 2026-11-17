@@ -67,6 +67,12 @@ pub struct Settings {
     pub proxy: String,
     /// With TLS: refuse a server whose certificate cannot be trusted.
     pub tls_verify: bool,
+    /// Encryption of the calls' audio (SRTP): `off`, `optional` or
+    /// `required`.
+    pub media_encryption: String,
+    /// STUN server asked for the public address of the audio; empty means
+    /// none.
+    pub stun: String,
 }
 
 impl Default for Settings {
@@ -101,6 +107,8 @@ impl Default for Settings {
             transport: "UDP".to_owned(),
             proxy: String::new(),
             tls_verify: true,
+            media_encryption: "off".to_owned(),
+            stun: String::new(),
         }
     }
 }
@@ -150,6 +158,8 @@ impl Settings {
                 "transport" => settings.transport = value,
                 "proxy" => settings.proxy = value,
                 "tls_verify" => settings.tls_verify = value != "0",
+                "media_encryption" => settings.media_encryption = value,
+                "stun" => settings.stun = value,
                 "auto_answer_delay" => {
                     if let Some(delay) = value.parse::<u32>().ok().filter(|delay| *delay <= 60) {
                         settings.auto_answer_delay = delay;
@@ -227,6 +237,8 @@ impl Settings {
             ("transport", &self.transport),
             ("proxy", &self.proxy),
             ("tls_verify", &tls_verify),
+            ("media_encryption", &self.media_encryption),
+            ("stun", &self.stun),
         ] {
             text.push_str(key);
             text.push('=');
@@ -347,6 +359,8 @@ mod tests {
             transport: "TLS".to_owned(),
             proxy: "proxy.example.com:5061".to_owned(),
             tls_verify: false,
+            media_encryption: "required".to_owned(),
+            stun: "stun.example.com:3478".to_owned(),
         }
     }
 
@@ -386,7 +400,8 @@ mod tests {
              forward=1\nforward_to=4011\n\
              ring_speaker=Speakers (Realtek)\nringtone=C:\\Sounds\\ring.wav\n\
              close_to_tray=0\nhotkeys=0\nlight_theme=1\ncodecs=opus,G722,PCMA\n\
-             transport=TLS\nproxy=proxy.example.com:5061\ntls_verify=0\n"
+             transport=TLS\nproxy=proxy.example.com:5061\ntls_verify=0\n\
+             media_encryption=required\nstun=stun.example.com:3478\n"
         );
         // No line holds the password itself; `save_password` and
         // `password_protected` are different keys.

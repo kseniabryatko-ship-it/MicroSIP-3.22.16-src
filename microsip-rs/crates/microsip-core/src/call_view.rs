@@ -45,6 +45,7 @@ pub struct CallView {
     held: bool,
     remote_held: bool,
     codec: Option<Codec>,
+    encrypted: bool,
 }
 
 impl CallView {
@@ -75,6 +76,11 @@ impl CallView {
     /// The codec of the call's audio, once it has started.
     pub fn codec(&self) -> Option<Codec> {
         self.codec
+    }
+
+    /// The call's audio is encrypted (SRTP).
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted
     }
 
     /// The connected call is on hold by this phone.
@@ -158,6 +164,7 @@ impl CallView {
             }
             Event::Established => self.phase = Phase::Connected,
             Event::Codec(codec) => self.codec = Some(*codec),
+            Event::Encrypted(encrypted) => self.encrypted = *encrypted,
             Event::MediaStats { sent, received } => self.stats = Some((*sent, *received)),
             Event::Hold(held) => self.held = *held,
             Event::RemoteHold(held) => self.remote_held = *held,
@@ -167,6 +174,7 @@ impl CallView {
                 self.held = false;
                 self.remote_held = false;
                 self.codec = None;
+                self.encrypted = false;
             }
             Event::AudioQuality(_)
             | Event::Recording(_)
