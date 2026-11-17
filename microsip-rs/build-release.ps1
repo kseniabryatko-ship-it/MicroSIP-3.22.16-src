@@ -206,7 +206,8 @@ PCMU/RTP audio in both directions.
 LIMITATIONS
 -----------
 SIP over UDP, TCP or TLS; SRTP; STUN; two lines; one account;
-voicemail indicator, busy lamps (BLF) and text messages. Codecs: G.711 (PCMU, PCMA), G.722, Opus, G.729.
+voicemail indicator, busy lamps (BLF) and text messages;
+echo cancellation, noise suppression and RTCP quality reports. Codecs: G.711 (PCMU, PCMA), G.722, Opus, G.729.
 Behind a router the phone registers the public address the server
 reports and sends keep-alives, but it uses no STUN: audio works only if
 the server sends it back to where the phone's audio comes from.

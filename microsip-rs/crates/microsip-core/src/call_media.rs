@@ -6,10 +6,13 @@ use crate::codec::Codec;
 use crate::gain::AutoGain;
 use crate::recording::{CallRecorder, RecorderInput};
 use crate::resample::Resampler;
+use crate::rtcp::RemoteQuality;
 use crate::rtp::PCMU_CLOCK_RATE;
+use crate::rtp::session::RtcpConfig;
 use crate::rtp::session::{RtpSession, RtpSessionConfig};
 use crate::srtp::SrtpKeys;
 use crate::tones::{Melody, MelodyPlayer, TONE_RATE, Tone, ToneGenerator};
+use crate::voice::{VoiceProcessor, VoiceSettings};
 use std::collections::VecDeque;
 use std::error::Error;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -46,6 +49,32 @@ pub struct MediaQuality {
     pub mic_peak_percent: u32,
     /// Microphone gain at the end of the call, in percent (100 is unchanged).
     pub mic_gain_percent: u32,
+    /// What the other side last reported (RTCP) about this phone's audio.
+    pub remote: Option<RemoteSummary>,
+}
+
+/// The other side's view of this phone's audio, rounded for showing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemoteSummary {
+    /// Share of this phone's packets lost on the way, in percent.
+    pub lost_percent: u32,
+    /// Packets lost in all.
+    pub lost_total: i32,
+    /// How unevenly they arrived, in milliseconds.
+    pub jitter_ms: u32,
+    /// Time there and back, when it could be measured.
+    pub round_trip_ms: Option<u32>,
+}
+
+impl From<RemoteQuality> for RemoteSummary {
+    fn from(quality: RemoteQuality) -> Self {
+        Self {
+            lost_percent: quality.lost_percent.round() as u32,
+            lost_total: quality.lost_total,
+            jitter_ms: quality.jitter_ms.round() as u32,
+            round_trip_ms: quality.round_trip_ms.map(|ms| ms.round() as u32),
+        }
+    }
 }
 
 impl std::fmt::Display for MediaQuality {
@@ -62,7 +91,18 @@ impl std::fmt::Display for MediaQuality {
             self.mic_peak_percent,
             self.mic_gain_percent / 100,
             self.mic_gain_percent % 100 / 10
-        )
+        )?;
+        if let Some(remote) = self.remote {
+            write!(
+                formatter,
+                "; other side: lost {}% ({} in all), jitter {} ms",
+                remote.lost_percent, remote.lost_total, remote.jitter_ms
+            )?;
+            if let Some(round_trip) = remote.round_trip_ms {
+                write!(formatter, ", round trip {round_trip} ms")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -73,6 +113,11 @@ impl std::fmt::Display for MediaQuality {
 pub trait Media {
     /// Reserves a local RTP port and returns the address to advertise in SDP.
     fn prepare(&mut self, ip: IpAddr) -> Result<SocketAddr, MediaError>;
+
+    /// Tells the media the other side's RTCP port, when its SDP names one
+    /// (`a=rtcp`); otherwise it is the RTP port plus one. Called before
+    /// `start`.
+    fn set_remote_rtcp_port(&mut self, _port: Option<u16>) {}
 
     /// Asks a STUN server under which address the reserved port is seen
     /// from the internet. `None` when there is no port, the server does
@@ -240,6 +285,8 @@ pub struct ToneMedia {
     payload_type: Option<u8>,
     listed: Vec<(u8, Codec)>,
     srtp: Option<SrtpKeys>,
+    rtcp_socket: Option<UdpSocket>,
+    remote_rtcp_port: Option<u16>,
     dtmf_payload_type: Option<u8>,
     session: Option<RtpSession>,
     feeder: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
@@ -259,6 +306,8 @@ impl ToneMedia {
             payload_type: None,
             listed: Vec::new(),
             srtp: None,
+            rtcp_socket: None,
+            remote_rtcp_port: None,
             dtmf_payload_type: None,
             session: None,
             feeder: None,
@@ -271,10 +320,15 @@ impl ToneMedia {
 
 impl Media for ToneMedia {
     fn prepare(&mut self, ip: IpAddr) -> Result<SocketAddr, MediaError> {
-        let socket = UdpSocket::bind(SocketAddr::new(ip, 0))?;
+        let (socket, rtcp) = bind_pair(ip)?;
         let address = socket.local_addr()?;
         self.socket = Some(socket);
+        self.rtcp_socket = rtcp;
         Ok(address)
+    }
+
+    fn set_remote_rtcp_port(&mut self, port: Option<u16>) {
+        self.remote_rtcp_port = port;
     }
 
     fn public_address(&mut self, stun: SocketAddr) -> Option<SocketAddr> {
@@ -292,7 +346,12 @@ impl Media for ToneMedia {
             .with_codec(self.codec)
             .with_payload_type(self.payload_type.unwrap_or(self.codec.payload_type()))
             .with_receive_types(self.listed.clone())
-            .with_srtp(self.srtp.clone());
+            .with_srtp(self.srtp.clone())
+            .with_rtcp(rtcp_for(
+                self.rtcp_socket.take(),
+                remote,
+                self.remote_rtcp_port,
+            ));
         if let Ok(mut meter) = self.meter.lock() {
             *meter = ToneMeter::default();
         }
@@ -338,6 +397,14 @@ impl Media for ToneMedia {
 
     fn pump(&mut self) -> Result<(), MediaError> {
         Ok(())
+    }
+
+    fn quality(&self) -> Option<MediaQuality> {
+        let session = self.session.as_ref()?;
+        Some(MediaQuality {
+            remote: session.remote_quality().map(RemoteSummary::from),
+            ..MediaQuality::default()
+        })
     }
 
     fn stats(&self) -> MediaStats {
@@ -392,6 +459,40 @@ impl Media for ToneMedia {
     }
 }
 
+/// Reserves an RTP port and the RTCP port after it. RTCP goes without a
+/// port when no such pair can be had; the call works without reports.
+fn bind_pair(ip: IpAddr) -> std::io::Result<(UdpSocket, Option<UdpSocket>)> {
+    for _ in 0..16 {
+        let rtp = UdpSocket::bind(SocketAddr::new(ip, 0))?;
+        let port = rtp.local_addr()?.port();
+        // RTP takes an even port and RTCP the odd one above it.
+        if port % 2 != 0 || port == u16::MAX {
+            continue;
+        }
+        if let Ok(rtcp) = UdpSocket::bind(SocketAddr::new(ip, port + 1)) {
+            return Ok((rtp, Some(rtcp)));
+        }
+    }
+    Ok((UdpSocket::bind(SocketAddr::new(ip, 0))?, None))
+}
+
+/// Where the other side's RTCP goes, and the socket it goes from.
+fn rtcp_for(
+    socket: Option<UdpSocket>,
+    remote: SocketAddr,
+    remote_port: Option<u16>,
+) -> Option<RtcpConfig> {
+    let port = remote_port.or_else(|| remote.port().checked_add(1))?;
+    Some(RtcpConfig {
+        socket: Arc::new(socket?),
+        remote: SocketAddr::new(remote.ip(), port),
+        interval: RTCP_INTERVAL,
+    })
+}
+
+/// Time between two RTCP reports.
+const RTCP_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Sound settings shared between the interface and the phone's audio.
 /// Volumes act at once, also during a call; a newly chosen device is used
 /// from the next call (and the next ringing) on.
@@ -418,6 +519,8 @@ struct ControlsInner {
     output_device: Mutex<Option<String>>,
     ring_device: Mutex<Option<String>>,
     ringtone: Mutex<Option<Arc<Melody>>>,
+    echo_cancellation: AtomicBool,
+    noise_suppression: AtomicBool,
 }
 
 impl Default for AudioControls {
@@ -432,6 +535,8 @@ impl Default for AudioControls {
                 output_device: Mutex::new(None),
                 ring_device: Mutex::new(None),
                 ringtone: Mutex::new(None),
+                echo_cancellation: AtomicBool::new(true),
+                noise_suppression: AtomicBool::new(true),
             }),
         }
     }
@@ -504,6 +609,24 @@ impl AudioControls {
 
     pub fn ringtone(&self) -> Option<Arc<Melody>> {
         self.inner.ringtone.lock().ok()?.clone()
+    }
+
+    /// Echo cancellation and noise suppression of the microphone; both
+    /// are on unless switched off. A change counts from the next call.
+    pub fn set_voice_settings(&self, settings: VoiceSettings) {
+        self.inner
+            .echo_cancellation
+            .store(settings.echo_cancellation, Ordering::Relaxed);
+        self.inner
+            .noise_suppression
+            .store(settings.noise_suppression, Ordering::Relaxed);
+    }
+
+    pub fn voice_settings(&self) -> VoiceSettings {
+        VoiceSettings {
+            echo_cancellation: self.inner.echo_cancellation.load(Ordering::Relaxed),
+            noise_suppression: self.inner.noise_suppression.load(Ordering::Relaxed),
+        }
     }
 
     fn speaker_volume_handle(&self) -> Arc<AtomicU32> {
@@ -620,6 +743,10 @@ pub struct AudioMedia {
     listed: Vec<(u8, Codec)>,
     /// Keys of an encrypted call.
     srtp: Option<SrtpKeys>,
+    /// The RTCP port reserved with the RTP one.
+    rtcp_socket: Option<UdpSocket>,
+    /// The other side's RTCP port, when its SDP named one.
+    remote_rtcp_port: Option<u16>,
     /// Playback reserve the last call ended with; the next call on the
     /// same connection starts from it instead of learning it again.
     reserve_ms: u32,
@@ -747,10 +874,15 @@ impl AudioMedia {
 
 impl Media for AudioMedia {
     fn prepare(&mut self, ip: IpAddr) -> Result<SocketAddr, MediaError> {
-        let socket = UdpSocket::bind(SocketAddr::new(ip, 0))?;
+        let (socket, rtcp) = bind_pair(ip)?;
         let address = socket.local_addr()?;
         self.socket = Some(socket);
+        self.rtcp_socket = rtcp;
         Ok(address)
+    }
+
+    fn set_remote_rtcp_port(&mut self, port: Option<u16>) {
+        self.remote_rtcp_port = port;
     }
 
     fn public_address(&mut self, stun: SocketAddr) -> Option<SocketAddr> {
@@ -796,17 +928,33 @@ impl Media for AudioMedia {
             .with_codec(self.codec)
             .with_payload_type(self.payload_type.unwrap_or(self.codec.payload_type()))
             .with_receive_types(self.listed.clone())
-            .with_srtp(self.srtp.clone());
+            .with_srtp(self.srtp.clone())
+            .with_rtcp(rtcp_for(
+                self.rtcp_socket.take(),
+                remote,
+                self.remote_rtcp_port,
+            ));
         // The sound of this call: 8 kHz for G.711 and G.729, 16 kHz for
         // G.722 and Opus.
         let heard_rate = config.decoded_sample_rate();
         let mut to_conference = Resampler::new(heard_rate, PCMU_CLOCK_RATE);
+        // Echo cancellation learns from what is played and cleans what the
+        // microphone picks up; one processor serves both sides.
+        let cleaner = VoiceProcessor::new(
+            self.controls.voice_settings(),
+            format.sample_rate,
+            heard_rate,
+        );
+        let played = cleaner.clone();
         self.next_ssrc = self.next_ssrc.wrapping_add(0x0101_0101).max(1);
         let session = RtpSession::from_socket_with_sink(
             socket,
             config,
             self.next_ssrc,
             Some(Box::new(move |samples| {
+                if let Some(played) = played.as_ref() {
+                    played.played(&samples);
+                }
                 if conference_in.is_conference()
                     && let Some(heard) = heard.as_ref()
                     && let Some(to_conference) = to_conference.as_mut()
@@ -845,6 +993,10 @@ impl Media for AudioMedia {
             level
                 .peak_percent
                 .fetch_max((peak * 100.0).round() as u32, Ordering::Relaxed);
+            // Echo and noise come out first: the gain must not raise them.
+            if let Some(cleaner) = cleaner.as_ref() {
+                cleaner.clean(&mut samples);
+            }
             gain.process(&mut samples);
             level
                 .gain_percent
@@ -1002,6 +1154,7 @@ impl Media for AudioMedia {
             reserve_ms: active.speaker.largest_reserve_ms(),
             mic_peak_percent: active.mic_level.peak_percent.load(Ordering::Relaxed),
             mic_gain_percent: active.mic_level.gain_percent.load(Ordering::Relaxed),
+            remote: active.session.remote_quality().map(RemoteSummary::from),
         })
     }
 
@@ -1162,11 +1315,28 @@ mod tests {
             reserve_ms: 160,
             mic_peak_percent: 12,
             mic_gain_percent: 420,
+            remote: None,
         };
         assert_eq!(
             quality.to_string(),
             "gaps 2, lost packets 5, reordered 1, discarded 0, reserve 160 ms, \
              microphone peak 12%, gain x4.2"
+        );
+        // With the other side's report, its view follows.
+        let reported = MediaQuality {
+            remote: Some(RemoteSummary {
+                lost_percent: 3,
+                lost_total: 41,
+                jitter_ms: 12,
+                round_trip_ms: Some(85),
+            }),
+            ..quality
+        };
+        assert!(
+            reported.to_string().ends_with(
+                "gain x4.2; other side: lost 3% (41 in all), jitter 12 ms, round trip 85 ms"
+            ),
+            "{reported}"
         );
     }
 }

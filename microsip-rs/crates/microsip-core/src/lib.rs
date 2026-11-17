@@ -13,6 +13,7 @@ pub mod playout;
 pub mod recording;
 pub mod registration;
 pub mod resample;
+pub mod rtcp;
 pub mod rtp;
 pub mod secret;
 pub mod services;
@@ -23,6 +24,7 @@ pub mod stream;
 pub mod stun;
 pub mod tones;
 pub mod transport;
+pub mod voice;
 pub mod winshell;
 
 #[path = "sip/transaction_headers.rs"]

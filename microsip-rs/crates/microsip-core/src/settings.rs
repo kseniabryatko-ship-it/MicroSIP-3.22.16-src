@@ -75,6 +75,10 @@ pub struct Settings {
     pub stun: String,
     /// What "Почта" dials: the exchange's voicemail number.
     pub voicemail_number: String,
+    /// Take the other side's voice out of the microphone (echo).
+    pub echo_cancellation: bool,
+    /// Lower steady background noise in the microphone.
+    pub noise_suppression: bool,
 }
 
 impl Default for Settings {
@@ -112,6 +116,8 @@ impl Default for Settings {
             media_encryption: "off".to_owned(),
             stun: String::new(),
             voicemail_number: "*97".to_owned(),
+            echo_cancellation: true,
+            noise_suppression: true,
         }
     }
 }
@@ -164,6 +170,8 @@ impl Settings {
                 "media_encryption" => settings.media_encryption = value,
                 "stun" => settings.stun = value,
                 "voicemail_number" => settings.voicemail_number = value,
+                "echo_cancellation" => settings.echo_cancellation = value != "0",
+                "noise_suppression" => settings.noise_suppression = value != "0",
                 "auto_answer_delay" => {
                     if let Some(delay) = value.parse::<u32>().ok().filter(|delay| *delay <= 60) {
                         settings.auto_answer_delay = delay;
@@ -205,6 +213,8 @@ impl Settings {
         let hotkeys = flag(self.hotkeys);
         let light_theme = flag(self.light_theme);
         let tls_verify = flag(self.tls_verify);
+        let echo_cancellation = flag(self.echo_cancellation);
+        let noise_suppression = flag(self.noise_suppression);
         // Without permission to remember it, no form of the password is written.
         let password_protected = if self.save_password {
             self.password_protected.clone()
@@ -244,6 +254,8 @@ impl Settings {
             ("media_encryption", &self.media_encryption),
             ("stun", &self.stun),
             ("voicemail_number", &self.voicemail_number),
+            ("echo_cancellation", &echo_cancellation),
+            ("noise_suppression", &noise_suppression),
         ] {
             text.push_str(key);
             text.push('=');
@@ -367,6 +379,8 @@ mod tests {
             media_encryption: "required".to_owned(),
             stun: "stun.example.com:3478".to_owned(),
             voicemail_number: "*98".to_owned(),
+            echo_cancellation: false,
+            noise_suppression: true,
         }
     }
 
@@ -408,7 +422,7 @@ mod tests {
              close_to_tray=0\nhotkeys=0\nlight_theme=1\ncodecs=opus,G722,PCMA\n\
              transport=TLS\nproxy=proxy.example.com:5061\ntls_verify=0\n\
              media_encryption=required\nstun=stun.example.com:3478\n\
-             voicemail_number=*98\n"
+             voicemail_number=*98\necho_cancellation=0\nnoise_suppression=1\n"
         );
         // No line holds the password itself; `save_password` and
         // `password_protected` are different keys.

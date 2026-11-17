@@ -1,5 +1,6 @@
 use crate::codec::{Codec, VoiceDecoder};
 use crate::resample::Resampler;
+use crate::rtcp::{self, Reception, RemoteQuality, SenderInfo};
 use crate::rtp::order::{OrderStats, PacketOrderer, Released};
 use crate::rtp::{PcmuStream, RtpError, RtpPacket};
 use crate::srtp::{SrtpKeys, SrtpReceiver, SrtpSender};
@@ -13,7 +14,7 @@ use std::sync::{
     mpsc::{self, Receiver, SyncSender, TryRecvError},
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SAMPLE_QUEUE_CAPACITY: usize = 256;
 
@@ -89,6 +90,7 @@ pub struct RtpSessionConfig {
     payload_type: Option<u8>,
     receive_types: Vec<(u8, Codec)>,
     srtp: Option<SrtpKeys>,
+    rtcp: Option<RtcpConfig>,
 }
 
 impl RtpSessionConfig {
@@ -103,6 +105,7 @@ impl RtpSessionConfig {
             payload_type: None,
             receive_types: Vec::new(),
             srtp: None,
+            rtcp: None,
         }
     }
 
@@ -144,6 +147,14 @@ impl RtpSessionConfig {
 
     /// Encrypts and signs the packets both ways (SRTP) with the keys
     /// agreed in SDP. Received packets that fail the check are dropped.
+    /// Sends and reads RTCP reports on this socket. Left out for an
+    /// encrypted call: its reports would have to be encrypted too (SRTCP),
+    /// which this phone does not do.
+    pub fn with_rtcp(mut self, rtcp: Option<RtcpConfig>) -> Self {
+        self.rtcp = rtcp;
+        self
+    }
+
     pub fn with_srtp(mut self, keys: Option<SrtpKeys>) -> Self {
         self.srtp = keys;
         self
@@ -180,6 +191,8 @@ pub struct RtpSession {
     control: Arc<SenderControl>,
     sender_thread: Option<JoinHandle<Result<(), RtpSessionError>>>,
     receiver_thread: Option<JoinHandle<Result<(), RtpSessionError>>>,
+    rtcp_state: SharedRtcp,
+    rtcp_thread: Option<JoinHandle<()>>,
 }
 
 impl RtpSession {
@@ -220,7 +233,10 @@ impl RtpSession {
             payload_type,
             receive_types,
             srtp,
+            rtcp,
         } = config;
+        let rtcp = rtcp.filter(|_| srtp.is_none());
+        let rtcp_state = SharedRtcp::default();
 
         let payload_type = payload_type.unwrap_or(codec.payload_type());
         let mut pcmu_stream = PcmuStream::new(ssrc, source_sample_rate)?;
@@ -231,7 +247,9 @@ impl RtpSession {
         receiving.srtp = srtp
             .as_ref()
             .map(|keys| SrtpReceiver::new(&keys.remote, keys.suite));
+        receiving.rtcp = Some((Arc::clone(&rtcp_state), Instant::now()));
         let outgoing = Outgoing {
+            rtcp: Arc::clone(&rtcp_state),
             stream: pcmu_stream,
             srtp: srtp
                 .as_ref()
@@ -288,7 +306,17 @@ impl RtpSession {
             )
         });
 
+        let rtcp_thread = rtcp.map(|config| {
+            let state = Arc::clone(&rtcp_state);
+            let stop = Arc::clone(&stop);
+            let clock_rate = codec.clock_rate();
+            let cname = format!("microsip-rs-{ssrc:08x}");
+            thread::spawn(move || run_rtcp(config, state, stop, ssrc, clock_rate, cname))
+        });
+
         Ok(Self {
+            rtcp_state,
+            rtcp_thread,
             socket,
             remote_address,
             sample_sender: Some(sample_sender),
@@ -367,6 +395,12 @@ impl RtpSession {
     }
 
     /// Lost, reordered and discarded packets of the received stream.
+    /// What the other side last reported about this phone's audio; `None`
+    /// before its first report, or without RTCP.
+    pub fn remote_quality(&self) -> Option<RemoteQuality> {
+        self.rtcp_state.lock().ok()?.remote
+    }
+
     pub fn order_stats(&self) -> OrderStats {
         self.order_stats
             .lock()
@@ -400,6 +434,10 @@ impl RtpSession {
             Ok(())
         };
 
+        if let Some(handle) = self.rtcp_thread.take() {
+            let _ = handle.join();
+        }
+
         sender_result?;
         receiver_result?;
 
@@ -423,6 +461,8 @@ struct SenderControl {
 /// The sending side: sound into packets, and the packets encrypted when
 /// the call uses SRTP.
 struct Outgoing {
+    /// Counts for the sender reports.
+    rtcp: SharedRtcp,
     stream: PcmuStream,
     srtp: Option<SrtpSender>,
 }
@@ -468,6 +508,12 @@ fn run_sender(
             }
 
             socket.send_to(&bytes, remote_address)?;
+            if let Ok(mut state) = outgoing.rtcp.lock() {
+                state.packets_sent = state.packets_sent.wrapping_add(1);
+                let payload = packet.payload.len() as u32;
+                state.octets_sent = state.octets_sent.wrapping_add(payload);
+                state.last_sent = Some((packet.timestamp, Instant::now()));
+            }
 
             sent_packets.fetch_add(1, Ordering::Relaxed);
         }
@@ -534,6 +580,7 @@ fn run_receiver(
                 }
 
                 received_packets.fetch_add(1, Ordering::Relaxed);
+                receiving.count(&packet);
 
                 let encoded = (packet.payload_type, packet.payload);
                 for released in orderer.push(packet.ssrc, packet.sequence_number, encoded) {
@@ -597,6 +644,8 @@ struct Receiving {
     previous: Option<Vec<f32>>,
     /// Checks and decrypts the packets when the call uses SRTP.
     srtp: Option<SrtpReceiver>,
+    /// Counts for the receiver reports, and the start of the session.
+    rtcp: Option<(SharedRtcp, Instant)>,
 }
 
 impl Receiving {
@@ -620,6 +669,29 @@ impl Receiving {
             last: None,
             previous: None,
             srtp: None,
+            rtcp: None,
+        }
+    }
+
+    /// Counts a received voice packet for the receiver reports.
+    fn count(&self, packet: &RtpPacket) {
+        let Some((state, started)) = self.rtcp.as_ref() else {
+            return;
+        };
+        let clock = self
+            .types
+            .iter()
+            .find(|(known, _)| *known == packet.payload_type)
+            .map_or(8_000, |(_, codec)| codec.clock_rate());
+        // Arrival in units of the packet's own clock.
+        let arrival = (started.elapsed().as_secs_f64() * f64::from(clock)) as u64 as u32;
+        if let Ok(mut state) = state.lock() {
+            state.reception.on_packet(
+                packet.ssrc,
+                packet.sequence_number,
+                packet.timestamp,
+                arrival,
+            );
         }
     }
 
@@ -680,6 +752,96 @@ impl Receiving {
         let last = self.previous.take()?;
         Some(last.iter().map(|sample| sample * 0.5).collect())
     }
+}
+
+/// Where RTCP goes for a session, and how often.
+#[derive(Debug, Clone)]
+pub struct RtcpConfig {
+    /// This phone's RTCP socket (usually the RTP port plus one).
+    pub socket: Arc<UdpSocket>,
+    /// The other side's RTCP address.
+    pub remote: SocketAddr,
+    /// Time between two reports; RFC 3550 suggests about five seconds.
+    pub interval: Duration,
+}
+
+/// What the RTP threads and the RTCP thread share.
+#[derive(Debug, Default)]
+struct RtcpState {
+    reception: Reception,
+    packets_sent: u32,
+    octets_sent: u32,
+    /// RTP timestamp of the last packet sent, and when it went.
+    last_sent: Option<(u32, Instant)>,
+    /// The other side's last sender report: its NTP middle, and when it
+    /// arrived.
+    last_sender_report: Option<(u32, Instant)>,
+    /// What the other side last said about this phone's audio.
+    remote: Option<RemoteQuality>,
+}
+
+type SharedRtcp = Arc<Mutex<RtcpState>>;
+
+/// Sends a report every interval and reads the other side's, until the
+/// session stops; then says goodbye.
+#[allow(clippy::too_many_arguments)]
+fn run_rtcp(
+    config: RtcpConfig,
+    state: SharedRtcp,
+    stop: Arc<AtomicBool>,
+    ssrc: u32,
+    clock_rate: u32,
+    cname: String,
+) {
+    let socket = config.socket;
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut buffer = [0_u8; 1_500];
+    // The first report soon, so that the other side learns the name early.
+    let mut next = Instant::now() + config.interval.min(Duration::from_secs(1));
+    while !stop.load(Ordering::Acquire) {
+        if let Ok((length, _)) = socket.recv_from(&mut buffer)
+            && let Some(report) = rtcp::parse(&buffer[..length])
+            && let Ok(mut state) = state.lock()
+        {
+            if let Some(sender) = report.sender {
+                state.last_sender_report = Some((rtcp::ntp_middle(sender.ntp), Instant::now()));
+            }
+            if let Some(block) = report.blocks.iter().find(|block| block.ssrc == ssrc) {
+                state.remote = Some(RemoteQuality::from_block(
+                    block,
+                    clock_rate,
+                    rtcp::ntp_now(),
+                ));
+            }
+        }
+        if Instant::now() < next {
+            continue;
+        }
+        next = Instant::now() + config.interval;
+        let bytes = match state.lock() {
+            Ok(mut state) => {
+                let sender = state.last_sent.map(|(timestamp, at)| {
+                    // The RTP time that goes with now.
+                    let elapsed = at.elapsed().as_secs_f64() * f64::from(clock_rate);
+                    SenderInfo {
+                        ntp: rtcp::ntp_now(),
+                        rtp_timestamp: timestamp.wrapping_add(elapsed as u32),
+                        packets: state.packets_sent,
+                        octets: state.octets_sent,
+                    }
+                });
+                let (last_report, delay) = match state.last_sender_report {
+                    Some((middle, at)) => (middle, (at.elapsed().as_secs_f64() * 65_536.0) as u32),
+                    None => (0, 0),
+                };
+                let block = state.reception.report(last_report, delay);
+                rtcp::build_report(ssrc, sender, block, &cname)
+            }
+            Err(_) => continue,
+        };
+        let _ = socket.send_to(&bytes, config.remote);
+    }
+    let _ = socket.send_to(&rtcp::build_bye(ssrc), config.remote);
 }
 
 #[cfg(test)]

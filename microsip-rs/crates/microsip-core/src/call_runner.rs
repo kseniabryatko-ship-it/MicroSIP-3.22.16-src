@@ -452,6 +452,8 @@ struct Call {
     codec_payload_type: u8,
     /// Every codec of ours the other side listed, with its payload type.
     listed: Vec<(u8, Codec)>,
+    /// The other side's RTCP port, when its SDP named one.
+    remote_rtcp_port: Option<u16>,
     /// Our `a=crypto` line, when this phone offered or accepted SRTP.
     crypto_local: Option<CryptoLine>,
     /// The other side's, when it did.
@@ -528,6 +530,7 @@ impl Call {
             codec: Codec::Pcmu,
             codec_payload_type: Codec::Pcmu.payload_type(),
             listed: Vec::new(),
+            remote_rtcp_port: None,
             crypto_local: None,
             crypto_remote: None,
             savp: false,
@@ -564,6 +567,7 @@ impl Call {
     /// Takes over what an SDP body agreed about the audio.
     fn agree(&mut self, agreed: Agreed, body: &[u8]) {
         self.remote_rtp = Some(agreed.address);
+        self.remote_rtcp_port = agreed.rtcp_port;
         self.crypto_remote = agreed.crypto;
         self.codec = agreed.codec;
         self.codec_payload_type = agreed.payload_type;
@@ -2074,6 +2078,7 @@ impl<M: Media> Runner<M> {
                 let codec = call.codec;
                 let (payload_type, listed) = (call.codec_payload_type, call.listed.clone());
                 let keys = call.srtp_keys();
+                let rtcp_port = call.remote_rtcp_port;
                 let encrypted = keys.is_some();
                 // Encryption that was promised (RTP/SAVP) but cannot be
                 // kept is a failed call, never a call in the clear.
@@ -2084,6 +2089,7 @@ impl<M: Media> Runner<M> {
                         media.set_codec(codec);
                         media.set_payload_types(payload_type, listed);
                         media.set_srtp(keys);
+                        media.set_remote_rtcp_port(rtcp_port);
                         media.set_dtmf_payload_type(dtmf);
                         media.start(remote)
                     }
@@ -3831,6 +3837,8 @@ struct Agreed {
     crypto: Option<CryptoLine>,
     /// The audio is announced as RTP/SAVP: it must be encrypted.
     savp: bool,
+    /// The RTCP port the other side named (`a=rtcp`), if it did.
+    rtcp_port: Option<u16>,
 }
 
 /// Audio address from an SDP body; see [`negotiate`].
@@ -3850,6 +3858,13 @@ fn negotiate(body: &[u8], is_offer: bool, enabled: &[Codec]) -> Result<Agreed> {
     if audio.port == 0 || (audio.protocol != "RTP/AVP" && !savp) {
         return Err("audio must be enabled RTP/AVP or RTP/SAVP".into());
     }
+    // `a=rtcp:PORT` (possibly followed by an address, which is the same).
+    let rtcp_port = audio
+        .attribute("rtcp")
+        .and_then(|attribute| attribute.value.as_deref())
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port != 0);
     let crypto = audio
         .attributes
         .iter()
@@ -3875,6 +3890,7 @@ fn negotiate(body: &[u8], is_offer: bool, enabled: &[Codec]) -> Result<Agreed> {
         listed,
         crypto,
         savp,
+        rtcp_port,
     })
 }
 

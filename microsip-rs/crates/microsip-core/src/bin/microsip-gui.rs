@@ -26,6 +26,7 @@ use microsip_core::srtp::MediaEncryption;
 use microsip_core::stream::SipTransport;
 use microsip_core::tones::Melody;
 use microsip_core::transport::{local_ip_towards, resolve_socket_address};
+use microsip_core::voice::VoiceSettings;
 use microsip_core::winshell::{self, Shell, ShellOptions};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -181,6 +182,8 @@ struct PhoneWindow {
     speaker: String,
     speaker_volume: u32,
     microphone_volume: u32,
+    echo_cancellation: bool,
+    noise_suppression: bool,
     microphones: Vec<String>,
     speakers: Vec<String>,
     controls: AudioControls,
@@ -363,6 +366,8 @@ impl PhoneWindow {
             speaker: saved.speaker.clone(),
             speaker_volume: saved.speaker_volume,
             microphone_volume: saved.microphone_volume,
+            echo_cancellation: saved.echo_cancellation,
+            noise_suppression: saved.noise_suppression,
             microphones: input_device_names(),
             speakers: output_device_names(),
             controls: AudioControls::default(),
@@ -471,6 +476,10 @@ impl PhoneWindow {
         self.controls
             .set_input_device(Some(self.microphone.clone()));
         self.controls.set_output_device(Some(self.speaker.clone()));
+        self.controls.set_voice_settings(VoiceSettings {
+            echo_cancellation: self.echo_cancellation,
+            noise_suppression: self.noise_suppression,
+        });
     }
 
     /// Tells the sound where and what to ring. A melody that cannot be
@@ -538,6 +547,8 @@ impl PhoneWindow {
             speaker: self.speaker.clone(),
             speaker_volume: self.speaker_volume,
             microphone_volume: self.microphone_volume,
+            echo_cancellation: self.echo_cancellation,
+            noise_suppression: self.noise_suppression,
             local_port: self.port(),
             save_password: self.save_password,
             password_protected,
@@ -992,7 +1003,22 @@ impl PhoneWindow {
                 Event::MediaStats { sent, received } => {
                     self.log(format!("RTP: отправлено {sent}, принято {received}"));
                 }
-                Event::AudioQuality(quality) => self.log(format!("Звук: {quality}")),
+                Event::AudioQuality(quality) => {
+                    self.log(format!("Звук: {quality}"));
+                    // The other side's report, in plain words: how much of
+                    // the user's voice did not get there.
+                    if let Some(remote) = quality.remote {
+                        let mut text = format!(
+                            "У собеседника потерялось {}% вашего звука (пакетов: {}), \
+                             неравномерность {} мс",
+                            remote.lost_percent, remote.lost_total, remote.jitter_ms
+                        );
+                        if let Some(round_trip) = remote.round_trip_ms {
+                            text.push_str(&format!(", задержка туда-обратно {round_trip} мс"));
+                        }
+                        self.log(text);
+                    }
+                }
                 Event::Hold(true) => self.log("Вызов на удержании"),
                 Event::Hold(false) => self.log("Вызов возобновлён"),
                 Event::RemoteHold(true) => self.log("Собеседник поставил вызов на удержание"),
@@ -2271,6 +2297,13 @@ if self.transport == SipTransport::Tls {
                             actions.push(Action::AudioChanged);
                         }
                         ui.weak("Новое устройство используется со следующего звонка.");
+                        let before = (self.echo_cancellation, self.noise_suppression);
+                        ui.checkbox(&mut self.echo_cancellation, "Подавлять эхо");
+                        ui.checkbox(&mut self.noise_suppression, "Подавлять шум");
+                        if before != (self.echo_cancellation, self.noise_suppression) {
+                            actions.push(Action::AudioChanged);
+                        }
+                        ui.weak("Эхо — ваш собеседник слышит сам себя из ваших колонок. Действует со следующего звонка.");
                         let before = (self.ring_speaker.clone(), self.ringtone.clone());
                         device_picker(ui, "Звонок", &mut self.ring_speaker, &self.speakers);
                         ui.horizontal(|ui| {
