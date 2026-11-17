@@ -187,6 +187,10 @@ impl CallView {
             | Event::Caller { .. }
             | Event::Registration(_)
             | Event::LocalAddress(_)
+            | Event::Voicemail(_)
+            | Event::Presence { .. }
+            | Event::Message { .. }
+            | Event::MessageSent { .. }
             | Event::Trace { .. }
             | Event::Error(_) => {}
         }

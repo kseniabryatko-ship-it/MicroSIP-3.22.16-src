@@ -73,6 +73,8 @@ pub struct Settings {
     /// STUN server asked for the public address of the audio; empty means
     /// none.
     pub stun: String,
+    /// What "Почта" dials: the exchange's voicemail number.
+    pub voicemail_number: String,
 }
 
 impl Default for Settings {
@@ -109,6 +111,7 @@ impl Default for Settings {
             tls_verify: true,
             media_encryption: "off".to_owned(),
             stun: String::new(),
+            voicemail_number: "*97".to_owned(),
         }
     }
 }
@@ -160,6 +163,7 @@ impl Settings {
                 "tls_verify" => settings.tls_verify = value != "0",
                 "media_encryption" => settings.media_encryption = value,
                 "stun" => settings.stun = value,
+                "voicemail_number" => settings.voicemail_number = value,
                 "auto_answer_delay" => {
                     if let Some(delay) = value.parse::<u32>().ok().filter(|delay| *delay <= 60) {
                         settings.auto_answer_delay = delay;
@@ -239,6 +243,7 @@ impl Settings {
             ("tls_verify", &tls_verify),
             ("media_encryption", &self.media_encryption),
             ("stun", &self.stun),
+            ("voicemail_number", &self.voicemail_number),
         ] {
             text.push_str(key);
             text.push('=');
@@ -361,6 +366,7 @@ mod tests {
             tls_verify: false,
             media_encryption: "required".to_owned(),
             stun: "stun.example.com:3478".to_owned(),
+            voicemail_number: "*98".to_owned(),
         }
     }
 
@@ -401,7 +407,8 @@ mod tests {
              ring_speaker=Speakers (Realtek)\nringtone=C:\\Sounds\\ring.wav\n\
              close_to_tray=0\nhotkeys=0\nlight_theme=1\ncodecs=opus,G722,PCMA\n\
              transport=TLS\nproxy=proxy.example.com:5061\ntls_verify=0\n\
-             media_encryption=required\nstun=stun.example.com:3478\n"
+             media_encryption=required\nstun=stun.example.com:3478\n\
+             voicemail_number=*98\n"
         );
         // No line holds the password itself; `save_password` and
         // `password_protected` are different keys.

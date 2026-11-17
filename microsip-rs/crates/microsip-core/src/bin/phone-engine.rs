@@ -7,6 +7,7 @@ use microsip_core::call_media::{AudioMedia, NullMedia, ToneMedia, ToneReport};
 use microsip_core::call_runner::{CallHandle, EndReason, Event, Timers, UiCommand, spawn_lines};
 use microsip_core::codec::Codec;
 use microsip_core::registration::{Account, RegistrationState};
+use microsip_core::services::LineState;
 use microsip_core::srtp::MediaEncryption;
 use microsip_core::stream::SipTransport;
 use std::error::Error;
@@ -24,6 +25,7 @@ const HELP: &str = "Usage: phone-engine.exe LOCAL_IP:SIP_PORT [--no-audio] [--tr
 Port 0 picks a free port; the chosen address is printed on the first line.\n\
 Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit\n\
           register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister\n\
+          watch NUMBER... (busy lamps) | msg NUMBER TEXT (text message)\n\
           dtmf DIGITS | mute | unmute | hold | resume\n\
 call IP:PORT dials directly. register keeps the account registered on a SIP\n\
 server; after that the server can send calls here and call NUMBER (or\n\
@@ -40,7 +42,7 @@ optional when the other side can, required always (default off). --stun\n\
 asks that server for the public address of each call's audio.";
 
 const COMMANDS: &str = "Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit | \
-register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister | dtmf DIGITS | mute | unmute | hold | resume | transfer NUMBER | dnd on|off | line 1|2 | join | conference on|off | forward NUMBER|off";
+register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister | dtmf DIGITS | mute | unmute | hold | resume | transfer NUMBER | dnd on|off | line 1|2 | join | conference on|off | forward NUMBER|off | watch NUMBERS | msg NUMBER TEXT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -168,6 +170,34 @@ impl Phone {
             Event::Codec(codec) => println!("Codec: {codec}"),
             Event::Encrypted(true) => println!("Audio is encrypted (SRTP)."),
             Event::Encrypted(false) => {}
+            Event::Voicemail(voicemail) => println!(
+                "Voicemail: {} new, {} old{}",
+                voicemail.new,
+                voicemail.old,
+                if voicemail.waiting { " (waiting)" } else { "" }
+            ),
+            Event::Presence { number, state } => {
+                let state = match state {
+                    LineState::Unknown => "unknown",
+                    LineState::Idle => "idle",
+                    LineState::Ringing => "ringing",
+                    LineState::Busy => "busy",
+                };
+                println!("Presence {number}: {state}");
+            }
+            Event::Message { number, name, text } => {
+                let who = if name.is_empty() {
+                    number
+                } else {
+                    format!("{number} ({name})")
+                };
+                println!("Message from {who}: {text}");
+            }
+            Event::MessageSent { to, error: None } => println!("Message to {to} delivered."),
+            Event::MessageSent {
+                to,
+                error: Some(error),
+            } => println!("Message to {to} failed: {error}"),
             Event::LocalAddress(address) => {
                 self.local = address;
                 println!("Moved to {address}");
@@ -294,6 +324,32 @@ impl Phone {
                     self.selected + 1,
                     other + 1
                 );
+            }
+            Some("watch") => {
+                let numbers: Vec<String> = parts.map(str::to_owned).collect();
+                if numbers.is_empty() {
+                    println!("Not watching anyone.");
+                } else {
+                    println!("Watching {}.", numbers.join(", "));
+                }
+                self.handle.send(UiCommand::Watch(numbers));
+            }
+            Some("msg") => {
+                let to = parts.next();
+                // The text is the rest of the line, spaces included.
+                let text = to
+                    .and_then(|to| line.trim_start()[3..].trim_start().strip_prefix(to))
+                    .map(str::trim)
+                    .unwrap_or("");
+                match to {
+                    Some(to) if !text.is_empty() => {
+                        self.handle.send(UiCommand::SendMessage {
+                            to: to.to_owned(),
+                            text: text.to_owned(),
+                        });
+                    }
+                    _ => println!("Usage: msg NUMBER TEXT"),
+                }
             }
             Some("forward") => match parts.next() {
                 Some("off") | None => {

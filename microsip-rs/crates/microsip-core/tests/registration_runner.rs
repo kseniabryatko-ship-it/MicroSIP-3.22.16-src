@@ -79,7 +79,9 @@ impl Registrar {
         }
     }
 
-    /// Counts datagrams that arrive within `window`.
+    /// Counts the REGISTER requests that arrive within `window`. Other
+    /// requests (the mailbox subscription made once registered) are not
+    /// the registrar's business.
     fn count_for(&self, window: Duration) -> usize {
         let deadline = Instant::now() + window;
         let mut buffer = [0_u8; 65_535];
@@ -89,7 +91,8 @@ impl Registrar {
             .unwrap();
         while Instant::now() < deadline {
             match self.socket.recv_from(&mut buffer) {
-                Ok(_) => count += 1,
+                Ok((length, _)) if buffer[..length].starts_with(b"REGISTER ") => count += 1,
+                Ok(_) => {}
                 Err(error)
                     if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {}
                 Err(error) => panic!("registrar socket failed: {error}"),

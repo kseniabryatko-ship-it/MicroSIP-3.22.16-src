@@ -216,9 +216,16 @@ fn register_and_quit_talk_to_the_server() {
         "the password must not be printed"
     );
 
-    // Quitting removes the registration before the program exits.
+    // Quitting removes the registration before the program exits. Once
+    // registered the phone also subscribed to its mailbox; that ends too.
     phone.command("quit");
-    let (removal, peer) = receive(&server);
+    let (removal, peer) = loop {
+        let (request, peer) = receive(&server);
+        if request.method.as_str() == "REGISTER" {
+            break (request, peer);
+        }
+        assert_eq!(request.method.as_str(), "SUBSCRIBE");
+    };
     assert_eq!(removal.headers.get("expires"), Some("0"));
     accept(&server, &removal, peer);
     let deadline = Instant::now() + WAIT;

@@ -1,5 +1,6 @@
 //! The contact list, kept in a plain text file next to the settings: one
-//! contact per line, `name<TAB>number`.
+//! contact per line, `name<TAB>number`, and `<TAB>watch` after it for a
+//! contact whose line state is shown (a busy lamp).
 
 use crate::history::field;
 use std::fs;
@@ -10,6 +11,8 @@ use std::path::Path;
 pub struct Contact {
     pub name: String,
     pub number: String,
+    /// Its line state is shown next to it.
+    pub watched: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -35,10 +38,42 @@ impl Contacts {
             return false;
         }
         let key = digits(&number);
+        // Renaming keeps the lamp as it was.
+        let watched = self
+            .list
+            .iter()
+            .any(|contact| digits(&contact.number) == key && contact.watched);
         self.list.retain(|contact| digits(&contact.number) != key);
-        self.list.push(Contact { name, number });
+        self.list.push(Contact {
+            name,
+            number,
+            watched,
+        });
         self.sort();
         true
+    }
+
+    /// Shows or stops showing the line state of the contact with this
+    /// number; false when there is no such contact.
+    pub fn set_watched(&mut self, number: &str, watched: bool) -> bool {
+        let key = digits(number);
+        let mut found = false;
+        for contact in &mut self.list {
+            if digits(&contact.number) == key {
+                contact.watched = watched;
+                found = true;
+            }
+        }
+        found
+    }
+
+    /// The numbers whose line state is shown.
+    pub fn watched(&self) -> Vec<String> {
+        self.list
+            .iter()
+            .filter(|contact| contact.watched)
+            .map(|contact| contact.number.clone())
+            .collect()
     }
 
     /// Removes the contact with this number; false when there is none.
@@ -85,8 +120,12 @@ impl Contacts {
     pub fn parse(text: &str) -> Self {
         let mut contacts = Self::default();
         for line in text.trim_start_matches('\u{feff}').lines() {
-            if let Some((name, number)) = line.split_once('\t') {
-                contacts.set(name, number);
+            let mut fields = line.split('\t');
+            if let (Some(name), Some(number)) = (fields.next(), fields.next())
+                && contacts.set(name, number)
+                && fields.next().map(str::trim) == Some("watch")
+            {
+                contacts.set_watched(number, true);
             }
         }
         contacts
@@ -95,7 +134,10 @@ impl Contacts {
     pub fn serialize(&self) -> String {
         self.list
             .iter()
-            .map(|contact| format!("{}\t{}\n", contact.name, contact.number))
+            .map(|contact| {
+                let watch = if contact.watched { "\twatch" } else { "" };
+                format!("{}\t{}{watch}\n", contact.name, contact.number)
+            })
             .collect()
     }
 
@@ -409,6 +451,27 @@ mod tests {
         let mut contacts = Contacts::default();
         assert_eq!(contacts.import_csv(&bytes), 1);
         assert_eq!(contacts.name_of("4010"), Some("Ёж №1"));
+    }
+
+    #[test]
+    fn lamps_are_kept_in_the_file_and_through_a_rename() {
+        let mut contacts = sample();
+        assert!(contacts.watched().is_empty());
+        assert!(contacts.set_watched("40-10", true));
+        assert!(!contacts.set_watched("4099", true));
+        assert_eq!(contacts.watched(), ["4010"]);
+        // Renaming does not switch the lamp off.
+        assert!(contacts.set("Анна Петровна", "4010"));
+        assert_eq!(contacts.watched(), ["4010"]);
+
+        let text = contacts.serialize();
+        assert!(text.contains("Анна Петровна\t4010\twatch\n"), "{text}");
+        assert!(text.contains("Борис\t4011\n"), "{text}");
+        assert_eq!(Contacts::parse(&text), contacts);
+
+        assert!(contacts.set_watched("4010", false));
+        assert!(contacts.watched().is_empty());
+        assert!(!contacts.serialize().contains("watch"));
     }
 
     #[test]

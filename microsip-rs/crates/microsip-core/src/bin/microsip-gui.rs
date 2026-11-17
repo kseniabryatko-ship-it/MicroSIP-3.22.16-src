@@ -10,6 +10,7 @@ use microsip_core::call_runner::{
     CallHandle, EndReason, Event, Timers, TransferState, UiCommand, spawn_lines,
 };
 use microsip_core::call_view::{CallView, Phase};
+use microsip_core::chat::{Chat, ChatMessage};
 use microsip_core::codec::Codec;
 use microsip_core::contacts::{Contacts, dialable};
 use microsip_core::history::{CallRecord, Direction, History};
@@ -19,13 +20,14 @@ use microsip_core::localtime::{
 use microsip_core::recording::recording_file_name;
 use microsip_core::registration::{Account, RegistrationState};
 use microsip_core::secret;
+use microsip_core::services::{LineState, Voicemail};
 use microsip_core::settings::{self, Settings, default_recordings_dir};
 use microsip_core::srtp::MediaEncryption;
 use microsip_core::stream::SipTransport;
 use microsip_core::tones::Melody;
 use microsip_core::transport::{local_ip_towards, resolve_socket_address};
 use microsip_core::winshell::{self, Shell, ShellOptions};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
@@ -45,6 +47,7 @@ enum Tab {
     Dialpad,
     Calls,
     Contacts,
+    Messages,
 }
 
 /// What the user asked for in this frame; carried out after drawing.
@@ -73,6 +76,14 @@ enum Action {
     DoNotDisturb(bool),
     /// Puts the clipboard's text into the number field.
     Paste,
+    /// Turns the lamp of a contact on or off.
+    Watch(String, bool),
+    /// Opens the conversation with a number.
+    OpenChat(String),
+    SendText,
+    ClearChat(String),
+    /// Dials the voicemail number.
+    Voicemail,
     /// Removes the last character of the number.
     Erase,
     /// Opens a file or folder with the program Windows uses for it.
@@ -131,10 +142,22 @@ struct PhoneWindow {
     settings_path: Option<PathBuf>,
     history_path: Option<PathBuf>,
     contacts_path: Option<PathBuf>,
+    chat_path: Option<PathBuf>,
     trace_file: Option<File>,
     saved: Settings,
     history: History,
     contacts: Contacts,
+    chat: Chat,
+    /// The conversation shown, and what is being typed into it.
+    chat_with: String,
+    chat_draft: String,
+    /// Messages received after this have not been seen.
+    messages_seen: u64,
+    /// The mailbox, once the exchange told.
+    voicemail: Option<Voicemail>,
+    voicemail_number: String,
+    /// What each watched number's line is doing.
+    presence: HashMap<String, LineState>,
     utc_offset: i64,
     started: Instant,
 
@@ -224,6 +247,8 @@ struct PhoneWindow {
     last_error: Option<String>,
     /// Missed calls older than this have been seen.
     missed_seen: u64,
+    /// "Почта" was pressed in the status bar.
+    voicemail_requested: bool,
 }
 
 impl PhoneWindow {
@@ -232,6 +257,7 @@ impl PhoneWindow {
         let sibling = |name: &str| settings_path.as_ref().map(|path| path.with_file_name(name));
         let history_path = sibling("history.tsv");
         let contacts_path = sibling("contacts.tsv");
+        let chat_path = sibling("messages.tsv");
         let trace_path = sibling("sip-trace.log");
 
         let mut notes = Vec::new();
@@ -253,6 +279,10 @@ impl PhoneWindow {
         let contacts = contacts_path
             .as_deref()
             .and_then(|path| Contacts::load(path).ok())
+            .unwrap_or_default();
+        let chat = chat_path
+            .as_deref()
+            .and_then(|path| Chat::load(path).ok())
             .unwrap_or_default();
         // A fresh trace for every run; it never holds the password.
         let trace_file = trace_path.as_ref().and_then(|path| {
@@ -366,9 +396,18 @@ impl PhoneWindow {
             logs: VecDeque::new(),
             last_error: None,
             missed_seen: now_unix(),
+            voicemail_requested: false,
+            messages_seen: now_unix(),
+            chat_with: String::new(),
+            chat_draft: String::new(),
+            voicemail: None,
+            voicemail_number: saved.voicemail_number.clone(),
+            presence: HashMap::new(),
             settings_path,
             history_path,
             contacts_path,
+            chat_path,
+            chat,
             trace_file,
             saved,
             history,
@@ -507,6 +546,7 @@ impl PhoneWindow {
             do_not_disturb: self.do_not_disturb,
             auto_answer: self.auto_answer,
             auto_answer_delay: self.auto_answer_delay,
+            voicemail_number: self.voicemail_number.trim().to_owned(),
             forward: self.forward,
             forward_to: self.forward_to.trim().to_owned(),
             ring_speaker: self.ring_speaker.clone(),
@@ -600,6 +640,7 @@ impl PhoneWindow {
         handle.send(UiCommand::Codecs(self.codecs.clone()));
         handle.send(UiCommand::Encryption(self.encryption));
         handle.send(UiCommand::Stun(Some(self.stun.trim().to_owned())));
+        handle.send(UiCommand::Watch(self.contacts.watched()));
         handle.send(UiCommand::Register(account));
         if let Some(shell) = self.shell.as_ref() {
             shell.watch_ringing(Some(handle.ringing_flag()));
@@ -974,6 +1015,45 @@ impl PhoneWindow {
                     text,
                 } => self.trace(outgoing, peer, &text),
                 Event::Line(_) | Event::Codec(_) | Event::Encrypted(_) => {}
+                Event::Voicemail(voicemail) => {
+                    if voicemail.new > self.voicemail.map_or(0, |known| known.new) {
+                        self.log(format!("Новых голосовых сообщений: {}", voicemail.new));
+                    }
+                    self.voicemail = Some(voicemail);
+                }
+                Event::Presence { number, state } => {
+                    self.presence.insert(number, state);
+                }
+                Event::Message { number, name, text } => {
+                    let who = if name.is_empty() {
+                        number.clone()
+                    } else {
+                        format!("{name} ({number})")
+                    };
+                    self.log(format!("Сообщение от {who}"));
+                    self.chat.add(ChatMessage {
+                        time: now_unix(),
+                        incoming: true,
+                        number: number.clone(),
+                        name,
+                        text,
+                    });
+                    self.save_chat();
+                    // The first conversation opens by itself.
+                    if self.chat_with.trim().is_empty() {
+                        self.chat_with = number;
+                    }
+                    // Like a ringing call, a message brings the window up.
+                    if let Some(shell) = self.shell.as_ref() {
+                        shell.show_window();
+                    }
+                }
+                Event::MessageSent { to, error } => match error {
+                    None => self.log(format!("Сообщение для {to} доставлено на сервер")),
+                    Some(error) => {
+                        self.error(format!("Сообщение для {to} не доставлено: {error}"));
+                    }
+                },
                 Event::Selected(line) => self.selected = line.min(LINES - 1),
                 Event::Conference(on) => {
                     self.conference = on;
@@ -1137,6 +1217,33 @@ impl PhoneWindow {
                 }
             },
             Action::WindowChanged => self.save_settings(),
+            Action::Watch(number, on) => {
+                if self.contacts.set_watched(&number, on) {
+                    self.save_contacts();
+                    if !on {
+                        self.presence.remove(&number);
+                    }
+                    self.send_watch_list();
+                }
+            }
+            Action::OpenChat(number) => {
+                self.chat_with = number;
+                self.tab = Tab::Messages;
+            }
+            Action::SendText => self.send_text(),
+            Action::ClearChat(number) => {
+                self.chat.remove(&number);
+                self.save_chat();
+            }
+            Action::Voicemail => {
+                let number = self.voicemail_number.trim().to_owned();
+                if number.is_empty() {
+                    self.settings_open = true;
+                    self.error("Укажите номер голосовой почты в настройках");
+                } else {
+                    self.call(number);
+                }
+            }
             Action::CodecsChanged => {
                 self.save_settings();
                 if self.handle.is_some() {
@@ -1298,6 +1405,172 @@ impl PhoneWindow {
         }
     }
 
+    // ----- voicemail, busy lamps, messages -----------------------------------
+
+    fn save_chat(&mut self) {
+        if let Some(path) = self.chat_path.clone()
+            && let Err(error) = self.chat.save(&path)
+        {
+            self.log(format!("Не удалось сохранить сообщения: {error}"));
+        }
+    }
+
+    /// Tells the phone which contacts to show the line state of.
+    fn send_watch_list(&mut self) {
+        if self.handle.is_some() {
+            self.send(UiCommand::Watch(self.contacts.watched()));
+        }
+    }
+
+    /// The lamp of a number: what its line is doing, or `None` when the
+    /// contact is not watched.
+    fn lamp(&self, number: &str) -> Option<LineState> {
+        self.contacts
+            .list()
+            .iter()
+            .find(|contact| contact.watched && contact.number == number)
+            .map(|_| {
+                self.presence
+                    .get(number)
+                    .copied()
+                    .unwrap_or(LineState::Unknown)
+            })
+    }
+
+    /// Who a number is, for the conversation list.
+    fn who(&self, number: &str, name: &str) -> String {
+        match self.contacts.name_of(number) {
+            Some(saved) => saved.to_owned(),
+            None if !name.is_empty() => name.to_owned(),
+            None => number.to_owned(),
+        }
+    }
+
+    fn send_text(&mut self) {
+        let to = dialable(&self.chat_with);
+        let text = self.chat_draft.trim().to_owned();
+        if to.is_empty() || text.is_empty() {
+            return;
+        }
+        if self.handle.is_none() || !self.is_online() {
+            return self.error("Нет регистрации на сервере — сообщение не отправить");
+        }
+        self.send(UiCommand::SendMessage {
+            to: to.clone(),
+            text: text.clone(),
+        });
+        let name = self.contacts.name_of(&to).unwrap_or("").to_owned();
+        self.chat.add(ChatMessage {
+            time: now_unix(),
+            incoming: false,
+            number: to.clone(),
+            name,
+            text,
+        });
+        self.chat_with = to;
+        self.chat_draft.clear();
+        self.save_chat();
+    }
+
+    fn messages_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        // Opening the tab reads what is shown.
+        self.messages_seen = now_unix();
+        ui.horizontal(|ui| {
+            ui.label("Кому");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.chat_with)
+                    .hint_text("номер")
+                    .desired_width(140.0),
+            );
+            let partners = self.chat.partners();
+            if !partners.is_empty() {
+                egui::ComboBox::from_id_salt("chat-partners")
+                    .selected_text("Переписка")
+                    .width(130.0)
+                    .show_ui(ui, |ui| {
+                        for (number, name) in &partners {
+                            let label = format!("{} {number}", self.who(number, name));
+                            if ui
+                                .selectable_label(self.chat_with == *number, label)
+                                .clicked()
+                            {
+                                actions.push(Action::OpenChat(number.clone()));
+                            }
+                        }
+                    });
+            }
+        });
+        let with = dialable(&self.chat_with);
+        if let Some(name) = self.contacts.name_of(&with) {
+            ui.weak(name.to_owned());
+        }
+        ui.separator();
+
+        let input_height = 64.0;
+        egui::ScrollArea::vertical()
+            .max_height((ui.available_height() - input_height).max(80.0))
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let thread = self.chat.with(&with);
+                if with.is_empty() {
+                    ui.weak("Введите номер или выберите переписку.");
+                } else if thread.is_empty() {
+                    ui.weak("Сообщений пока нет.");
+                }
+                for message in thread {
+                    let time = format_timestamp(message.time, self.utc_offset);
+                    let (who, color) = if message.incoming {
+                        (
+                            self.who(&message.number, &message.name),
+                            self.tint(
+                                egui::Color32::LIGHT_GREEN,
+                                egui::Color32::from_rgb(30, 130, 50),
+                            ),
+                        )
+                    } else {
+                        (
+                            "Вы".to_owned(),
+                            self.tint(
+                                egui::Color32::LIGHT_BLUE,
+                                egui::Color32::from_rgb(30, 90, 170),
+                            ),
+                        )
+                    };
+                    ui.horizontal(|ui| {
+                        ui.colored_label(color, who);
+                        ui.weak(time);
+                    });
+                    ui.label(&message.text);
+                    ui.add_space(4.0);
+                }
+            });
+        ui.separator();
+        ui.horizontal(|ui| {
+            let field = egui::TextEdit::singleline(&mut self.chat_draft)
+                .hint_text("Сообщение")
+                .desired_width(ui.available_width() - 100.0);
+            let response = ui.add(field);
+            let enter =
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let can_send = self.is_online() && !with.is_empty();
+            if ui
+                .add_enabled(can_send, egui::Button::new("Отправить"))
+                .clicked()
+                || (enter && can_send)
+            {
+                actions.push(Action::SendText);
+                response.request_focus();
+            }
+        });
+        if !with.is_empty()
+            && !self.chat.with(&with).is_empty()
+            && ui.small_button("Удалить переписку").clicked()
+        {
+            actions.push(Action::ClearChat(with));
+        }
+    }
+
     // ----- drawing -------------------------------------------------------
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -1330,6 +1603,25 @@ impl PhoneWindow {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Журнал").clicked() {
                     self.log_open = !self.log_open;
+                }
+                if let Some(voicemail) = self.voicemail {
+                    let text = if voicemail.new > 0 {
+                        egui::RichText::new(format!("Почта: {}", voicemail.new))
+                            .color(egui::Color32::RED)
+                            .strong()
+                    } else {
+                        egui::RichText::new("Почта")
+                    };
+                    if ui
+                        .button(text)
+                        .on_hover_text(format!(
+                            "Новых: {}, прослушанных: {}. Нажмите, чтобы позвонить в ящик.",
+                            voicemail.new, voicemail.old
+                        ))
+                        .clicked()
+                    {
+                        self.voicemail_requested = true;
+                    }
                 }
                 if ui.button("Настройки").clicked() {
                     self.settings_open = !self.settings_open;
@@ -1794,11 +2086,32 @@ impl PhoneWindow {
             for (index, contact) in found.into_iter().enumerate() {
                 ui.push_id(index, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(&contact.name);
-                        ui.weak(&contact.number);
+                        if let Some(state) = self.lamp(&contact.number) {
+                            let (color, hint) = lamp_look(state);
+                            let (dot, response) = ui
+                                .allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                            ui.painter().circle_filled(dot.center(), 5.0, color);
+                            response.on_hover_text(hint);
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Удалить").clicked() {
                                 actions.push(Action::RemoveContact(contact.number.clone()));
+                            }
+                            let watch = if contact.watched {
+                                "Не следить"
+                            } else {
+                                "Следить"
+                            };
+                            if ui
+                                .small_button(watch)
+                                .on_hover_text("Показывать, занят ли этот номер (BLF)")
+                                .clicked()
+                            {
+                                actions
+                                    .push(Action::Watch(contact.number.clone(), !contact.watched));
+                            }
+                            if ui.small_button("Написать").clicked() {
+                                actions.push(Action::OpenChat(contact.number.clone()));
                             }
                             if ui
                                 .add_enabled(can_dial, egui::Button::new("Позвонить"))
@@ -1806,6 +2119,33 @@ impl PhoneWindow {
                             {
                                 actions.push(Action::Call(contact.number.clone()));
                             }
+                            // Name and number take the room the buttons
+                            // leave, and are cut short rather than run under
+                            // them.
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let mut text = egui::text::LayoutJob::default();
+                                    let style = ui.style();
+                                    egui::RichText::new(&contact.name).append_to(
+                                        &mut text,
+                                        style,
+                                        egui::FontSelection::Default,
+                                        egui::Align::Center,
+                                    );
+                                    egui::RichText::new(format!("  {}", contact.number))
+                                        .weak()
+                                        .append_to(
+                                            &mut text,
+                                            style,
+                                            egui::FontSelection::Default,
+                                            egui::Align::Center,
+                                        );
+                                    ui.add(egui::Label::new(text).truncate()).on_hover_text(
+                                        format!("{} {}", contact.name, contact.number),
+                                    );
+                                },
+                            );
                         });
                     });
                     ui.separator();
@@ -1972,6 +2312,15 @@ if self.transport == SipTransport::Tls {
 
                         ui.separator();
                         ui.heading("Входящие вызовы");
+                        ui.horizontal(|ui| {
+                            ui.label("Номер голосовой почты");
+                            if ui
+                                .add(egui::TextEdit::singleline(&mut self.voicemail_number).desired_width(80.0))
+                                .lost_focus()
+                            {
+                                actions.push(Action::WindowChanged);
+                            }
+                        });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.auto_answer, "Автоответ через");
                             ui.add(egui::DragValue::new(&mut self.auto_answer_delay).range(0..=60));
@@ -2179,7 +2528,7 @@ fn end_reason_text(reason: EndReason) -> String {
 /// Messages of the phone's core, in Russian where they are known. The text
 /// after the first colon (a system detail) is kept as it is.
 fn error_text(message: &str) -> String {
-    const KNOWN: [(&str, &str); 13] = [
+    const KNOWN: [(&str, &str); 14] = [
         (
             "Cannot play the ringing sound",
             "Не удалось воспроизвести звонок",
@@ -2203,6 +2552,10 @@ fn error_text(message: &str) -> String {
         ),
         ("invalid number or SIP address", "Неверный номер"),
         ("STUN server", "STUN-сервер"),
+        (
+            "register on a SIP server before sending messages",
+            "Нет регистрации на сервере — сообщение не отправить",
+        ),
         ("a call is already in progress", "Уже идёт вызов"),
         (
             "digits can be sent only during a connected call",
@@ -2215,6 +2568,16 @@ fn error_text(message: &str) -> String {
         }
     }
     message.to_owned()
+}
+
+/// The colour of a busy lamp and what it means.
+fn lamp_look(state: LineState) -> (egui::Color32, &'static str) {
+    match state {
+        LineState::Idle => (egui::Color32::from_rgb(60, 180, 75), "свободен"),
+        LineState::Ringing => (egui::Color32::from_rgb(230, 160, 0), "ему звонят"),
+        LineState::Busy => (egui::Color32::from_rgb(210, 50, 50), "разговаривает"),
+        LineState::Unknown => (egui::Color32::GRAY, "состояние неизвестно"),
+    }
 }
 
 /// The encryption modes as the settings list them.
@@ -2307,12 +2670,20 @@ impl eframe::App for PhoneWindow {
                 ui.selectable_value(&mut self.tab, Tab::Dialpad, "Набор");
                 ui.selectable_value(&mut self.tab, Tab::Calls, calls);
                 ui.selectable_value(&mut self.tab, Tab::Contacts, "Контакты");
+                let unread = self.chat.received_since(self.messages_seen);
+                let messages = if unread > 0 && self.tab != Tab::Messages {
+                    format!("Сообщения ({unread})")
+                } else {
+                    "Сообщения".to_owned()
+                };
+                ui.selectable_value(&mut self.tab, Tab::Messages, messages);
             });
             ui.separator();
             match self.tab {
                 Tab::Dialpad => self.dialpad_tab(ui, &mut actions),
                 Tab::Calls => self.calls_tab(ui, &mut actions),
                 Tab::Contacts => self.contacts_tab(ui, &mut actions),
+                Tab::Messages => self.messages_tab(ui, &mut actions),
             }
         });
 
@@ -2321,6 +2692,9 @@ impl eframe::App for PhoneWindow {
         }
         if self.log_open {
             self.log_window(ctx);
+        }
+        if std::mem::take(&mut self.voicemail_requested) {
+            actions.push(Action::Voicemail);
         }
         if let Some(on) = self.pending_dnd.take() {
             actions.push(Action::DoNotDisturb(on));

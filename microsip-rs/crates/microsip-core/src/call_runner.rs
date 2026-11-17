@@ -26,7 +26,12 @@ use crate::invite_control::{build_cancel, build_failure_ack};
 use crate::registration::{
     Account, Output, RETRY_DELAY, Registration, RegistrationState, add_rport,
 };
-use crate::sip::message::{Headers, InviteRequest, Message, Request, Response, ResponseBuilder};
+use crate::services::{
+    LineState, Package, Reply, Subscription, Voicemail, parse_dialog_info, parse_message_summary,
+};
+use crate::sip::message::{
+    Headers, InviteRequest, Message, Method, Request, RequestBuilder, Response, ResponseBuilder,
+};
 use crate::sip::sdp::{MediaKind, Sdp};
 use crate::srtp::{CryptoLine, MasterKey, MediaEncryption, SrtpKeys, Suite};
 use crate::stream::{LinkEvent, StreamLink, with_via_transport};
@@ -104,6 +109,14 @@ pub enum UiCommand {
     /// Sets the STUN server (`host` or `host:port`) asked for the public
     /// address of each call's audio; `None` or an empty name uses none.
     Stun(Option<String>),
+    /// Sets the extensions whose state is shown (busy lamps); they are
+    /// watched while the account is registered.
+    Watch(Vec<String>),
+    /// Sends a text message to a number or SIP address, through the server.
+    SendMessage {
+        to: String,
+        text: String,
+    },
     /// Records the connected call to this WAV file, or stops recording with
     /// `None`. Reported with [`Event::Recording`]; the recording also stops
     /// when the call ends.
@@ -175,6 +188,26 @@ pub enum Event {
     Codec(Codec),
     /// Whether the call's audio is encrypted (SRTP); follows `Codec`.
     Encrypted(bool),
+    /// The mailbox of the account changed (or was reported for the first
+    /// time).
+    Voicemail(Voicemail),
+    /// A watched extension changed its state.
+    Presence {
+        number: String,
+        state: LineState,
+    },
+    /// A text message arrived.
+    Message {
+        number: String,
+        name: String,
+        text: String,
+    },
+    /// A message sent with [`UiCommand::SendMessage`] was delivered to the
+    /// server (`error` is `None`) or refused.
+    MessageSent {
+        to: String,
+        error: Option<String>,
+    },
     /// RTP packet counters, sent just before the media stops.
     MediaStats {
         sent: u64,
@@ -379,6 +412,8 @@ enum RetxKind {
     Register,
     ReInvite,
     Refer,
+    Subscribe,
+    Message,
 }
 
 struct Retx {
@@ -590,6 +625,64 @@ impl<M: Media> Line<M> {
     }
 }
 
+/// A text message on its way.
+struct OutgoingMessage {
+    /// As the user wrote it.
+    to: String,
+    uri: String,
+    aor: String,
+    via: SocketAddr,
+    call_id: String,
+    from_tag: String,
+    text: String,
+    cseq: u32,
+    /// The credentials were already given.
+    authorized: bool,
+    /// Of the request last sent.
+    headers: Option<TransactionHeaders>,
+}
+
+impl OutgoingMessage {
+    /// The MESSAGE to send, with the next CSeq.
+    fn request(
+        &mut self,
+        authorization: Option<(&str, String)>,
+        branch: String,
+    ) -> Result<Vec<u8>> {
+        self.cseq += 1;
+        self.authorized = authorization.is_some();
+        let mut builder = RequestBuilder::new(Method::Message, self.uri.clone())
+            .header(
+                "via",
+                format!("SIP/2.0/UDP {};branch={branch};rport", self.via),
+            )?
+            .header("max-forwards", "70")?
+            .header("from", format!("<{}>;tag={}", self.aor, self.from_tag))?
+            .header("to", format!("<{}>", self.uri))?
+            .header("call-id", self.call_id.clone())?
+            .header("cseq", format!("{} MESSAGE", self.cseq))?
+            .header("content-type", "text/plain;charset=UTF-8")?
+            .body(self.text.clone().into_bytes());
+        if let Some((name, value)) = authorization {
+            builder = builder.header(name, value)?;
+        }
+        let request = builder.build()?;
+        self.headers = Some(TransactionHeaders::from_message(&Message::Request(
+            request.clone(),
+        ))?);
+        Ok(request.serialize()?)
+    }
+}
+
+/// The user part of a SIP address: `sip:4010@pbx` gives `4010`.
+fn user_part(uri: &str) -> String {
+    let uri = uri
+        .strip_prefix("sips:")
+        .or_else(|| uri.strip_prefix("sip:"))
+        .unwrap_or(uri);
+    uri.split('@').next().unwrap_or(uri).to_owned()
+}
+
 struct Runner<M: Media> {
     socket: UdpSocket,
     local: SocketAddr,
@@ -611,6 +704,12 @@ struct Runner<M: Media> {
     codecs: Vec<Codec>,
     /// Whether calls' audio is encrypted.
     encryption: MediaEncryption,
+    /// The mailbox and the watched extensions, while registered.
+    subscriptions: Vec<Subscription>,
+    /// Extensions whose state is shown.
+    watched: Vec<String>,
+    /// Messages sent and not answered yet.
+    messages: Vec<OutgoingMessage>,
     /// The STUN server asked for the public address of each call's audio.
     stun: Option<SocketAddr>,
     /// After the server failed to answer it is left alone until then, so
@@ -672,6 +771,9 @@ impl<M: Media> Runner<M> {
             forward_to: None,
             codecs: Codec::PREFERRED.to_vec(),
             encryption: MediaEncryption::Off,
+            subscriptions: Vec::new(),
+            watched: Vec::new(),
+            messages: Vec::new(),
             stun: None,
             stun_rest_until: None,
             ringing: Arc::new(AtomicBool::new(false)),
@@ -878,6 +980,11 @@ impl<M: Media> Runner<M> {
                     None => Ok(()),
                 }
             }
+            UiCommand::Watch(numbers) => {
+                self.watch(numbers);
+                Ok(())
+            }
+            UiCommand::SendMessage { to, text } => self.send_message(&to, &text),
             UiCommand::Encryption(mode) => {
                 self.encryption = mode;
                 Ok(())
@@ -1149,6 +1256,7 @@ impl<M: Media> Runner<M> {
     }
 
     fn unregister(&mut self) {
+        self.stop_services(true);
         // The user wants the account off: nothing registers it again.
         self.account = None;
         self.register_retry = None;
@@ -1202,10 +1310,16 @@ impl<M: Media> Runner<M> {
                     return;
                 }
                 Output::State(state) => {
-                    if matches!(state, RegistrationState::Registered { .. }) {
+                    let registered = matches!(state, RegistrationState::Registered { .. });
+                    if registered {
                         self.moved = false;
                     }
                     self.emit(Event::Registration(state));
+                    if registered {
+                        self.start_services();
+                    } else {
+                        self.stop_services(false);
+                    }
                 }
             }
         }
@@ -1249,6 +1363,369 @@ impl<M: Media> Runner<M> {
         }
     }
 
+    // ----- services: voicemail, busy lamps, messages -----------------------
+
+    /// The account as the services need it, while it is registered: its
+    /// address of record, this phone's Contact URI, the address for Via,
+    /// the server and the domain.
+    fn service_identity(&self) -> Option<(String, String, SocketAddr, SocketAddr, String)> {
+        let registration = self
+            .registration
+            .as_ref()
+            .filter(|registration| registration.is_bound())?;
+        let aor = format!("sip:{}@{}", registration.username(), registration.domain());
+        let contact = format!(
+            "sip:{}@{}{}",
+            registration.username(),
+            registration.contact_address(),
+            self.link
+                .as_ref()
+                .map_or("", |link| link.transport().uri_parameter())
+        );
+        let via = self.link.as_ref().map_or(self.local, StreamLink::local);
+        Some((
+            aor,
+            contact,
+            via,
+            registration.server(),
+            registration.domain().to_owned(),
+        ))
+    }
+
+    /// Subscribes to the mailbox and to every watched extension, once the
+    /// account is registered. Nothing happens while they are running.
+    fn start_services(&mut self) {
+        if !self.subscriptions.is_empty() {
+            return;
+        }
+        let Some((aor, contact, via, _, domain)) = self.service_identity() else {
+            return;
+        };
+        let mut targets = vec![(Package::Voicemail, aor.clone())];
+        for number in &self.watched {
+            match server_target(number, &domain) {
+                Ok(target) => targets.push((Package::Dialog, target)),
+                Err(_) => {
+                    let _ = self.events.send(Event::Presence {
+                        number: number.clone(),
+                        state: LineState::Unknown,
+                    });
+                }
+            }
+        }
+        for (package, target) in targets {
+            let seed = self.unique();
+            self.subscriptions.push(Subscription::new(
+                package,
+                target,
+                aor.clone(),
+                contact.clone(),
+                via.to_string(),
+                &seed,
+            ));
+            self.send_subscribe(self.subscriptions.len() - 1, None, false);
+        }
+    }
+
+    /// Ends the subscriptions. With `goodbye` the server is told (when the
+    /// account is being removed); without it they are simply forgotten
+    /// (the connection or the network is gone, nothing would arrive).
+    fn stop_services(&mut self, goodbye: bool) {
+        for index in 0..self.subscriptions.len() {
+            let id = self.subscriptions[index].call_id();
+            self.stop_retx(&id, &[RetxKind::Subscribe]);
+            if goodbye && self.subscriptions[index].is_active() {
+                self.send_subscribe(index, None, true);
+            }
+        }
+        self.subscriptions.clear();
+    }
+
+    /// Sends the SUBSCRIBE the subscription at `index` makes now.
+    fn send_subscribe(&mut self, index: usize, authorization: Option<(&str, String)>, end: bool) {
+        let Some(server) = self.registration.as_ref().map(Registration::server) else {
+            return;
+        };
+        let Some(subscription) = self.subscriptions.get_mut(index) else {
+            return;
+        };
+        match subscription.request(authorization, end) {
+            Ok((bytes, _)) => {
+                let id = subscription.call_id();
+                self.stop_retx(&id, &[RetxKind::Subscribe]);
+                let _ = self.send(&bytes, server);
+                // An ending is not repeated: the server lets it run out anyway.
+                if !end {
+                    self.start_retx(RetxKind::Subscribe, id, bytes, server, self.timers.t2);
+                }
+            }
+            Err(error) => self.report(format!("Cannot subscribe: {error}")),
+        }
+    }
+
+    /// Returns true when the response belonged to a subscription.
+    fn on_subscribe_response(&mut self, response: &Response, headers: &TransactionHeaders) -> bool {
+        if headers.method != "SUBSCRIBE" {
+            return false;
+        }
+        let Some(index) = self.subscriptions.iter().position(|subscription| {
+            subscription.call_id() == headers.call_id && subscription.is_answer(headers)
+        }) else {
+            return false;
+        };
+        if response.status_code >= 200 {
+            self.stop_retx(&headers.call_id, &[RetxKind::Subscribe]);
+        }
+        let now = Instant::now();
+        let subscription = &mut self.subscriptions[index];
+        match subscription.on_response(response, now) {
+            Reply::Wait => {}
+            Reply::Authorize => {
+                let uri = subscription.request_uri();
+                let answer = self
+                    .registration
+                    .as_ref()
+                    .map(|registration| registration.authorize(response, "SUBSCRIBE", &uri));
+                match answer {
+                    Some(Ok((name, value))) => {
+                        self.send_subscribe(index, Some((name, value)), false)
+                    }
+                    _ => {
+                        // Cannot answer the challenge: treated as a refusal.
+                        let failed = self.subscriptions[index].on_response(response, now);
+                        debug_assert!(matches!(failed, Reply::Failed(_) | Reply::Wait));
+                        self.subscription_failed(index);
+                    }
+                }
+            }
+            Reply::Failed(_) => self.subscription_failed(index),
+        }
+        true
+    }
+
+    /// A watched extension whose subscription was refused shows as unknown.
+    fn subscription_failed(&mut self, index: usize) {
+        let subscription = &self.subscriptions[index];
+        if subscription.package() == Package::Dialog {
+            let number = user_part(subscription.target());
+            self.emit(Event::Presence {
+                number,
+                state: LineState::Unknown,
+            });
+        }
+    }
+
+    /// Renews the subscriptions that are due.
+    fn tick_services(&mut self, now: Instant) {
+        for index in 0..self.subscriptions.len() {
+            if self.subscriptions[index].is_due(now) {
+                self.send_subscribe(index, None, false);
+            }
+        }
+    }
+
+    /// Handles a NOTIFY about the mailbox or a watched extension. Returns
+    /// false when it is about something else (a transfer).
+    fn on_service_notify(&mut self, request: &Request, source: SocketAddr) -> Result<bool> {
+        let event = request
+            .headers
+            .get("event")
+            .map(|event| event.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let body = String::from_utf8_lossy(&request.body).into_owned();
+        if let Some(index) = self
+            .subscriptions
+            .iter()
+            .position(|subscription| subscription.is_notify_of(request))
+        {
+            let bytes = build_response(request, 200, "OK", None, None, None)?;
+            self.remember(request, bytes.clone(), source);
+            self.send(&bytes, source)?;
+            let subscription = &mut self.subscriptions[index];
+            subscription.on_notify(request, Instant::now());
+            match subscription.package() {
+                Package::Voicemail => {
+                    if let Some(voicemail) = parse_message_summary(&body) {
+                        self.emit(Event::Voicemail(voicemail));
+                    }
+                }
+                Package::Dialog => {
+                    let number = user_part(subscription.target());
+                    // An empty NOTIFY (the subscription's end) says nothing new.
+                    if let Some(state) = parse_dialog_info(&body) {
+                        self.emit(Event::Presence { number, state });
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        // Many servers report voicemail without being asked.
+        if event.starts_with("message-summary") {
+            let tag = format!("rs-stateless-{}", self.local.port());
+            let bytes = build_response(request, 200, "OK", Some(&tag), None, None)?;
+            self.remember(request, bytes.clone(), source);
+            self.send(&bytes, source)?;
+            if let Some(voicemail) = parse_message_summary(&body) {
+                self.emit(Event::Voicemail(voicemail));
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Changes the watched extensions: their subscriptions are made anew.
+    fn watch(&mut self, numbers: Vec<String>) {
+        let mut watched: Vec<String> = Vec::new();
+        for number in numbers {
+            let number = number.trim().to_owned();
+            if !number.is_empty() && !watched.contains(&number) {
+                watched.push(number);
+            }
+        }
+        if watched == self.watched {
+            return;
+        }
+        self.watched = watched;
+        if self.subscriptions.is_empty() {
+            return;
+        }
+        // The mailbox stays as it is; the lamps start again.
+        let mut index = 0;
+        while index < self.subscriptions.len() {
+            if self.subscriptions[index].package() == Package::Dialog {
+                let id = self.subscriptions[index].call_id();
+                self.stop_retx(&id, &[RetxKind::Subscribe]);
+                if self.subscriptions[index].is_active() {
+                    self.send_subscribe(index, None, true);
+                }
+                self.subscriptions.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        let Some((aor, contact, via, _, domain)) = self.service_identity() else {
+            return;
+        };
+        for number in self.watched.clone() {
+            let Ok(target) = server_target(&number, &domain) else {
+                self.emit(Event::Presence {
+                    number,
+                    state: LineState::Unknown,
+                });
+                continue;
+            };
+            let seed = self.unique();
+            self.subscriptions.push(Subscription::new(
+                Package::Dialog,
+                target,
+                aor.clone(),
+                contact.clone(),
+                via.to_string(),
+                &seed,
+            ));
+            self.send_subscribe(self.subscriptions.len() - 1, None, false);
+        }
+    }
+
+    /// A text message from someone.
+    fn on_message(&mut self, request: &Request, source: SocketAddr) -> Result<()> {
+        let plain = request
+            .headers
+            .get("content-type")
+            .is_none_or(|kind| kind.trim().to_ascii_lowercase().starts_with("text/plain"));
+        if !plain {
+            return self.reply_stateless(request, source, 415, "Unsupported Media Type");
+        }
+        let tag = format!("rs-stateless-{}", self.local.port());
+        let bytes = build_response(request, 200, "OK", Some(&tag), None, None)?;
+        // A repeated MESSAGE gets the same answer and is not shown twice.
+        self.remember(request, bytes.clone(), source);
+        self.send(&bytes, source)?;
+        let (number, name) = caller_identity(header(&request.headers, "from")?);
+        let text = String::from_utf8_lossy(&request.body).trim().to_owned();
+        if !text.is_empty() {
+            self.emit(Event::Message { number, name, text });
+        }
+        Ok(())
+    }
+
+    /// Sends a text message through the server.
+    fn send_message(&mut self, to: &str, text: &str) -> Result<()> {
+        let Some((aor, _, via, server, domain)) = self.service_identity() else {
+            return Err("register on a SIP server before sending messages".into());
+        };
+        if text.trim().is_empty() {
+            return Err("the message is empty".into());
+        }
+        let uri = server_target(to.trim(), &domain)?;
+        let call_id = format!("{}@{}", self.unique(), via.ip());
+        let from_tag = self.unique();
+        let mut message = OutgoingMessage {
+            to: to.trim().to_owned(),
+            uri,
+            aor,
+            via,
+            call_id,
+            from_tag,
+            text: text.to_owned(),
+            cseq: 0,
+            authorized: false,
+            headers: None,
+        };
+        let bytes = message.request(None, self.branch())?;
+        let id = message.call_id.clone();
+        self.messages.push(message);
+        self.send(&bytes, server)?;
+        self.start_retx(RetxKind::Message, id, bytes, server, self.timers.t2);
+        Ok(())
+    }
+
+    /// Returns true when the response belonged to a message sent here.
+    fn on_message_response(&mut self, response: &Response, headers: &TransactionHeaders) -> bool {
+        if headers.method != "MESSAGE" {
+            return false;
+        }
+        let Some(index) = self.messages.iter().position(|message| {
+            message
+                .headers
+                .as_ref()
+                .is_some_and(|sent| sent.matches_response(headers))
+        }) else {
+            return false;
+        };
+        let status = response.status_code;
+        if status < 200 {
+            return true;
+        }
+        self.stop_retx(&headers.call_id, &[RetxKind::Message]);
+        if matches!(status, 401 | 407) && !self.messages[index].authorized {
+            let uri = self.messages[index].uri.clone();
+            let answer = self
+                .registration
+                .as_ref()
+                .map(|registration| registration.authorize(response, "MESSAGE", &uri));
+            if let (Some(Ok(authorization)), Some(server)) =
+                (answer, self.registration.as_ref().map(Registration::server))
+            {
+                let branch = self.branch();
+                if let Ok(bytes) = self.messages[index].request(Some(authorization), branch) {
+                    let id = self.messages[index].call_id.clone();
+                    let _ = self.send(&bytes, server);
+                    self.start_retx(RetxKind::Message, id, bytes, server, self.timers.t2);
+                    return true;
+                }
+            }
+        }
+        let message = self.messages.remove(index);
+        let error =
+            (!(200..300).contains(&status)).then(|| format!("{status} {}", response.reason));
+        self.emit(Event::MessageSent {
+            to: message.to,
+            error,
+        });
+        true
+    }
+
     // ----- the connection to the server and the network --------------------
 
     /// Hands over what the TCP or TLS connection received.
@@ -1272,6 +1749,7 @@ impl<M: Media> Runner<M> {
     /// The connection to the server ended: the account is registered again
     /// over a new one, soon.
     fn on_link_closed(&mut self, reason: &str) {
+        self.stop_services(false);
         self.link = None;
         if let Some(old) = self.registration.take() {
             let id = old.call_id().to_owned();
@@ -1326,6 +1804,7 @@ impl<M: Media> Runner<M> {
     /// The old registration cannot be removed, its network is gone; the
     /// server forgets it when it expires.
     fn move_to(&mut self, ip: IpAddr) {
+        self.stop_services(false);
         let bound = UdpSocket::bind(SocketAddr::new(ip, self.local.port()))
             .or_else(|_| UdpSocket::bind(SocketAddr::new(ip, 0)))
             .and_then(|socket| {
@@ -2167,8 +2646,33 @@ impl<M: Media> Runner<M> {
             let outputs = registration.poll(now);
             self.apply_registration(outputs);
         }
+        self.tick_services(now);
 
         for (kind, call_id) in expired {
+            if kind == RetxKind::Subscribe {
+                if let Some(subscription) = self
+                    .subscriptions
+                    .iter_mut()
+                    .find(|subscription| subscription.call_id() == call_id)
+                {
+                    subscription.on_timeout(now);
+                }
+                continue;
+            }
+            if kind == RetxKind::Message {
+                if let Some(index) = self
+                    .messages
+                    .iter()
+                    .position(|message| message.call_id == call_id)
+                {
+                    let message = self.messages.remove(index);
+                    self.emit(Event::MessageSent {
+                        to: message.to,
+                        error: Some("no answer from the SIP server".to_owned()),
+                    });
+                }
+                continue;
+            }
             if kind == RetxKind::Register {
                 if let Some(leaving) = self
                     .leaving
@@ -2347,6 +2851,15 @@ impl<M: Media> Runner<M> {
         {
             let bytes = entry.bytes.clone();
             return self.send(&bytes, source);
+        }
+
+        // What the exchange says outside calls: voicemail, busy lamps,
+        // text messages.
+        if method == "NOTIFY" && self.on_service_notify(request, source)? {
+            return Ok(());
+        }
+        if method == "MESSAGE" {
+            return self.on_message(request, source);
         }
 
         // The line of this call; a new call goes to a free line. With no
@@ -2556,6 +3069,11 @@ impl<M: Media> Runner<M> {
             return Ok(());
         };
         if self.on_register_response(response, &headers, source) {
+            return Ok(());
+        }
+        if self.on_subscribe_response(response, &headers)
+            || self.on_message_response(response, &headers)
+        {
             return Ok(());
         }
         if !self.find_line(&headers.call_id, source) {
