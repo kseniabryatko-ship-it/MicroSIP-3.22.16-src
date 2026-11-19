@@ -8,6 +8,7 @@ pub mod codec;
 pub mod contacts;
 pub mod gain;
 pub mod history;
+pub mod key_tones;
 pub mod links;
 pub mod live_quality;
 pub mod localtime;

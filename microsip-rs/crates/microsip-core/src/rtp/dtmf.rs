@@ -108,6 +108,31 @@ pub fn event_code(digit: char) -> Option<u8> {
     }
 }
 
+/// The sound of a pressed key for the user's own ears (as desk phones and
+/// MicroSIP give): its two tones for `duration_ms`, softly faded in and
+/// out so it does not click. Empty for a character that is no key.
+pub fn key_sound(digit: char, sample_rate: u32, duration_ms: u32) -> Vec<f32> {
+    let Some(code) = event_code(digit) else {
+        return Vec::new();
+    };
+    let (low, high) = frequencies(code);
+    let length = (sample_rate * duration_ms / 1_000) as usize;
+    let fade = (sample_rate as usize / 200).max(1).min(length / 2);
+    (0..length)
+        .map(|index| {
+            let time = index as f32 / sample_rate as f32;
+            let edge = index.min(length - 1 - index);
+            let envelope = if edge < fade {
+                edge as f32 / fade as f32
+            } else {
+                1.0
+            };
+            let tones = (2.0 * PI * low * time).sin() + (2.0 * PI * high * time).sin();
+            0.12 * envelope * tones
+        })
+        .collect()
+}
+
 /// The low and high tone of a keypad code, in hertz.
 fn frequencies(code: u8) -> (f32, f32) {
     const ROWS: [f32; 4] = [697.0, 770.0, 852.0, 941.0];
@@ -299,6 +324,17 @@ fn tone(code: u8, frame: u8, sample_rate: u32) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pressed_key_sounds_its_two_tones_without_clicks() {
+        let sound = key_sound('5', 8_000, 120);
+        assert_eq!(sound.len(), 960);
+        // Soft edges, never loud.
+        assert!(sound[0].abs() < 0.01 && sound[959].abs() < 0.05);
+        assert!(sound.iter().all(|sample| sample.abs() <= 0.25));
+        assert!(sound.iter().any(|sample| sample.abs() > 0.15));
+        assert!(key_sound('x', 8_000, 120).is_empty());
+    }
 
     #[test]
     fn the_chosen_method_decides_how_digits_travel() {

@@ -89,6 +89,12 @@ pub struct Settings {
     pub all_accounts: bool,
     /// Language of the window: `ru` or `en`.
     pub language: String,
+    /// The keypad plays its tones when pressed.
+    pub key_tones: bool,
+    /// An incoming call shows a small window with Answer and Decline.
+    pub incoming_popup: bool,
+    /// The phone's window stays above the other windows.
+    pub always_on_top: bool,
     /// The saved accounts other than the active one (whose settings are
     /// the fields above), in the order they were added.
     pub accounts: Vec<AccountSettings>,
@@ -136,6 +142,9 @@ impl Default for Settings {
             presence_status: "online".to_owned(),
             all_accounts: false,
             language: "ru".to_owned(),
+            key_tones: true,
+            incoming_popup: true,
+            always_on_top: false,
             accounts: Vec::new(),
         }
     }
@@ -215,6 +224,9 @@ impl Settings {
                 "presence_status" => settings.presence_status = value,
                 "all_accounts" => settings.all_accounts = value != "0",
                 "language" => settings.language = value,
+                "key_tones" => settings.key_tones = value != "0",
+                "incoming_popup" => settings.incoming_popup = value != "0",
+                "always_on_top" => settings.always_on_top = value != "0",
                 "auto_answer_delay" => {
                     if let Some(delay) = value.parse::<u32>().ok().filter(|delay| *delay <= 60) {
                         settings.auto_answer_delay = delay;
@@ -261,6 +273,9 @@ impl Settings {
         let noise_suppression = flag(self.noise_suppression);
         let presence = flag(self.presence);
         let all_accounts = flag(self.all_accounts);
+        let key_tones = flag(self.key_tones);
+        let incoming_popup = flag(self.incoming_popup);
+        let always_on_top = flag(self.always_on_top);
         // Without permission to remember it, no form of the password is written.
         let password_protected = if self.save_password {
             self.password_protected.clone()
@@ -307,6 +322,9 @@ impl Settings {
             ("presence_status", &self.presence_status),
             ("all_accounts", &all_accounts),
             ("language", &self.language),
+            ("key_tones", &key_tones),
+            ("incoming_popup", &incoming_popup),
+            ("always_on_top", &always_on_top),
         ] {
             text.push_str(key);
             text.push('=');
@@ -564,6 +582,9 @@ mod tests {
             presence_status: "away".to_owned(),
             all_accounts: true,
             language: "en".to_owned(),
+            key_tones: false,
+            incoming_popup: false,
+            always_on_top: true,
             accounts: Vec::new(),
         }
     }
@@ -684,7 +705,8 @@ mod tests {
              transport=TLS\nproxy=proxy.example.com:5061\ntls_verify=0\n\
              media_encryption=required\nstun=stun.example.com:3478\n\
              voicemail_number=*98\necho_cancellation=0\nnoise_suppression=1\n\
-             dtmf_method=info\npresence=1\npresence_status=away\nall_accounts=1\nlanguage=en\n"
+             dtmf_method=info\npresence=1\npresence_status=away\nall_accounts=1\nlanguage=en\n\
+             key_tones=0\nincoming_popup=0\nalways_on_top=1\n"
         );
         // No line holds the password itself; `save_password` and
         // `password_protected` are different keys.

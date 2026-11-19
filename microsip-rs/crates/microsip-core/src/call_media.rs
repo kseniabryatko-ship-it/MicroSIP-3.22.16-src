@@ -521,6 +521,11 @@ struct ControlsInner {
     ringtone: Mutex<Option<Arc<Melody>>>,
     echo_cancellation: AtomicBool,
     noise_suppression: AtomicBool,
+    /// Loudest sample heard from the other side since the window last
+    /// looked, in thousandths of full scale.
+    heard_level: AtomicU32,
+    /// The same for the microphone, as it goes out.
+    microphone_level: AtomicU32,
 }
 
 impl Default for AudioControls {
@@ -537,6 +542,8 @@ impl Default for AudioControls {
                 ringtone: Mutex::new(None),
                 echo_cancellation: AtomicBool::new(true),
                 noise_suppression: AtomicBool::new(true),
+                heard_level: AtomicU32::new(0),
+                microphone_level: AtomicU32::new(0),
             }),
         }
     }
@@ -629,7 +636,24 @@ impl AudioControls {
         }
     }
 
-    fn speaker_volume_handle(&self) -> Arc<AtomicU32> {
+    /// How loud the other side and the microphone were since the last
+    /// call: the loudest sample of each, from 0.0 to 1.0. For level bars.
+    pub fn take_levels(&self) -> (f32, f32) {
+        let heard = self.inner.heard_level.swap(0, Ordering::Relaxed);
+        let microphone = self.inner.microphone_level.swap(0, Ordering::Relaxed);
+        (heard as f32 / 1_000.0, microphone as f32 / 1_000.0)
+    }
+
+    fn note_level(level: &AtomicU32, samples: &[f32]) {
+        let peak = samples
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()))
+            .min(1.0);
+        level.fetch_max((peak * 1_000.0).round() as u32, Ordering::Relaxed);
+    }
+
+    /// The speaker volume shared with the sound card, for other players.
+    pub fn speaker_volume_handle(&self) -> Arc<AtomicU32> {
         Arc::clone(&self.inner.speaker_percent)
     }
 
@@ -914,6 +938,7 @@ impl Media for AudioMedia {
         let record_local = RecorderSlot::default();
         let record_remote = RecorderSlot::default();
         let (tap_local, tap_remote) = (Arc::clone(&record_local), Arc::clone(&record_remote));
+        let heard_controls = self.controls.clone();
         // For a conference: what this line hears is kept for the others,
         // and what the others hear is added to what this line sends.
         let heard = self.line.and_then(|line| self.controls.heard_queue(line));
@@ -976,6 +1001,7 @@ impl Media for AudioMedia {
                 {
                     input.push(&samples, heard_rate);
                 }
+                AudioControls::note_level(&heard_controls.inner.heard_level, &samples);
                 // A failure here means the speaker is gone; the call ends soon.
                 let _ = to_speaker.push(&samples, heard_rate);
             })),
@@ -1016,6 +1042,7 @@ impl Media for AudioMedia {
             {
                 input.push(&samples, format.sample_rate);
             }
+            AudioControls::note_level(&controls.inner.microphone_level, &samples);
             // Never wait on the sound card thread; a full queue drops a block.
             let _ = to_network.try_send(samples);
         })?;

@@ -14,6 +14,7 @@ use microsip_core::chat::{Chat, ChatMessage};
 use microsip_core::codec::Codec;
 use microsip_core::contacts::{Contacts, dialable};
 use microsip_core::history::{CallRecord, Direction, History};
+use microsip_core::key_tones::KeyTones;
 use microsip_core::links::{self, Instance, Request as LinkRequest};
 use microsip_core::live_quality::{Lamp, LiveQuality};
 use microsip_core::localtime::{
@@ -223,6 +224,20 @@ struct PhoneWindow {
     call_from: Option<usize>,
     /// What the exchange says about each extra account, by its key.
     extra_states: HashMap<String, RegistrationState>,
+    /// The keypad sounds its tones.
+    key_tones_on: bool,
+    key_tones: KeyTones,
+    /// An incoming call shows a small window above everything.
+    incoming_popup: bool,
+    /// The user closed that window for the call ringing now.
+    popup_dismissed: bool,
+    /// The phone's window stays above the others.
+    always_on_top: bool,
+    /// What the window was last told about staying on top.
+    on_top_applied: Option<bool>,
+    /// How loud the other side and the microphone are, for the level bars;
+    /// falls back slowly like a meter's needle.
+    levels: (f32, f32),
     utc_offset: i64,
     started: Instant,
 
@@ -370,6 +385,7 @@ impl PhoneWindow {
             }
         };
         set_english(saved.language == "en");
+        let controls = AudioControls::default();
         let history = history_path
             .as_deref()
             .and_then(|path| History::load(path).ok())
@@ -480,7 +496,7 @@ impl PhoneWindow {
             noise_suppression: saved.noise_suppression,
             microphones: input_device_names(),
             speakers: output_device_names(),
-            controls: AudioControls::default(),
+            controls: controls.clone(),
             record_calls: saved.record_calls,
             recordings_dir: saved.recordings_dir.clone(),
             do_not_disturb: saved.do_not_disturb,
@@ -530,6 +546,13 @@ impl PhoneWindow {
             all_accounts: saved.all_accounts,
             call_from: None,
             extra_states: HashMap::new(),
+            key_tones_on: saved.key_tones,
+            key_tones: KeyTones::new(controls.clone()),
+            incoming_popup: saved.incoming_popup,
+            popup_dismissed: false,
+            always_on_top: saved.always_on_top,
+            on_top_applied: None,
+            levels: (0.0, 0.0),
             settings_path,
             history_path,
             contacts_path,
@@ -693,6 +716,9 @@ impl PhoneWindow {
             presence_status: self.my_status.name().to_owned(),
             all_accounts: self.all_accounts,
             language: if english() { "en" } else { "ru" }.to_owned(),
+            key_tones: self.key_tones_on,
+            incoming_popup: self.incoming_popup,
+            always_on_top: self.always_on_top,
             accounts: self.other_accounts.clone(),
         };
         if current == self.saved {
@@ -1102,6 +1128,9 @@ impl PhoneWindow {
 
     /// A keypad press: a tone during a call, a digit of the number otherwise.
     fn digit(&mut self, digit: char) {
+        if self.key_tones_on {
+            self.key_tones.play(digit);
+        }
         if self.lines[self.at].view.phase() == Phase::Connected {
             self.send(UiCommand::Dtmf(digit));
         } else if self.lines[self.at].view.can_dial() {
@@ -2429,16 +2458,37 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         for item in order {
             match item {
                 0 => {
-                    if ui.button(tr!("Журнал", "Log")).clicked() {
-                        self.log_open = !self.log_open;
-                    }
+                    // Settings, the log and staying on top live in one menu.
+                    ui.menu_button(tr!("Меню", "Menu"), |ui| {
+                        if ui.button(tr!("Настройки", "Settings")).clicked() {
+                            self.settings_open = !self.settings_open;
+                            ui.close_menu();
+                        }
+                        if ui.button(tr!("Журнал", "Log")).clicked() {
+                            self.log_open = !self.log_open;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .checkbox(
+                                &mut self.always_on_top,
+                                tr!("Поверх всех окон", "Always on top"),
+                            )
+                            .changed()
+                        {
+                            self.save_settings();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .checkbox(&mut self.key_tones_on, tr!("Звук кнопок", "Keypad sounds"))
+                            .changed()
+                        {
+                            self.save_settings();
+                        }
+                    });
                 }
                 1 => self.voicemail_button(ui),
-                2 => {
-                    if ui.button(tr!("Настройки", "Settings")).clicked() {
-                        self.settings_open = !self.settings_open;
-                    }
-                }
+                2 => {}
                 3 => self.status_choice(ui),
                 _ => {
                     let mut dnd = self.do_not_disturb;
@@ -2644,16 +2694,63 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         let before = (self.speaker_volume, self.microphone_volume);
         let width = (ui.available_width() - 150.0).clamp(60.0, 400.0);
         ui.spacing_mut().slider_width = width;
+        // During a call the bars under the sliders show how loud the other
+        // side is and how loud the microphone is, as in MicroSIP.
+        let talking = self
+            .lines
+            .iter()
+            .any(|line| line.view.phase() == Phase::Connected);
+        let (heard, spoken) = self.controls.take_levels();
+        let fall = |old: f32, new: f32| if talking { new.max(old * 0.85) } else { 0.0 };
+        self.levels = (fall(self.levels.0, heard), fall(self.levels.1, spoken));
+        if talking {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
+        let (heard_level, spoken_level) = self.levels;
+        let bar = |ui: &egui::Ui, slider: &egui::Response, level: f32| {
+            if !talking {
+                return;
+            }
+            let width = ui.spacing().slider_width;
+            let left = slider.rect.left();
+            let y = slider.rect.bottom() - 1.0;
+            let full =
+                egui::Rect::from_min_max(egui::pos2(left, y - 3.0), egui::pos2(left + width, y));
+            ui.painter()
+                .rect_filled(full, 1.0, ui.visuals().extreme_bg_color);
+            // A level shown on a sound scale: quiet speech is still seen.
+            let shown = (1.0 + (level.max(0.000_1)).log10() / 3.0).clamp(0.0, 1.0);
+            let color = if level > 0.9 {
+                egui::Color32::from_rgb(210, 50, 50)
+            } else {
+                egui::Color32::from_rgb(60, 180, 75)
+            };
+            let mut filled = full;
+            filled.set_right(left + width * shown);
+            ui.painter().rect_filled(filled, 1.0, color);
+        };
         ui.horizontal(|ui| {
             ui.add_sized([70.0, 18.0], egui::Label::new(tr!("Динамик", "Speaker")));
-            ui.add(egui::Slider::new(&mut self.speaker_volume, 0..=200).suffix("%"));
+            let slider = ui
+                .add(egui::Slider::new(&mut self.speaker_volume, 0..=200).suffix("%"))
+                .on_hover_text(tr!(
+                    "Полоска — как громко говорит собеседник",
+                    "The bar shows how loud the other side speaks"
+                ));
+            bar(ui, &slider, heard_level);
         });
         ui.horizontal(|ui| {
             ui.add_sized(
                 [70.0, 18.0],
                 egui::Label::new(tr!("Микрофон", "Microphone")),
             );
-            ui.add(egui::Slider::new(&mut self.microphone_volume, 0..=200).suffix("%"));
+            let slider = ui
+                .add(egui::Slider::new(&mut self.microphone_volume, 0..=200).suffix("%"))
+                .on_hover_text(tr!(
+                    "Полоска — как громко вас слышно",
+                    "The bar shows how loud you are"
+                ));
+            bar(ui, &slider, spoken_level);
         });
         if before != (self.speaker_volume, self.microphone_volume) {
             // Volumes act at once; they are saved when the window closes.
@@ -2770,6 +2867,23 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         let response = ui.add_enabled(idle, field);
         // The right-click menu of a Windows text field, as in MicroSIP.
         response.context_menu(|ui| self.number_menu(ui, number_id, actions));
+        // Keys typed on the keyboard sound like the keypad's.
+        if response.changed() && self.key_tones_on {
+            let typed: Vec<char> = ui.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        egui::Event::Text(text) => Some(text.chars().collect::<Vec<_>>()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect()
+            });
+            if let [digit] = typed.as_slice() {
+                self.key_tones.play(*digit);
+            }
+        }
         if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
             actions.push(Action::Call(self.number.clone()));
         }
@@ -3615,6 +3729,28 @@ format!("Phone address: {local}"),
                         });
                         let before = (self.close_to_tray, self.hotkeys, self.light_theme);
                         ui.checkbox(&mut self.light_theme, tr!("Светлая тема", "Light theme"));
+                        let before_window =
+                            (self.always_on_top, self.incoming_popup, self.key_tones_on);
+                        ui.checkbox(
+                            &mut self.always_on_top,
+                            tr!("Поверх всех окон", "Always on top"),
+                        );
+                        ui.checkbox(
+                            &mut self.incoming_popup,
+                            tr!(
+                                "Окно входящего звонка с кнопками «Ответить» и «Отклонить»",
+                                "A window for incoming calls with Answer and Decline"
+                            ),
+                        );
+                        ui.checkbox(
+                            &mut self.key_tones_on,
+                            tr!("Звук кнопок при наборе", "Keypad sounds when dialling"),
+                        );
+                        if before_window
+                            != (self.always_on_top, self.incoming_popup, self.key_tones_on)
+                        {
+                            self.save_settings();
+                        }
                         if self.shell.is_some() {
                             ui.checkbox(
                                 &mut self.close_to_tray,
@@ -4251,8 +4387,109 @@ impl eframe::App for PhoneWindow {
         if let Some(on) = self.pending_dnd.take() {
             actions.push(Action::DoNotDisturb(on));
         }
+        self.incoming_window(ctx, &mut actions);
+        if self.on_top_applied != Some(self.always_on_top) {
+            self.on_top_applied = Some(self.always_on_top);
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.always_on_top {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            }));
+        }
         for action in actions {
             self.apply(action);
+        }
+    }
+}
+
+impl PhoneWindow {
+    /// A small window above all others while a call rings, with the caller
+    /// and the buttons to answer or decline, as MicroSIP shows.
+    fn incoming_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let ringing = (0..LINES).find(|line| self.lines[*line].view.phase() == Phase::Incoming);
+        let Some(line) = ringing.filter(|_| self.incoming_popup) else {
+            self.popup_dismissed = false;
+            return;
+        };
+        if self.popup_dismissed {
+            return;
+        }
+        let (who, number, account) = match self.lines[line].current.as_ref() {
+            Some(call) if !call.name.is_empty() => {
+                (call.name.clone(), call.number.clone(), call.account.clone())
+            }
+            Some(call) => (call.number.clone(), String::new(), call.account.clone()),
+            None => (
+                tr!("Входящий вызов", "Incoming call").to_owned(),
+                String::new(),
+                String::new(),
+            ),
+        };
+        // Bottom right of the screen, where notifications appear.
+        let size = egui::vec2(320.0, 128.0);
+        let screen = ctx.input(|input| input.viewport().monitor_size);
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(tr!("Входящий вызов", "Incoming call"))
+            .with_inner_size(size)
+            .with_resizable(false)
+            .with_always_on_top();
+        if let Some(screen) = screen {
+            builder = builder.with_position(egui::pos2(
+                (screen.x - size.x - 24.0).max(0.0),
+                (screen.y - size.y - 72.0).max(0.0),
+            ));
+        }
+        let mut answer = false;
+        let mut decline = false;
+        let mut closed = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("incoming-call"),
+            builder,
+            |ctx, _| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(tr!("Входящий вызов", "Incoming call"));
+                    ui.label(egui::RichText::new(&who).size(20.0).strong());
+                    if !number.is_empty() {
+                        ui.label(&number);
+                    }
+                    if !account.is_empty() {
+                        ui.weak(tr!(format!("на номер {account}"), format!("to {account}"),));
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let half = egui::vec2((ui.available_width() - 8.0) / 2.0, 34.0);
+                        let green = egui::Button::new(
+                            egui::RichText::new(tr!("Ответить", "Answer"))
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(46, 140, 64));
+                        if ui.add_sized(half, green).clicked() {
+                            answer = true;
+                        }
+                        let red = egui::Button::new(
+                            egui::RichText::new(tr!("Отклонить", "Decline"))
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(180, 50, 50));
+                        if ui.add_sized(half, red).clicked() {
+                            decline = true;
+                        }
+                    });
+                });
+                if ctx.input(|input| input.viewport().close_requested()) {
+                    closed = true;
+                }
+            },
+        );
+        if answer {
+            actions.push(Action::Answer);
+        }
+        if decline {
+            actions.push(Action::Reject);
+        }
+        // Closed with its cross: the call rings on in the main window.
+        if closed {
+            self.popup_dismissed = true;
         }
     }
 }
