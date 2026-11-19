@@ -211,6 +211,10 @@ impl CallView {
             | Event::LocalAddress(_)
             | Event::Voicemail(_)
             | Event::Presence { .. }
+            | Event::StatusPublished(_)
+            | Event::AccountRegistration { .. }
+            | Event::CalledAccount(_)
+            | Event::Status { .. }
             | Event::Message { .. }
             | Event::MessageSent { .. }
             | Event::Trace { .. }

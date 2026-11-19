@@ -160,6 +160,25 @@ impl EstablishedDialog {
         Ok(request)
     }
 
+    /// Builds an INFO inside the dialog (a keypad digit) and reserves its
+    /// CSeq and branch. The caller adds the body.
+    pub fn build_info(&mut self, branch: &str) -> Result<Request, DialogError> {
+        self.require_confirmed()?;
+        self.check_new_branch(branch)?;
+
+        let cseq = self
+            .local_cseq
+            .checked_add(1)
+            .filter(|number| *number <= MAX_CSEQ)
+            .ok_or(DialogError::CseqExhausted)?;
+
+        let request = self.build_request(Method::Info, cseq, branch)?;
+
+        self.local_cseq = cseq;
+        self.used_branches.insert(branch.to_owned());
+        Ok(request)
+    }
+
     /// Builds the ACK for a successful re-INVITE that had this CSeq.
     pub fn build_reinvite_ack(&mut self, cseq: u32, branch: &str) -> Result<Request, DialogError> {
         self.require_confirmed()?;

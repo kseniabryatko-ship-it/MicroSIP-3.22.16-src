@@ -470,3 +470,100 @@ fn text_messages_go_out_with_a_password_and_come_in_once() {
     server.send(&picture, peer);
     server.response(415);
 }
+
+#[test]
+fn the_own_status_is_published_and_colleagues_statuses_are_shown() {
+    use microsip_core::presence::PresenceStatus;
+    let server = Server::new();
+    let handle = phone();
+    let (_, peer) = server.register(&handle);
+
+    // The status goes out with the password the server asks for.
+    assert!(handle.send(UiCommand::Presence(Some(PresenceStatus::Away))));
+    let (first, _) = server.request("PUBLISH");
+    assert_eq!(first.target, format!("sip:4009@{}", server.address().ip()));
+    assert_eq!(first.headers.get("event"), Some("presence"));
+    assert_eq!(
+        first.headers.get("content-type"),
+        Some("application/pidf+xml")
+    );
+    assert!(String::from_utf8_lossy(&first.body).contains("<rpid:away/>"));
+    server.reply(&first, peer, 401, &[("www-authenticate", CHALLENGE)]);
+    let (second, _) = server.request("PUBLISH");
+    assert!(second.headers.get("authorization").is_some());
+    server.reply(
+        &second,
+        peer,
+        200,
+        &[("sip-etag", "e-1"), ("expires", "3600")],
+    );
+    assert_eq!(
+        wait_for(&handle, |event| matches!(event, Event::StatusPublished(_))),
+        Event::StatusPublished(Ok(PresenceStatus::Away))
+    );
+
+    // A new status names the one it replaces.
+    assert!(handle.send(UiCommand::Presence(Some(PresenceStatus::Busy))));
+    let (change, _) = server.request("PUBLISH");
+    assert_eq!(change.headers.get("sip-if-match"), Some("e-1"));
+    assert!(String::from_utf8_lossy(&change.body).contains("<rpid:busy/>"));
+    // An exchange that does not take statuses, like Asterisk.
+    server.reply(&change, peer, 489, &[]);
+    assert_eq!(
+        wait_for(&handle, |event| matches!(event, Event::StatusPublished(_))),
+        Event::StatusPublished(Err("489 Scripted".to_owned()))
+    );
+
+    // With statuses on, a watched colleague's status is asked for too.
+    assert!(handle.send(UiCommand::Watch(vec!["4010".to_owned()])));
+    let mut presence = None;
+    for _ in 0..2 {
+        let (subscribe, peer) = server.request("SUBSCRIBE");
+        server.reply(&subscribe, peer, 200, &[("expires", "600")]);
+        if subscribe.headers.get("event") == Some("presence") {
+            assert_eq!(
+                subscribe.headers.get("accept"),
+                Some("application/pidf+xml")
+            );
+            presence = Some(subscribe);
+        }
+    }
+    let subscribe = presence.expect("a presence subscription");
+    let pidf = "<?xml version=\"1.0\"?><presence xmlns=\"urn:ietf:params:xml:ns:pidf\" \
+        entity=\"sip:4010@pbx\"><tuple id=\"a\"><status><basic>open</basic></status>\
+        <note>Away</note></tuple></presence>";
+    server.send(
+        &notify(
+            &subscribe,
+            1,
+            "active;expires=600",
+            "application/pidf+xml",
+            pidf,
+        ),
+        peer,
+    );
+    let Event::Status { number, presence } =
+        wait_for(&handle, |event| matches!(event, Event::Status { .. }))
+    else {
+        unreachable!();
+    };
+    assert_eq!(number, "4010");
+    assert!(presence.online);
+    assert_eq!(presence.status, Some(PresenceStatus::Away));
+
+    // Statuses off: nothing was published, so nothing is taken down, and
+    // colleagues are watched for their calls only.
+    assert!(handle.send(UiCommand::Presence(None)));
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        let (request, peer) = server.request("SUBSCRIBE");
+        server.reply(&request, peer, 200, &[("expires", "600")]);
+        events.push(request.headers.get("event").unwrap_or("").to_owned());
+        if events.len() == 3 {
+            break;
+        }
+    }
+    // The two old subscriptions end (dialog, presence), one new for dialog.
+    events.sort();
+    assert_eq!(events, ["dialog", "dialog", "presence"]);
+}

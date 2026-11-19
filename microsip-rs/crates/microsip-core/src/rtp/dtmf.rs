@@ -27,6 +27,76 @@ const EVENT_VOLUME: u8 = 10;
 /// Digits waiting to be sent; more are refused.
 const QUEUE_LIMIT: usize = 64;
 
+/// How the keypad digits of a call are sent, as chosen in the settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DtmfMethod {
+    /// Telephone-event packets when the other side agreed to them, tones in
+    /// the voice otherwise.
+    #[default]
+    Auto,
+    /// Always telephone-event packets (RFC 2833 / 4733), also when the
+    /// other side did not announce them.
+    Rfc2833,
+    /// Always tones in the voice.
+    InBand,
+    /// SIP INFO requests inside the call (`application/dtmf-relay`), for
+    /// exchanges that take digits only this way.
+    SipInfo,
+}
+
+/// Payload type used for telephone-event when the other side announced
+/// none and the user asked for events all the same.
+pub const DEFAULT_EVENT_PAYLOAD_TYPE: u8 = 101;
+
+impl DtmfMethod {
+    pub const ALL: [DtmfMethod; 4] = [
+        DtmfMethod::Auto,
+        DtmfMethod::Rfc2833,
+        DtmfMethod::InBand,
+        DtmfMethod::SipInfo,
+    ];
+
+    /// Name in the settings file.
+    pub const fn name(self) -> &'static str {
+        match self {
+            DtmfMethod::Auto => "auto",
+            DtmfMethod::Rfc2833 => "rfc2833",
+            DtmfMethod::InBand => "inband",
+            DtmfMethod::SipInfo => "info",
+        }
+    }
+
+    /// Unknown names give the automatic choice.
+    pub fn from_name(name: &str) -> Self {
+        let name = name.trim();
+        Self::ALL
+            .into_iter()
+            .find(|method| method.name().eq_ignore_ascii_case(name))
+            .unwrap_or_default()
+    }
+
+    /// The telephone-event payload type the audio uses, from the one the
+    /// two sides agreed on (if any). `None` means tones in the voice; with
+    /// SIP INFO the audio sends no digits at all, so this does not matter.
+    pub fn event_payload_type(self, agreed: Option<u8>) -> Option<u8> {
+        match self {
+            DtmfMethod::Auto | DtmfMethod::SipInfo => agreed,
+            DtmfMethod::Rfc2833 => agreed.or(Some(DEFAULT_EVENT_PAYLOAD_TYPE)),
+            DtmfMethod::InBand => None,
+        }
+    }
+}
+
+/// Body of a SIP INFO carrying one digit (`application/dtmf-relay`, the
+/// form Asterisk, FreeSWITCH and MicroSIP use). Duration in milliseconds.
+pub fn info_body(digit: char) -> Option<String> {
+    event_code(digit)?;
+    Some(format!(
+        "Signal={}\r\nDuration=160\r\n",
+        digit.to_ascii_uppercase()
+    ))
+}
+
 /// RFC 4733 event code of a keypad character.
 pub fn event_code(digit: char) -> Option<u8> {
     match digit.to_ascii_uppercase() {
@@ -229,6 +299,32 @@ fn tone(code: u8, frame: u8, sample_rate: u32) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_chosen_method_decides_how_digits_travel() {
+        for method in DtmfMethod::ALL {
+            assert_eq!(DtmfMethod::from_name(method.name()), method);
+        }
+        assert_eq!(DtmfMethod::from_name("whatever"), DtmfMethod::Auto);
+        assert_eq!(DtmfMethod::Auto.event_payload_type(Some(96)), Some(96));
+        assert_eq!(DtmfMethod::Auto.event_payload_type(None), None);
+        assert_eq!(DtmfMethod::Rfc2833.event_payload_type(None), Some(101));
+        assert_eq!(DtmfMethod::Rfc2833.event_payload_type(Some(96)), Some(96));
+        assert_eq!(DtmfMethod::InBand.event_payload_type(Some(96)), None);
+        assert_eq!(
+            info_body('5').as_deref(),
+            Some("Signal=5\r\nDuration=160\r\n")
+        );
+        assert_eq!(
+            info_body('#').as_deref(),
+            Some("Signal=#\r\nDuration=160\r\n")
+        );
+        assert_eq!(
+            info_body('a').as_deref(),
+            Some("Signal=A\r\nDuration=160\r\n")
+        );
+        assert_eq!(info_body('x'), None);
+    }
 
     /// Collects frames until the sender is idle again.
     fn frames(sender: &mut DtmfSender, start_timestamp: u32) -> Vec<DtmfFrame> {

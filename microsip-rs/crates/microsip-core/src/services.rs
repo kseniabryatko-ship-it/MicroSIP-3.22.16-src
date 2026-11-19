@@ -27,6 +27,8 @@ pub enum Package {
     Voicemail,
     /// The calls of another extension.
     Dialog,
+    /// The status another extension published (online, away, busy).
+    Presence,
 }
 
 impl Package {
@@ -35,6 +37,7 @@ impl Package {
         match self {
             Package::Voicemail => "message-summary",
             Package::Dialog => "dialog",
+            Package::Presence => "presence",
         }
     }
 
@@ -42,6 +45,7 @@ impl Package {
         match self {
             Package::Voicemail => "application/simple-message-summary",
             Package::Dialog => "application/dialog-info+xml",
+            Package::Presence => "application/pidf+xml",
         }
     }
 }

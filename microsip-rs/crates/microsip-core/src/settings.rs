@@ -79,6 +79,16 @@ pub struct Settings {
     pub echo_cancellation: bool,
     /// Lower steady background noise in the microphone.
     pub noise_suppression: bool,
+    /// How keypad digits are sent: `auto`, `rfc2833`, `inband` or `info`.
+    pub dtmf_method: String,
+    /// Publish the user's status and watch colleagues' statuses.
+    pub presence: bool,
+    /// The user's status: `online`, `away` or `busy`.
+    pub presence_status: String,
+    /// Keep every saved account registered, not only the active one.
+    pub all_accounts: bool,
+    /// Language of the window: `ru` or `en`.
+    pub language: String,
     /// The saved accounts other than the active one (whose settings are
     /// the fields above), in the order they were added.
     pub accounts: Vec<AccountSettings>,
@@ -121,6 +131,11 @@ impl Default for Settings {
             voicemail_number: "*97".to_owned(),
             echo_cancellation: true,
             noise_suppression: true,
+            dtmf_method: "auto".to_owned(),
+            presence: false,
+            presence_status: "online".to_owned(),
+            all_accounts: false,
+            language: "ru".to_owned(),
             accounts: Vec::new(),
         }
     }
@@ -195,6 +210,11 @@ impl Settings {
                 "voicemail_number" => settings.voicemail_number = value,
                 "echo_cancellation" => settings.echo_cancellation = value != "0",
                 "noise_suppression" => settings.noise_suppression = value != "0",
+                "dtmf_method" => settings.dtmf_method = value,
+                "presence" => settings.presence = value != "0",
+                "presence_status" => settings.presence_status = value,
+                "all_accounts" => settings.all_accounts = value != "0",
+                "language" => settings.language = value,
                 "auto_answer_delay" => {
                     if let Some(delay) = value.parse::<u32>().ok().filter(|delay| *delay <= 60) {
                         settings.auto_answer_delay = delay;
@@ -239,6 +259,8 @@ impl Settings {
         let tls_verify = flag(self.tls_verify);
         let echo_cancellation = flag(self.echo_cancellation);
         let noise_suppression = flag(self.noise_suppression);
+        let presence = flag(self.presence);
+        let all_accounts = flag(self.all_accounts);
         // Without permission to remember it, no form of the password is written.
         let password_protected = if self.save_password {
             self.password_protected.clone()
@@ -280,6 +302,11 @@ impl Settings {
             ("voicemail_number", &self.voicemail_number),
             ("echo_cancellation", &echo_cancellation),
             ("noise_suppression", &noise_suppression),
+            ("dtmf_method", &self.dtmf_method),
+            ("presence", &presence),
+            ("presence_status", &self.presence_status),
+            ("all_accounts", &all_accounts),
+            ("language", &self.language),
         ] {
             text.push_str(key);
             text.push('=');
@@ -532,6 +559,11 @@ mod tests {
             voicemail_number: "*98".to_owned(),
             echo_cancellation: false,
             noise_suppression: true,
+            dtmf_method: "info".to_owned(),
+            presence: true,
+            presence_status: "away".to_owned(),
+            all_accounts: true,
+            language: "en".to_owned(),
             accounts: Vec::new(),
         }
     }
@@ -651,7 +683,8 @@ mod tests {
              close_to_tray=0\nhotkeys=0\nlight_theme=1\ncodecs=opus,G722,PCMA\n\
              transport=TLS\nproxy=proxy.example.com:5061\ntls_verify=0\n\
              media_encryption=required\nstun=stun.example.com:3478\n\
-             voicemail_number=*98\necho_cancellation=0\nnoise_suppression=1\n"
+             voicemail_number=*98\necho_cancellation=0\nnoise_suppression=1\n\
+             dtmf_method=info\npresence=1\npresence_status=away\nall_accounts=1\nlanguage=en\n"
         );
         // No line holds the password itself; `save_password` and
         // `password_protected` are different keys.

@@ -12,6 +12,7 @@ pub mod links;
 pub mod live_quality;
 pub mod localtime;
 pub mod playout;
+pub mod presence;
 pub mod recording;
 pub mod registration;
 pub mod resample;

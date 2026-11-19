@@ -6,7 +6,9 @@
 use microsip_core::call_media::{AudioMedia, NullMedia, ToneMedia, ToneReport};
 use microsip_core::call_runner::{CallHandle, EndReason, Event, Timers, UiCommand, spawn_lines};
 use microsip_core::codec::Codec;
+use microsip_core::presence::PresenceStatus;
 use microsip_core::registration::{Account, RegistrationState};
+use microsip_core::rtp::dtmf::DtmfMethod;
 use microsip_core::services::LineState;
 use microsip_core::srtp::MediaEncryption;
 use microsip_core::stream::SipTransport;
@@ -21,28 +23,33 @@ use std::time::Duration;
 const HELP: &str = "Usage: phone-engine.exe LOCAL_IP:SIP_PORT [--no-audio] [--trace]\n\
        [--codecs=LIST] [--tone=HZ] [--transport=udp|tcp|tls]\n\
        [--proxy=HOST[:PORT]] [--tls-insecure] [--srtp=off|optional|required]\n\
-       [--stun=HOST[:PORT]]\n\
+       [--stun=HOST[:PORT]] [--dtmf=auto|rfc2833|inband|info]\n\
 Port 0 picks a free port; the chosen address is printed on the first line.\n\
 Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit\n\
           register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister\n\
           watch NUMBER... (busy lamps) | msg NUMBER TEXT (text message)\n\
           dtmf DIGITS | mute | unmute | hold | resume\n\
+          presence online|away|busy|off (publish the status, watch colleagues')\n\
+          account SERVER USER PASSWORD (one more account) | account off\n\
+          callfrom USER@SERVER NUMBER (call through that extra account)\n\
 call IP:PORT dials directly. register keeps the account registered on a SIP\n\
 server; after that the server can send calls here and call NUMBER (or\n\
 USER@DOMAIN) dials through it.\n\
 --no-audio runs without sound devices. --trace prints every SIP message\n\
 (the Digest response value is hidden).\n\
 --codecs=opus,G722,PCMA sets the codecs and their order (PCMU, PCMA, G722,\n\
-opus, G729). --tone=440 needs no sound devices: it sends a tone of that\n\
+opus, G729, GSM, speex, speex16). --tone=440 needs no sound devices: it sends a tone of that\n\
 pitch and prints what was heard when the call ends.\n\
 --transport sets how register talks to the server (default udp); --proxy\n\
 sends everything through that address instead; --tls-insecure accepts a\n\
 TLS certificate that cannot be checked. --srtp encrypts the audio of calls:\n\
 optional when the other side can, required always (default off). --stun\n\
-asks that server for the public address of each call's audio.";
+asks that server for the public address of each call's audio. --dtmf sets\n\
+how dtmf sends digits (default auto: events if agreed, else tones; info\n\
+sends SIP INFO requests).";
 
 const COMMANDS: &str = "Commands: call IP:PORT | call NUMBER | answer | reject | hangup | status | quit | \
-register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister | dtmf DIGITS | mute | unmute | hold | resume | transfer NUMBER | dnd on|off | line 1|2 | join | conference on|off | forward NUMBER|off | watch NUMBERS | msg NUMBER TEXT";
+register SERVER[:PORT] USER PASSWORD [DOMAIN] | unregister | dtmf DIGITS | mute | unmute | hold | resume | transfer NUMBER | dnd on|off | presence online|away|busy|off | line 1|2 | join | conference on|off | forward NUMBER|off | watch NUMBERS | msg NUMBER TEXT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -67,6 +74,8 @@ impl State {
 
 struct Phone {
     handle: CallHandle,
+    /// Accounts added with `account`, registered besides the main one.
+    extras: Vec<Account>,
     local: SocketAddr,
     /// State of each line; `state` and `set_state` work on one of them.
     states: Vec<State>,
@@ -179,6 +188,29 @@ impl Phone {
                 voicemail.new,
                 voicemail.old,
                 if voicemail.waiting { " (waiting)" } else { "" }
+            ),
+            Event::AccountRegistration { account, state } => {
+                println!("Account {account}: {state:?}");
+            }
+            Event::CalledAccount(account) => println!("The call is for {account}."),
+            Event::StatusPublished(Ok(status)) => {
+                println!("Status published: {}", status.name());
+            }
+            Event::StatusPublished(Err(why)) => {
+                println!("Status not published: {why}");
+            }
+            Event::Status { number, presence } => println!(
+                "Status of {number}: {}{}{}",
+                if presence.online { "online" } else { "offline" },
+                presence
+                    .status
+                    .map(|status| format!(", {}", status.name()))
+                    .unwrap_or_default(),
+                if presence.note.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", presence.note)
+                }
             ),
             Event::Presence { number, state } => {
                 let state = match state {
@@ -366,6 +398,39 @@ impl Phone {
                     println!("Forwarding to {target}.");
                 }
             },
+            Some("account") => {
+                // account SERVER USER PASSWORD: one more account, or "account
+                // off" to take the extra ones off again.
+                let words: Vec<&str> = parts.collect();
+                match words.as_slice() {
+                    ["off"] => {
+                        self.extras.clear();
+                    }
+                    [server, user, password] => {
+                        self.extras.push(Account::new(*server, *user, *password));
+                    }
+                    _ => println!("Usage: account SERVER USER PASSWORD | account off"),
+                }
+                self.handle
+                    .send(UiCommand::ExtraAccounts(self.extras.clone()));
+            }
+            Some("callfrom") => match (parts.next(), parts.next()) {
+                (Some(account), Some(target)) => {
+                    self.handle.send(UiCommand::DialFrom {
+                        account: account.to_owned(),
+                        target: target.to_owned(),
+                    });
+                }
+                _ => println!("Usage: callfrom USER@SERVER NUMBER"),
+            },
+            Some("presence") => {
+                let status = match parts.next() {
+                    Some("off") => None,
+                    Some(name) => Some(PresenceStatus::from_name(name)),
+                    None => Some(PresenceStatus::Online),
+                };
+                self.handle.send(UiCommand::Presence(status));
+            }
             Some("dnd") => {
                 let on = parts.next() == Some("on");
                 self.handle.send(UiCommand::DoNotDisturb(on));
@@ -463,7 +528,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|argument| !argument.starts_with("--"))
         .collect();
-    if positional.len() != 1 || args.len() - positional.len() > 9 {
+    if positional.len() != 1 || args.len() - positional.len() > 10 {
         println!("{HELP}");
         return Err("expected LOCAL_IP:SIP_PORT".into());
     }
@@ -491,6 +556,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if let Some(encryption) = encryption {
         handle.send(UiCommand::Encryption(encryption));
+    }
+    if let Some(method) = value("--dtmf") {
+        handle.send(UiCommand::DtmfMethod(DtmfMethod::from_name(method)));
     }
     if let Some(stun) = value("--stun") {
         handle.send(UiCommand::Stun(Some(stun.to_owned())));
@@ -523,6 +591,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut phone = Phone {
         handle,
+        extras: Vec::new(),
         local,
         states: vec![State::Idle; LINES],
         event_line: 0,

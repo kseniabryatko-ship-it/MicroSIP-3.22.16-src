@@ -24,9 +24,11 @@ use crate::codec::Codec;
 use crate::dialog::{DialogConfig, EstablishedDialog};
 use crate::invite_control::{build_cancel, build_failure_ack};
 use crate::live_quality::{LiveQuality, QualityMeter};
+use crate::presence::{PresenceStatus, Publication, PublishReply, RemotePresence, parse_pidf};
 use crate::registration::{
     Account, Output, RETRY_DELAY, Registration, RegistrationState, add_rport,
 };
+use crate::rtp::dtmf::{DtmfMethod, info_body};
 use crate::services::{
     LineState, Package, Reply, Subscription, Voicemail, parse_dialog_info, parse_message_summary,
 };
@@ -103,6 +105,23 @@ pub enum UiCommand {
     /// Sends all incoming calls to this number instead of ringing;
     /// `None` switches forwarding off.
     Forward(Option<String>),
+    /// Registers these accounts besides the main one, so that calls to any
+    /// of them ring here (MicroSIP's several accounts). They go over UDP,
+    /// from the same address; voicemail, lamps and statuses stay with the
+    /// main account. An empty list takes them all off.
+    ExtraAccounts(Vec<Account>),
+    /// Calls a number through one of the extra accounts, named by
+    /// [`account_key`]; the main account calls with `DialTarget`.
+    DialFrom {
+        account: String,
+        target: String,
+    },
+    /// Publishes this status of the user for colleagues and watches theirs;
+    /// `None` stops both.
+    Presence(Option<PresenceStatus>),
+    /// Sets how keypad digits are sent; telephone-event packets and tones
+    /// take effect from the next call on, SIP INFO at once.
+    DtmfMethod(DtmfMethod),
     /// Sets the codecs offered and accepted from the next call on, in the
     /// order of preference. An empty list means all of them.
     Codecs(Vec<Codec>),
@@ -219,6 +238,23 @@ pub enum Event {
     /// How well the received audio played, sent just before the media stops
     /// when real audio was used.
     AudioQuality(MediaQuality),
+    /// The registration of an extra account changed; `account` is its
+    /// [`account_key`].
+    AccountRegistration {
+        account: String,
+        state: RegistrationState,
+    },
+    /// The incoming call just reported is for this extra account (its
+    /// [`account_key`]); calls for the main account have no such event.
+    CalledAccount(String),
+    /// How publishing the user's status went: the status now shown to
+    /// colleagues, or why the exchange did not take it.
+    StatusPublished(std::result::Result<PresenceStatus, String>),
+    /// A watched colleague's published status.
+    Status {
+        number: String,
+        presence: RemotePresence,
+    },
     /// What the last seconds of the connected call were like: the quality
     /// lamp. Sent every couple of seconds while audio flows both ways.
     LiveQuality(LiveQuality),
@@ -420,6 +456,8 @@ enum RetxKind {
     Refer,
     Subscribe,
     Message,
+    Info,
+    Publish,
 }
 
 struct Retx {
@@ -495,11 +533,18 @@ struct Call {
     remote_hold: bool,
     /// Our transfer request that is waiting for its answer.
     refer: Option<TransactionHeaders>,
+    /// Keypad digits waiting to go as SIP INFO, one request at a time.
+    info_digits: VecDeque<char>,
+    /// The INFO that is waiting for its answer.
+    info: Option<TransactionHeaders>,
     /// The line whose call this one is being joined with by an attended
     /// transfer; it is ended too when the transfer is done.
     transfer_partner: Option<usize>,
     /// The BYE was already repeated with credentials once.
     bye_authorized: bool,
+    /// The extra account the call belongs to (its key); `None` for the
+    /// main account. Its credentials answer the server's challenges.
+    account: Option<String>,
 }
 
 struct ReInvite {
@@ -562,8 +607,11 @@ impl Call {
             local_hold: false,
             remote_hold: false,
             refer: None,
+            info_digits: VecDeque::new(),
+            info: None,
             transfer_partner: None,
             bye_authorized: false,
+            account: None,
         })
     }
 }
@@ -699,6 +747,18 @@ fn user_part(uri: &str) -> String {
     uri.split('@').next().unwrap_or(uri).to_owned()
 }
 
+/// How an extra account is named in commands and events: `user@server`.
+pub fn account_key(account: &Account) -> String {
+    format!("{}@{}", account.username.trim(), account.server.trim())
+}
+
+/// An account registered besides the main one.
+struct ExtraAccount {
+    key: String,
+    account: Account,
+    registration: Option<Registration>,
+}
+
 struct Runner<M: Media> {
     socket: UdpSocket,
     local: SocketAddr,
@@ -718,6 +778,12 @@ struct Runner<M: Media> {
     forward_to: Option<String>,
     /// Codecs offered and accepted, in the user's order of preference.
     codecs: Vec<Codec>,
+    dtmf_method: DtmfMethod,
+    /// Accounts registered besides the main one.
+    extras: Vec<ExtraAccount>,
+    /// The user's status to publish, when publishing is on.
+    presence: Option<PresenceStatus>,
+    publication: Option<Publication>,
     /// Whether calls' audio is encrypted.
     encryption: MediaEncryption,
     /// The mailbox and the watched extensions, while registered.
@@ -786,6 +852,10 @@ impl<M: Media> Runner<M> {
             conference: false,
             forward_to: None,
             codecs: Codec::DEFAULT.to_vec(),
+            dtmf_method: DtmfMethod::Auto,
+            presence: None,
+            publication: None,
+            extras: Vec::new(),
             encryption: MediaEncryption::Off,
             subscriptions: Vec::new(),
             watched: Vec::new(),
@@ -877,6 +947,7 @@ impl<M: Media> Runner<M> {
 
     fn begin_shutdown(&mut self) {
         self.stopping = true;
+        self.set_extra_accounts(Vec::new());
         self.unregister();
         for line in 0..self.lines.len() {
             self.cur = line;
@@ -892,8 +963,10 @@ impl<M: Media> Runner<M> {
     fn on_command(&mut self, command: UiCommand) {
         self.cur = self.selected;
         // A new call needs a line that is free.
-        if matches!(command, UiCommand::Dial(_) | UiCommand::DialTarget(_))
-            && self.lines[self.cur].engine.state() != State::Idle
+        if matches!(
+            command,
+            UiCommand::Dial(_) | UiCommand::DialTarget(_) | UiCommand::DialFrom { .. }
+        ) && self.lines[self.cur].engine.state() != State::Idle
             && let Some(line) = self.free_line()
         {
             self.select(line);
@@ -947,6 +1020,22 @@ impl<M: Media> Runner<M> {
             // presses the button; there is then nothing left to hang up.
             UiCommand::Hangup if self.lines[self.cur].engine.state() == State::Idle => Ok(()),
             UiCommand::Hangup => self.dispatch(Input::Command(Command::Hangup)),
+            UiCommand::ExtraAccounts(accounts) => {
+                self.set_extra_accounts(accounts);
+                Ok(())
+            }
+            UiCommand::DialFrom { account, target } => self.dial_from(&target, Some(&account)),
+            UiCommand::Presence(status) => {
+                self.set_presence(status);
+                Ok(())
+            }
+            UiCommand::DtmfMethod(method) => {
+                self.dtmf_method = method;
+                Ok(())
+            }
+            UiCommand::Dtmf(digit) if self.dtmf_method == DtmfMethod::SipInfo => {
+                self.queue_info(digit)
+            }
             UiCommand::Dtmf(digit) => {
                 if self.lines[self.cur].media_running {
                     self.lines[self.cur].media.send_dtmf(digit)
@@ -1301,6 +1390,157 @@ impl<M: Media> Runner<M> {
         }
     }
 
+    /// Brings the extra accounts in line with `accounts`: those no longer
+    /// wanted are taken off the server, new ones registered, changed ones
+    /// registered again.
+    fn set_extra_accounts(&mut self, accounts: Vec<Account>) {
+        let mut index = 0;
+        while index < self.extras.len() {
+            let keep = accounts
+                .iter()
+                .any(|account| *account == self.extras[index].account);
+            if keep {
+                index += 1;
+                continue;
+            }
+            let mut extra = self.extras.remove(index);
+            if let Some(mut registration) = extra.registration.take() {
+                let id = registration.call_id().to_owned();
+                self.stop_retx(&id, &[RetxKind::Register]);
+                // Once, without waiting for the answer: the account is gone.
+                if registration.is_bound() {
+                    for output in registration.unregister() {
+                        if let Output::Send(bytes) = output {
+                            let _ = self.send(&bytes, registration.server());
+                        }
+                    }
+                }
+            }
+            self.emit(Event::AccountRegistration {
+                account: extra.key,
+                state: RegistrationState::Unregistered,
+            });
+        }
+        for account in accounts {
+            let key = account_key(&account);
+            if self.extras.iter().any(|extra| extra.account == account) {
+                continue;
+            }
+            // The same account twice, or the main one again, is not added.
+            let main = self
+                .account
+                .as_ref()
+                .is_some_and(|main| account_key(main) == key);
+            if main || self.extras.iter().any(|extra| extra.key == key) {
+                continue;
+            }
+            self.extras.push(ExtraAccount {
+                key,
+                account,
+                registration: None,
+            });
+            self.start_extra(self.extras.len() - 1);
+        }
+    }
+
+    /// Registers the extra account at `index` from this phone's address.
+    fn start_extra(&mut self, index: usize) {
+        let account = self.extras[index].account.clone();
+        let key = self.extras[index].key.clone();
+        let fail = |reason: String| Event::AccountRegistration {
+            account: key.clone(),
+            state: RegistrationState::Failed(reason),
+        };
+        if account.transport.is_stream() {
+            let reason = "an additional account works over UDP only".to_owned();
+            return self.emit(fail(reason));
+        }
+        let server = account.connect_host_port().and_then(|(host, port)| {
+            resolve_socket_address(&host, port)
+                .map_err(|error| format!("cannot resolve {host}: {error}"))
+        });
+        let server = match server {
+            Ok(server) if self.local.ip().is_loopback() && !server.ip().is_loopback() => {
+                return self.emit(fail(format!("{} cannot reach {server}", self.local.ip())));
+            }
+            Ok(server) => server,
+            Err(reason) => return self.emit(fail(reason)),
+        };
+        let seed = self.unique();
+        match Registration::new(account, server, self.local, &seed) {
+            Ok(mut registration) => {
+                let outputs = registration.start();
+                self.extras[index].registration = Some(registration);
+                self.apply_extra(index, outputs);
+            }
+            Err(reason) => self.emit(fail(reason)),
+        }
+    }
+
+    /// After a change of address the extra accounts register again.
+    fn restart_extras(&mut self) {
+        for index in 0..self.extras.len() {
+            if let Some(old) = self.extras[index].registration.take() {
+                let id = old.call_id().to_owned();
+                self.stop_retx(&id, &[RetxKind::Register]);
+            }
+            self.start_extra(index);
+        }
+    }
+
+    fn apply_extra(&mut self, index: usize, outputs: Vec<Output>) {
+        let Some((server, id)) = self.extras[index]
+            .registration
+            .as_ref()
+            .map(|registration| (registration.server(), registration.call_id().to_owned()))
+        else {
+            return;
+        };
+        for output in outputs {
+            match output {
+                Output::Send(bytes) => {
+                    self.stop_retx(&id, &[RetxKind::Register]);
+                    if let Err(error) = self.send(&bytes, server) {
+                        self.report(format!("Cannot send REGISTER: {error}"));
+                    }
+                    self.start_retx(
+                        RetxKind::Register,
+                        id.clone(),
+                        bytes,
+                        server,
+                        self.timers.t2,
+                    );
+                }
+                Output::State(state) => {
+                    let account = self.extras[index].key.clone();
+                    self.emit(Event::AccountRegistration { account, state });
+                }
+            }
+        }
+        if self.extras[index]
+            .registration
+            .as_ref()
+            .is_some_and(Registration::is_finished)
+        {
+            self.stop_retx(&id, &[RetxKind::Register]);
+            self.extras[index].registration = None;
+        }
+    }
+
+    /// Refreshes and keeps alive the extra accounts.
+    fn tick_extras(&mut self, now: Instant) {
+        for index in 0..self.extras.len() {
+            let Some(registration) = self.extras[index].registration.as_mut() else {
+                continue;
+            };
+            if registration.keepalive_due(now) {
+                let _ = self.socket.send_to(KEEPALIVE, registration.server());
+            }
+            let outputs = registration.poll(now);
+            self.apply_extra(index, outputs);
+        }
+    }
+
     fn unregister(&mut self) {
         self.stop_services(true);
         // The user wants the account off: nothing registers it again.
@@ -1448,17 +1688,8 @@ impl<M: Media> Runner<M> {
             return;
         };
         let mut targets = vec![(Package::Voicemail, aor.clone())];
-        for number in &self.watched {
-            match server_target(number, &domain) {
-                Ok(target) => targets.push((Package::Dialog, target)),
-                Err(_) => {
-                    let _ = self.events.send(Event::Presence {
-                        number: number.clone(),
-                        state: LineState::Unknown,
-                    });
-                }
-            }
-        }
+        targets.extend(self.watched_targets(&domain));
+        self.start_publication();
         for (package, target) in targets {
             let seed = self.unique();
             self.subscriptions.push(Subscription::new(
@@ -1473,10 +1704,171 @@ impl<M: Media> Runner<M> {
         }
     }
 
+    /// What to subscribe to for the watched extensions: their calls (the
+    /// busy lamps) and, with statuses on, their status. An extension that
+    /// is no address shows as unknown.
+    fn watched_targets(&self, domain: &str) -> Vec<(Package, String)> {
+        let mut targets = Vec::new();
+        for number in &self.watched {
+            match server_target(number, domain) {
+                Ok(target) => {
+                    targets.push((Package::Dialog, target.clone()));
+                    if self.presence.is_some() {
+                        targets.push((Package::Presence, target));
+                    }
+                }
+                Err(_) => {
+                    let _ = self.events.send(Event::Presence {
+                        number: number.clone(),
+                        state: LineState::Unknown,
+                    });
+                }
+            }
+        }
+        targets
+    }
+
+    /// Starts publishing the user's status, when that is wanted and the
+    /// account is registered.
+    fn start_publication(&mut self) {
+        let Some(status) = self.presence else {
+            return;
+        };
+        if self.publication.is_some() {
+            return;
+        }
+        let Some((aor, _, via, _, _)) = self.service_identity() else {
+            return;
+        };
+        let seed = self.unique();
+        self.publication = Some(Publication::new(status, aor, via.to_string(), &seed));
+        self.tick_publication(Instant::now());
+    }
+
+    /// Sends the status when it changed or its refresh is due.
+    fn tick_publication(&mut self, now: Instant) {
+        if self
+            .publication
+            .as_ref()
+            .is_some_and(|publication| publication.wants_sending(now))
+        {
+            self.send_publish(None, false);
+        }
+    }
+
+    fn send_publish(&mut self, authorization: Option<(&str, String)>, remove: bool) {
+        let Some(server) = self.registration.as_ref().map(Registration::server) else {
+            return;
+        };
+        let Some(publication) = self.publication.as_mut() else {
+            return;
+        };
+        match publication.request(authorization, remove) {
+            Ok(bytes) => {
+                let id = publication.call_id().to_owned();
+                self.stop_retx(&id, &[RetxKind::Publish]);
+                if self.send(&bytes, server).is_ok() && !remove {
+                    self.start_retx(RetxKind::Publish, id, bytes, server, self.timers.t2);
+                }
+            }
+            Err(error) => self.report(format!("Cannot publish the status: {error}")),
+        }
+    }
+
+    /// The user chose a status, or switched publishing on or off.
+    fn set_presence(&mut self, status: Option<PresenceStatus>) {
+        let switched = status.is_some() != self.presence.is_some();
+        self.presence = status;
+        match (status, self.publication.as_mut()) {
+            (Some(status), Some(publication)) => {
+                publication.set_status(status);
+                self.tick_publication(Instant::now());
+            }
+            (None, Some(_)) => self.stop_publication(true),
+            (Some(_), None) => self.start_publication(),
+            (None, None) => {}
+        }
+        // Colleagues' statuses are watched only with statuses on.
+        if switched && !self.subscriptions.is_empty() {
+            self.rewatch();
+        }
+    }
+
+    /// Takes the status down (when the server is to be told) and forgets it.
+    fn stop_publication(&mut self, goodbye: bool) {
+        if let Some((id, published)) = self
+            .publication
+            .as_ref()
+            .map(|publication| (publication.call_id().to_owned(), publication.is_published()))
+        {
+            self.stop_retx(&id, &[RetxKind::Publish]);
+            if goodbye && published {
+                self.send_publish(None, true);
+            }
+        }
+        self.publication = None;
+    }
+
+    /// Returns true when the response belonged to the status publication.
+    fn on_publish_response(&mut self, response: &Response, headers: &TransactionHeaders) -> bool {
+        if headers.method != "PUBLISH" {
+            return false;
+        }
+        if !self
+            .publication
+            .as_ref()
+            .is_some_and(|publication| publication.is_answer(headers))
+        {
+            return false;
+        }
+        if response.status_code >= 200 {
+            self.stop_retx(&headers.call_id, &[RetxKind::Publish]);
+        }
+        let now = Instant::now();
+        let Some(publication) = self.publication.as_mut() else {
+            return true;
+        };
+        let (reply, status, uri) = (
+            publication.on_response(response, now),
+            publication.status(),
+            publication.uri().to_owned(),
+        );
+        match reply {
+            PublishReply::Wait => {}
+            PublishReply::Published => {
+                self.emit(Event::StatusPublished(Ok(status)));
+                // The status may have changed while waiting.
+                self.tick_publication(now);
+            }
+            PublishReply::Again => self.send_publish(None, false),
+            PublishReply::Authorize => {
+                let answer = self
+                    .registration
+                    .as_ref()
+                    .map(|registration| registration.authorize(response, "PUBLISH", &uri));
+                match answer {
+                    Some(Ok((name, value))) => self.send_publish(Some((name, value)), false),
+                    _ => {
+                        let refused = self
+                            .publication
+                            .as_mut()
+                            .map(|publication| publication.on_response(response, now));
+                        if let Some(PublishReply::Refused(why)) = refused {
+                            self.emit(Event::StatusPublished(Err(why)));
+                        }
+                    }
+                }
+            }
+            PublishReply::Refused(why) => self.emit(Event::StatusPublished(Err(why))),
+        }
+        true
+    }
+
     /// Ends the subscriptions. With `goodbye` the server is told (when the
     /// account is being removed); without it they are simply forgotten
     /// (the connection or the network is gone, nothing would arrive).
     fn stop_services(&mut self, goodbye: bool) {
+        self.stop_publication(goodbye);
         for index in 0..self.subscriptions.len() {
             let id = self.subscriptions[index].call_id();
             self.stop_retx(&id, &[RetxKind::Subscribe]);
@@ -1568,6 +1960,7 @@ impl<M: Media> Runner<M> {
                 self.send_subscribe(index, None, false);
             }
         }
+        self.tick_publication(now);
     }
 
     /// Handles a NOTIFY about the mailbox or a watched extension. Returns
@@ -1600,6 +1993,12 @@ impl<M: Media> Runner<M> {
                     // An empty NOTIFY (the subscription's end) says nothing new.
                     if let Some(state) = parse_dialog_info(&body) {
                         self.emit(Event::Presence { number, state });
+                    }
+                }
+                Package::Presence => {
+                    let number = user_part(subscription.target());
+                    if let Some(presence) = parse_pidf(&body) {
+                        self.emit(Event::Status { number, presence });
                     }
                 }
             }
@@ -1635,10 +2034,14 @@ impl<M: Media> Runner<M> {
         if self.subscriptions.is_empty() {
             return;
         }
-        // The mailbox stays as it is; the lamps start again.
+        self.rewatch();
+    }
+
+    /// Subscribes anew for the watched extensions; the mailbox stays.
+    fn rewatch(&mut self) {
         let mut index = 0;
         while index < self.subscriptions.len() {
-            if self.subscriptions[index].package() == Package::Dialog {
+            if self.subscriptions[index].package() != Package::Voicemail {
                 let id = self.subscriptions[index].call_id();
                 self.stop_retx(&id, &[RetxKind::Subscribe]);
                 if self.subscriptions[index].is_active() {
@@ -1652,17 +2055,10 @@ impl<M: Media> Runner<M> {
         let Some((aor, contact, via, _, domain)) = self.service_identity() else {
             return;
         };
-        for number in self.watched.clone() {
-            let Ok(target) = server_target(&number, &domain) else {
-                self.emit(Event::Presence {
-                    number,
-                    state: LineState::Unknown,
-                });
-                continue;
-            };
+        for (package, target) in self.watched_targets(&domain) {
             let seed = self.unique();
             self.subscriptions.push(Subscription::new(
-                Package::Dialog,
+                package,
                 target,
                 aor.clone(),
                 contact.clone(),
@@ -1867,6 +2263,7 @@ impl<M: Media> Runner<M> {
         self.link = None;
         self.moved = true;
         self.emit(Event::LocalAddress(local));
+        self.restart_extras();
         let old = self.registration.take();
         if let Some(old) = old.as_ref() {
             let id = old.call_id().to_owned();
@@ -1947,6 +2344,28 @@ impl<M: Media> Runner<M> {
                     self.stop_retx(&id, &[RetxKind::Register]);
                 }
                 self.apply_leaving(outputs);
+            }
+            return true;
+        }
+        if headers.method == "REGISTER"
+            && let Some(index) = self.extras.iter().position(|extra| {
+                extra.registration.as_ref().is_some_and(|registration| {
+                    registration.call_id() == headers.call_id && registration.server() == source
+                })
+            })
+        {
+            let outputs = self.extras[index]
+                .registration
+                .as_mut()
+                .and_then(|registration| {
+                    registration.on_response(response, headers, Instant::now())
+                });
+            if let Some(outputs) = outputs {
+                if response.status_code >= 200 {
+                    let id = headers.call_id.clone();
+                    self.stop_retx(&id, &[RetxKind::Register]);
+                }
+                self.apply_extra(index, outputs);
             }
             return true;
         }
@@ -2116,7 +2535,8 @@ impl<M: Media> Runner<M> {
             }
             Action::StartMedia => {
                 let call = self.call_ref()?;
-                let (remote_rtp, dtmf) = (call.remote_rtp, call.dtmf_payload_type);
+                let remote_rtp = call.remote_rtp;
+                let dtmf = self.dtmf_method.event_payload_type(call.dtmf_payload_type);
                 let codec = call.codec;
                 let (payload_type, listed) = (call.codec_payload_type, call.listed.clone());
                 let keys = call.srtp_keys();
@@ -2432,6 +2852,55 @@ impl<M: Media> Runner<M> {
         Ok(())
     }
 
+    /// Queues a keypad digit to go as SIP INFO; it is sent at once when no
+    /// other INFO is waiting for its answer.
+    fn queue_info(&mut self, digit: char) -> Result<()> {
+        if info_body(digit).is_none() {
+            return Err(format!("{digit:?} is not a keypad digit").into());
+        }
+        if self.lines[self.cur].engine.state() != State::Established {
+            return Err("digits can be sent only during a connected call".into());
+        }
+        let call = self.call_mut()?;
+        if call.info_digits.len() >= 64 {
+            return Err("too many digits are waiting".into());
+        }
+        call.info_digits.push_back(digit);
+        if call.info.is_none() {
+            self.send_next_info()?;
+        }
+        Ok(())
+    }
+
+    /// Sends the next queued digit of the current line as SIP INFO.
+    fn send_next_info(&mut self) -> Result<()> {
+        self.ensure_dialog()?;
+        let branch = self.branch();
+        let call = self.call_mut()?;
+        let Some(digit) = call.info_digits.pop_front() else {
+            return Ok(());
+        };
+        let body = info_body(digit).ok_or("not a keypad digit")?;
+        let dialog = call.dialog.as_mut().ok_or("no dialog")?;
+        let mut request = dialog.build_info(&branch)?;
+        add_routes(&mut request, &call.route_set)?;
+        request
+            .headers
+            .insert("content-type", "application/dtmf-relay")?;
+        request.headers.remove("content-length");
+        request
+            .headers
+            .insert("content-length", body.len().to_string())?;
+        request.body = body.into_bytes();
+        let headers = TransactionHeaders::from_message(&Message::Request(request.clone()))?;
+        let bytes = request.serialize()?;
+        let (peer, id) = (call.peer, call.call_id.clone());
+        call.info = Some(headers);
+        self.send(&bytes, peer)?;
+        self.start_retx(RetxKind::Info, id, bytes, peer, self.timers.t2);
+        Ok(())
+    }
+
     /// Joins all connected lines into one conversation, or separates them.
     fn set_conference(&mut self, on: bool) -> Result<()> {
         let keep = self.cur;
@@ -2697,6 +3166,7 @@ impl<M: Media> Runner<M> {
             let outputs = registration.poll(now);
             self.apply_registration(outputs);
         }
+        self.tick_extras(now);
         self.tick_services(now);
 
         for (kind, call_id) in expired {
@@ -2707,6 +3177,16 @@ impl<M: Media> Runner<M> {
                     .find(|subscription| subscription.call_id() == call_id)
                 {
                     subscription.on_timeout(now);
+                }
+                continue;
+            }
+            if kind == RetxKind::Publish {
+                if let Some(publication) = self
+                    .publication
+                    .as_mut()
+                    .filter(|publication| publication.call_id() == call_id)
+                {
+                    publication.on_timeout(now);
                 }
                 continue;
             }
@@ -2741,6 +3221,20 @@ impl<M: Media> Runner<M> {
                 {
                     let outputs = registration.on_timeout(now);
                     self.apply_registration(outputs);
+                    continue;
+                }
+                if let Some(index) = self.extras.iter().position(|extra| {
+                    extra
+                        .registration
+                        .as_ref()
+                        .is_some_and(|registration| registration.call_id() == call_id)
+                }) {
+                    let outputs = self.extras[index]
+                        .registration
+                        .as_mut()
+                        .map(|registration| registration.on_timeout(now))
+                        .unwrap_or_default();
+                    self.apply_extra(index, outputs);
                 }
                 continue;
             }
@@ -2753,6 +3247,16 @@ impl<M: Media> Runner<M> {
             let current = line.is_some();
             if let Some(line) = line {
                 self.cur = line;
+            }
+            if kind == RetxKind::Info {
+                if current
+                    && let Some(call) = self.lines[self.cur].call.as_mut()
+                    && call.info.take().is_some()
+                {
+                    call.info_digits.clear();
+                    self.report("Digits sent by SIP INFO got no answer".to_owned());
+                }
+                continue;
             }
             if kind == RetxKind::Refer {
                 if current
@@ -2924,6 +3428,14 @@ impl<M: Media> Runner<M> {
             "BYE" => self.on_bye(request, &headers, source),
             "CANCEL" => self.on_cancel(request, &headers, source),
             "NOTIFY" => self.on_notify(request, &headers, source),
+            // Digits or other information inside a call: taken and
+            // acknowledged, as the standard asks.
+            "INFO" if self.is_current(&headers.call_id, source) => {
+                let tag = self.call_ref()?.local_tag.clone();
+                let bytes = build_response(request, 200, "OK", Some(&tag), None, None)?;
+                self.send(&bytes, source)
+            }
+            "INFO" => self.reply_stateless(request, source, 481, "Call/Transaction Does Not Exist"),
             // Servers ask this to see whether the phone is alive.
             "OPTIONS" => {
                 let tag = format!("rs-stateless-{}", self.local.port());
@@ -3052,8 +3564,25 @@ impl<M: Media> Runner<M> {
         self.send(&trying, source)?;
         self.dispatch(Input::IncomingInvite)?;
         let (number, name) = caller_identity(header(&request.headers, "from")?);
+        // A call for an extra account says so, by the number it was sent to.
+        let called = user_part(&request.target);
+        let extra = self
+            .extras
+            .iter()
+            .find(|extra| {
+                extra.registration.as_ref().is_some_and(|registration| {
+                    registration.username() == called && registration.server() == source
+                })
+            })
+            .map(|extra| extra.key.clone());
+        if let Some(call) = self.lines[self.cur].call.as_mut() {
+            call.account = extra.clone();
+        }
         self.emit(Event::Caller { number, name });
         self.emit(Event::Incoming { peer: source });
+        if let Some(key) = extra {
+            self.emit(Event::CalledAccount(key));
+        }
         self.ring(Some(Tone::Ringtone));
         Ok(())
     }
@@ -3124,6 +3653,7 @@ impl<M: Media> Runner<M> {
         }
         if self.on_subscribe_response(response, &headers)
             || self.on_message_response(response, &headers)
+            || self.on_publish_response(response, &headers)
         {
             return Ok(());
         }
@@ -3141,6 +3671,27 @@ impl<M: Media> Runner<M> {
         match headers.method.as_str() {
             "INVITE" if call.invite_headers.matches_response(&headers) => {
                 self.on_invite_response(response, status)
+            }
+            "INFO"
+                if call
+                    .info
+                    .as_ref()
+                    .is_some_and(|sent| sent.matches_response(&headers)) =>
+            {
+                if status < 200 {
+                    return Ok(());
+                }
+                self.stop_retx(&headers.call_id, &[RetxKind::Info]);
+                self.call_mut()?.info = None;
+                if !(200..300).contains(&status) {
+                    // The digits after a refused one would make no sense.
+                    self.call_mut()?.info_digits.clear();
+                    self.report(format!(
+                        "The exchange refused the digit sent by SIP INFO ({status})"
+                    ));
+                    return Ok(());
+                }
+                self.send_next_info()
             }
             "REFER"
                 if call
@@ -3307,27 +3858,58 @@ impl<M: Media> Runner<M> {
     /// `IP:port` is called directly; anything else is a number or user on the
     /// SIP server the account is registered on.
     fn dial_target(&mut self, text: &str) -> Result<()> {
+        self.dial_from(text, None)
+    }
+
+    /// Calls through the main account (`None`) or an extra one.
+    fn dial_from(&mut self, text: &str, account: Option<&str>) -> Result<()> {
         let text = text.trim();
-        if let Ok(peer) = text.parse::<SocketAddr>() {
+        if account.is_none()
+            && let Ok(peer) = text.parse::<SocketAddr>()
+        {
             return self.dial(peer);
         }
         let registration = self
-            .registration
-            .as_ref()
+            .registration_for(account)
             .filter(|registration| registration.is_bound())
-            .ok_or("register on a SIP server before calling a number")?;
+            .ok_or(match account {
+                Some(_) => "this account is not registered",
+                None => "register on a SIP server before calling a number",
+            })?;
         let target = server_target(text, registration.domain())?;
         let peer = registration.server();
         let from_uri = format!("sip:{}@{}", registration.username(), registration.domain());
+        // Extra accounts go over UDP; only the main one may use a link.
+        let transport = match account {
+            Some(_) => "",
+            None => self
+                .link
+                .as_ref()
+                .map_or("", |link| link.transport().uri_parameter()),
+        };
         let contact_uri = format!(
             "sip:{}@{}{}",
             registration.username(),
             registration.contact_address(),
-            self.link
-                .as_ref()
-                .map_or("", |link| link.transport().uri_parameter())
+            transport
         );
-        self.start_call(peer, target, from_uri, contact_uri, true)
+        self.start_call(peer, target, from_uri, contact_uri, true)?;
+        if let Some(call) = self.lines[self.cur].call.as_mut() {
+            call.account = account.map(str::to_owned);
+        }
+        Ok(())
+    }
+
+    /// The registration of the main account (`None`) or of an extra one.
+    fn registration_for(&self, account: Option<&str>) -> Option<&Registration> {
+        match account {
+            None => self.registration.as_ref(),
+            Some(key) => self
+                .extras
+                .iter()
+                .find(|extra| extra.key == key)
+                .and_then(|extra| extra.registration.as_ref()),
+        }
     }
 
     fn start_call(
@@ -3412,7 +3994,7 @@ impl<M: Media> Runner<M> {
         ) else {
             return Ok(false);
         };
-        let Some(registration) = self.registration.as_ref() else {
+        let Some(registration) = self.registration_for(call.account.as_deref()) else {
             return Ok(false);
         };
         let Ok((name, value)) = registration.authorize(response, "BYE", &previous.target) else {
@@ -3457,7 +4039,7 @@ impl<M: Media> Runner<M> {
         if server.authorized || call.reason.is_some() || call.cancel_request.is_some() {
             return Ok(false);
         }
-        let Some(registration) = self.registration.as_ref() else {
+        let Some(registration) = self.registration_for(call.account.as_deref()) else {
             return Ok(false);
         };
         let Ok((name, value)) = registration.authorize(response, "INVITE", &server.target) else {
