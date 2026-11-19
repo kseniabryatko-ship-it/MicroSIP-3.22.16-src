@@ -227,6 +227,8 @@ struct PhoneWindow {
     /// The keypad sounds its tones.
     key_tones_on: bool,
     key_tones: KeyTones,
+    /// "Exit" was chosen in the menu: closing really closes.
+    exiting: bool,
     /// When the key sounds' speaker was last asked to be ready.
     key_tones_warmed: Option<Instant>,
     /// An incoming call shows a small window above everything.
@@ -308,7 +310,9 @@ struct PhoneWindow {
     /// The number was changed by a button: the typing cursor must follow.
     number_changed: bool,
     focus_number: bool,
-    paste_requested: bool,
+    /// A paste was asked for at this moment; it waits for the number field
+    /// to have the focus, but not for long.
+    paste_requested: Option<Instant>,
     /// The selection in the number field before a right click, which moves
     /// the cursor to where the mouse is; the menu works on this one.
     number_selection: Option<egui::text::CCursorRange>,
@@ -508,7 +512,7 @@ impl PhoneWindow {
             pending_dnd: None,
             number_changed: false,
             focus_number: true,
-            paste_requested: false,
+            paste_requested: None,
             number_selection: None,
             handle: None,
             local: None,
@@ -551,6 +555,7 @@ impl PhoneWindow {
             key_tones_on: saved.key_tones,
             key_tones: KeyTones::new(controls.clone()),
             key_tones_warmed: None,
+            exiting: false,
             incoming_popup: saved.incoming_popup,
             popup_dismissed: false,
             always_on_top: saved.always_on_top,
@@ -1585,7 +1590,7 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
                 // The field is focused and the system is asked to paste; the
                 // text arrives in the next frame like a Ctrl+V would.
                 self.focus_number = true;
-                self.paste_requested = true;
+                self.paste_requested = Some(Instant::now());
             }
             Action::Erase => {
                 self.number.pop();
@@ -1871,6 +1876,7 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
         // phone without an icon really close.
         if ctx.input(|input| input.viewport().close_requested())
             && self.close_to_tray
+            && !self.exiting
             && !signals.exit.load(Ordering::Relaxed)
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -2488,6 +2494,22 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                         {
                             self.save_settings();
                         }
+                        ui.separator();
+                        // Closes the program, not only the window: calls end
+                        // and the account goes off the exchange.
+                        if ui
+                            .button(tr!("Выход", "Exit"))
+                            .on_hover_text(tr!(
+                                "Закрыть программу полностью, а не свернуть в трей",
+                                "Close the program completely, not to the tray"
+                            ))
+                            .clicked()
+                        {
+                            self.exiting = true;
+                            self.save_settings();
+                            ui.close_menu();
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
                     });
                 }
                 1 => self.voicemail_button(ui),
@@ -2816,6 +2838,8 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             done = true;
         }
         if item(ui, true, tr!("Вставить", "Paste"), "Ctrl+V") {
+            // The text goes to the field with the focus: this one.
+            ctx.memory_mut(|memory| memory.request_focus(id));
             actions.push(Action::Paste);
             done = true;
         }
@@ -2929,10 +2953,24 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 state.store(ui.ctx(), number_id);
             }
         }
-        if self.paste_requested && response.has_focus() {
-            self.paste_requested = false;
+        // A paste that could not happen at once is forgotten: it must not
+        // turn up later by surprise.
+        if self
+            .paste_requested
+            .is_some_and(|at| at.elapsed() > Duration::from_secs(1))
+        {
+            self.paste_requested = None;
+        }
+        if self.paste_requested.is_some() && response.has_focus() {
+            self.paste_requested = None;
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            // The text comes as an event: the window looks again at once
+            // instead of at the next mouse move.
+            ui.ctx().request_repaint();
+        } else if self.paste_requested.is_some() {
+            // The field takes the focus in this frame; paste in the next.
+            ui.ctx().request_repaint();
         }
         if idle && let Some(name) = self.contacts.name_of(&self.number) {
             ui.label(name.to_owned());
@@ -3241,8 +3279,14 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                             ui.with_layout(
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    ui.add(egui::Label::new(&who).truncate())
+                                    // Selectable with the mouse, and a right
+                                    // click offers to copy, as in MicroSIP.
+                                    let label = ui
+                                        .add(egui::Label::new(&who).truncate().selectable(true))
                                         .on_hover_text(&who);
+                                    label.context_menu(|ui| {
+                                        copy_menu(ui, &record.number, name);
+                                    });
                                 },
                             );
                         });
@@ -3396,9 +3440,15 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                                             egui::FontSelection::Default,
                                             egui::Align::Center,
                                         );
-                                    ui.add(egui::Label::new(text).truncate()).on_hover_text(
-                                        format!("{} {}", contact.name, contact.number),
-                                    );
+                                    let label =
+                                        ui.add(egui::Label::new(text).truncate().selectable(true));
+                                    label.context_menu(|ui| {
+                                        copy_menu(ui, &contact.number, &contact.name);
+                                    });
+                                    label.on_hover_text(format!(
+                                        "{} {}",
+                                        contact.name, contact.number
+                                    ));
                                 },
                             );
                         });
@@ -4120,6 +4170,31 @@ fn result_text(code: &str) -> Option<String> {
             Err(_) => other.to_owned(),
         },
     })
+}
+
+/// "Copy the number" (and the name, when there is one) for a right click on
+/// a call or a contact.
+fn copy_menu(ui: &mut egui::Ui, number: &str, name: &str) {
+    if ui
+        .button(tr!("Копировать номер", "Copy the number"))
+        .clicked()
+    {
+        ui.ctx().copy_text(number.to_owned());
+        ui.close_menu();
+    }
+    if !name.is_empty() && ui.button(tr!("Копировать имя", "Copy the name")).clicked()
+    {
+        ui.ctx().copy_text(name.to_owned());
+        ui.close_menu();
+    }
+    if !name.is_empty()
+        && ui
+            .button(tr!("Копировать имя и номер", "Copy the name and number"))
+            .clicked()
+    {
+        ui.ctx().copy_text(format!("{name} {number}"));
+        ui.close_menu();
+    }
 }
 
 /// An account's title in the window's language: the settings name an

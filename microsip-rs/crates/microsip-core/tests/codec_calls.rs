@@ -63,7 +63,17 @@ fn talk(caller: &[Codec], called: &[Codec], expected: Codec) -> (ToneReport, Ton
     // Both sides report the codec their audio started with.
     wait_for(&a.handle, Event::Codec(expected));
     wait_for(&b.handle, Event::Codec(expected));
-    std::thread::sleep(Duration::from_millis(1_500));
+    // Talk until each side has heard a second of the other. A slow codec
+    // on a busy computer (the tests run side by side) may need longer than
+    // that second, but not much: one that cannot keep up at all fails.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        let heard = |phone: &Phone| phone.report.lock().unwrap().seconds;
+        if heard(&a) >= 1.2 && heard(&b) >= 1.2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert!(a.handle.send(UiCommand::Hangup));
     wait_for(&a.handle, Event::Ended(EndReason::Completed));
     wait_for(&b.handle, Event::Ended(EndReason::Completed));

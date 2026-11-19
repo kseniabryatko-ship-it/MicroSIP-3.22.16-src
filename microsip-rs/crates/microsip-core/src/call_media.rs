@@ -356,6 +356,7 @@ impl Media for ToneMedia {
             *meter = ToneMeter::default();
         }
         let meter = Arc::clone(&self.meter);
+        let live = Arc::clone(&self.report);
         self.next_ssrc = self.next_ssrc.wrapping_add(0x0101_0101).max(1);
         let session = RtpSession::from_socket_with_sink(
             socket,
@@ -364,6 +365,11 @@ impl Media for ToneMedia {
             Some(Box::new(move |samples| {
                 if let Ok(mut meter) = meter.lock() {
                     meter.push(&samples, rate);
+                    // How much has been heard is known during the call too;
+                    // pitch and level are worked out when it ends.
+                    if let Ok(mut report) = live.lock() {
+                        report.seconds = meter.total as f32 / rate as f32;
+                    }
                 }
             })),
         )?;
