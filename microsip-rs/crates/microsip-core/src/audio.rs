@@ -337,6 +337,39 @@ impl Speaker {
         volume: Arc<AtomicU32>,
         reserve_ms: u32,
     ) -> Result<Self, AudioError> {
+        Self::start_with(device, volume, |rate| {
+            PlayoutBuffer::adaptive_from(rate, reserve_ms)
+        })
+    }
+
+    /// A speaker for sounds made on this computer: what is given plays at
+    /// once, without the reserve network audio needs.
+    pub fn start_immediate(
+        device: Option<&str>,
+        volume: Arc<AtomicU32>,
+    ) -> Result<Self, AudioError> {
+        Self::start_with(device, volume, PlayoutBuffer::immediate)
+    }
+
+    /// Ends what is playing quickly and softly; see [`PlayoutBuffer::cut`].
+    pub fn cut(&self) {
+        if let Ok(mut playout) = self.playout.lock() {
+            playout.cut();
+        }
+    }
+
+    /// Milliseconds of sound waiting to be played.
+    pub fn queued_ms(&self) -> u32 {
+        self.playout.lock().map_or(0, |playout| {
+            (playout.queued() as u64 * 1_000 / u64::from(self.format.sample_rate.max(1))) as u32
+        })
+    }
+
+    fn start_with(
+        device: Option<&str>,
+        volume: Arc<AtomicU32>,
+        make_buffer: impl FnOnce(u32) -> PlayoutBuffer,
+    ) -> Result<Self, AudioError> {
         let device = output_device(device)?;
 
         let supported = device
@@ -350,10 +383,7 @@ impl Speaker {
             channels: supported.channels(),
         };
 
-        let playout = Arc::new(Mutex::new(PlayoutBuffer::adaptive_from(
-            format.sample_rate,
-            reserve_ms,
-        )));
+        let playout = Arc::new(Mutex::new(make_buffer(format.sample_rate)));
         let shared = || (Arc::clone(&playout), Arc::clone(&volume));
 
         let stream = match sample_format {

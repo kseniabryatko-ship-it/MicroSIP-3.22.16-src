@@ -92,6 +92,34 @@ impl PlayoutBuffer {
         buffer
     }
 
+    /// A buffer that plays at once, without a reserve and without learning:
+    /// for sounds made on this computer (the keypad), which arrive whole
+    /// and never late.
+    pub fn immediate(sample_rate: u32) -> Self {
+        let mut buffer = Self::new(sample_rate);
+        buffer.target = 1;
+        buffer.target_ms = 0;
+        buffer.largest_target_ms = 0;
+        buffer
+    }
+
+    /// Ends what is playing within a few milliseconds, faded to silence so
+    /// that it does not click, and drops the rest.
+    pub fn cut(&mut self) {
+        let keep = self.fade.min(self.queue.len());
+        self.queue.truncate(keep);
+        for (step, sample) in self.queue.iter_mut().enumerate() {
+            *sample *= (keep - step) as f32 / (keep + 1) as f32;
+        }
+    }
+
+    /// Drops what is waiting to be played.
+    pub fn clear(&mut self) {
+        self.queue.clear();
+        self.playing = false;
+        self.fade_in_left = 0;
+    }
+
     /// The reserve currently collected before playback starts.
     pub fn target_ms(&self) -> u32 {
         self.target_ms
@@ -208,6 +236,34 @@ mod tests {
         let mut output = vec![9.0; samples];
         buffer.pull(&mut output);
         output
+    }
+
+    #[test]
+    fn an_immediate_buffer_plays_short_sounds_at_once_and_keeps_doing_so() {
+        let mut buffer = PlayoutBuffer::immediate(8_000);
+        // A key's sound, several times with pauses between: each one plays
+        // in the very next block, and no reserve is learnt from the pauses.
+        for _ in 0..5 {
+            buffer.push(&[0.5; 960]);
+            let first = pull(&mut buffer, 160);
+            assert!(first[80..].iter().all(|sample| *sample > 0.4), "{first:?}");
+            for _ in 0..6 {
+                pull(&mut buffer, 160);
+            }
+            assert_eq!(buffer.queued(), 0);
+            assert_eq!(buffer.target_ms(), 0);
+        }
+        // Cut short: a few milliseconds fading to nothing, then silence.
+        buffer.push(&[0.5; 960]);
+        pull(&mut buffer, 160);
+        buffer.cut();
+        let faded = pull(&mut buffer, 160);
+        assert!(faded[0] < 0.5 && faded.windows(2).all(|pair| pair[1] <= pair[0]));
+        assert!(faded[100..].iter().all(|sample| *sample == 0.0));
+        buffer.push(&[0.5; 960]);
+        buffer.clear();
+        assert_eq!(buffer.queued(), 0);
+        assert!(pull(&mut buffer, 160).iter().all(|sample| *sample == 0.0));
     }
 
     #[test]

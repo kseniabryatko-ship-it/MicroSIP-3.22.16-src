@@ -17,8 +17,8 @@ use std::time::Duration;
 const KEY_MS: u32 = 120;
 /// The speaker is released after this long without a key.
 const IDLE: Duration = Duration::from_secs(5);
-/// Rate the tones are made at; the speaker converts it.
-const RATE: u32 = 8_000;
+/// A key waits behind at most this much of the one before.
+const MAX_LAG_MS: u32 = 40;
 
 /// Plays key sounds; cheap to keep, the thread waits for keys.
 pub struct KeyTones {
@@ -36,15 +36,24 @@ impl KeyTones {
                     Ok(digit) => {
                         if speaker.is_none() {
                             let device = controls.output_device();
-                            speaker = Speaker::start_on(
+                            // Played at once: the buffer for network audio
+                            // would wait for a reserve longer than a key.
+                            speaker = Speaker::start_immediate(
                                 device.as_deref().filter(|name| !name.is_empty()),
                                 controls.speaker_volume_handle(),
-                                0,
                             )
                             .ok();
                         }
                         if let Some(speaker) = speaker.as_ref() {
-                            let _ = speaker.play_mono(&key_sound(digit, RATE, KEY_MS), RATE);
+                            // Quick typing: a key cuts the rest of the one
+                            // before, so the sound keeps up with the fingers.
+                            if speaker.queued_ms() > MAX_LAG_MS {
+                                speaker.cut();
+                            }
+                            // Made at the speaker's own rate: nothing to
+                            // convert, nothing to smear.
+                            let rate = speaker.format().sample_rate;
+                            let _ = speaker.play_mono(&key_sound(digit, rate, KEY_MS), rate);
                         }
                     }
                     // Quiet for a while: the sound card is let go.
