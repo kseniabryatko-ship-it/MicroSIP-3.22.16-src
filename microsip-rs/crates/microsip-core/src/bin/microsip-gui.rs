@@ -292,6 +292,9 @@ struct PhoneWindow {
     number_changed: bool,
     focus_number: bool,
     paste_requested: bool,
+    /// The selection in the number field before a right click, which moves
+    /// the cursor to where the mouse is; the menu works on this one.
+    number_selection: Option<egui::text::CCursorRange>,
 
     // The phone.
     handle: Option<CallHandle>,
@@ -488,6 +491,7 @@ impl PhoneWindow {
             number_changed: false,
             focus_number: true,
             paste_requested: false,
+            number_selection: None,
             handle: None,
             local: None,
             registration: None,
@@ -2657,6 +2661,90 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         }
     }
 
+    /// Undo, cut, copy, paste, delete and select all for the number field.
+    fn number_menu(&mut self, ui: &mut egui::Ui, id: egui::Id, actions: &mut Vec<Action>) {
+        let ctx = ui.ctx().clone();
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+        let length = self.number.chars().count();
+        let range = self
+            .number_selection
+            .or_else(|| state.cursor.char_range())
+            .unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(length)));
+        // The right click moved the cursor; the selection is shown again.
+        if state.cursor.char_range() != Some(range) {
+            state.cursor.set_char_range(Some(range));
+            state.clone().store(&ctx, id);
+        }
+        let [from, to] = range.sorted();
+        let (from, to) = (from.index.min(length), to.index.min(length));
+        let selected: String = self.number.chars().skip(from).take(to - from).collect();
+        let has_selection = from < to;
+        let mut undoer = state.undoer();
+        let current = (range, self.number.clone());
+        let mut done = false;
+
+        let item = |ui: &mut egui::Ui, enabled: bool, text: &str, keys: &str| {
+            ui.add_enabled(enabled, egui::Button::new(text).shortcut_text(keys))
+                .clicked()
+        };
+        if item(
+            ui,
+            undoer.has_undo(&current),
+            tr!("Отменить", "Undo"),
+            "Ctrl+Z",
+        ) {
+            if let Some((cursor, text)) = undoer.undo(&current).cloned() {
+                self.number = text;
+                state.cursor.set_char_range(Some(cursor));
+            }
+            done = true;
+        }
+        ui.separator();
+        let cut = item(ui, has_selection, tr!("Вырезать", "Cut"), "Ctrl+X");
+        if item(ui, has_selection, tr!("Копировать", "Copy"), "Ctrl+C") || cut {
+            ctx.copy_text(selected.clone());
+            done = true;
+        }
+        if item(ui, true, tr!("Вставить", "Paste"), "Ctrl+V") {
+            actions.push(Action::Paste);
+            done = true;
+        }
+        if item(ui, has_selection, tr!("Удалить", "Delete"), "Del") || (cut && has_selection)
+        {
+            // Undo brings the deleted part back.
+            undoer.add_undo(&current);
+            let kept: String = self
+                .number
+                .chars()
+                .take(from)
+                .chain(self.number.chars().skip(to))
+                .collect();
+            self.number = kept;
+            let at = egui::text::CCursor::new(from);
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(at)));
+            done = true;
+        }
+        ui.separator();
+        if item(ui, length > 0, tr!("Выделить всё", "Select all"), "Ctrl+A") {
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(length),
+                )));
+            done = true;
+        }
+        if done {
+            self.number_selection = state.cursor.char_range();
+            state.set_undoer(undoer);
+            state.store(&ctx, id);
+            self.focus_number = true;
+            ui.close_menu();
+        }
+    }
+
     fn dialpad_content(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>, sizes: &PadSizes) {
         self.lines_bar(ui, actions);
         let phase = self.lines[self.at].view.phase();
@@ -2668,7 +2756,20 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             .hint_text(tr!("Номер", "Number"))
             .font(egui::TextStyle::Heading)
             .desired_width(f32::INFINITY);
+        // The selection as it is before this frame's clicks, kept while the
+        // menu is open.
+        let right_click = ui.input(|input| {
+            input.pointer.button_pressed(egui::PointerButton::Secondary)
+                || input.pointer.button_down(egui::PointerButton::Secondary)
+        });
+        let menu_open = ui.memory(|memory| memory.any_popup_open());
+        if !right_click && !menu_open {
+            self.number_selection = egui::TextEdit::load_state(ui.ctx(), number_id)
+                .and_then(|state| state.cursor.char_range());
+        }
         let response = ui.add_enabled(idle, field);
+        // The right-click menu of a Windows text field, as in MicroSIP.
+        response.context_menu(|ui| self.number_menu(ui, number_id, actions));
         if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
             actions.push(Action::Call(self.number.clone()));
         }
