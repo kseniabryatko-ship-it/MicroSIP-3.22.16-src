@@ -65,7 +65,7 @@ macro_rules! tr {
 }
 
 const LOG_LIMIT: usize = 1_000;
-const WINDOW_TITLE: &str = "MicroSIP Rust";
+const WINDOW_TITLE: &str = "sip by @enxances x NAVI";
 /// How long a number from a link or the command line waits for the phone
 /// to get registered before it is only left in the number field.
 const LINK_WAIT: Duration = Duration::from_secs(20);
@@ -4681,8 +4681,9 @@ fn end_text(started: u64, ended: u64, offset: i64) -> String {
     }
 }
 
-/// The picture of the top band, built into the program.
-const HEADER_PICTURE: &[u8] = include_bytes!("../../assets/header-logo.png");
+/// The picture of the top band, built into the program: the letters NAVI,
+/// yellow on nothing, drawn on the band's black.
+const HEADER_PICTURE: &[u8] = include_bytes!("../../assets/header-letters.png");
 
 /// The windows' own icon: NAVI on black. Small, so it costs next to
 /// nothing; without it the window library unpacks a large one of its own.
@@ -4730,7 +4731,8 @@ fn paint_picture_band(
     if size.x > room.width() {
         size = egui::vec2(room.width(), room.width() / aspect);
     }
-    let place = egui::Rect::from_center_size(room.center(), size);
+    // Some air around the letters, so they do not touch the window's top.
+    let place = egui::Rect::from_center_size(room.center(), size * 0.8);
     painter.image(
         texture.id(),
         place,
