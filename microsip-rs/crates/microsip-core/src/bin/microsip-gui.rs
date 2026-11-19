@@ -3132,7 +3132,11 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                         ));
                         // Why the call did not take place, as MicroSIP shows it.
                         if let Some(why) = result_text(&record.result) {
-                            ui.colored_label(egui::Color32::from_rgb(210, 80, 80), why);
+                            // A long reason is cut at the window's edge; the
+                            // whole of it shows under the mouse.
+                            let text = egui::RichText::new(why.clone())
+                                .color(egui::Color32::from_rgb(210, 80, 80));
+                            ui.add(egui::Label::new(text).truncate()).on_hover_text(why);
                         }
                     });
                     ui.separator();
@@ -3774,18 +3778,71 @@ fn phase_text(phase: Phase) -> &'static str {
 fn end_reason_text(reason: EndReason) -> String {
     match reason {
         EndReason::Completed => tr!("разговор окончен", "call ended").to_owned(),
-        EndReason::Rejected(486 | 600) => tr!("занято", "busy").to_owned(),
-        EndReason::Rejected(404) => tr!("номер не найден", "number not found").to_owned(),
-        EndReason::Rejected(480) => tr!("абонент недоступен", "unavailable").to_owned(),
-        EndReason::Rejected(603) => tr!("вызов отклонён", "call declined").to_owned(),
-        EndReason::Rejected(status) => tr!(
-            format!("вызов не прошёл (код {status})"),
-            format!("call failed (code {status})"),
-        ),
+        EndReason::Rejected(status) => match sip_status_text(status) {
+            // What the code means, then the code with its standard name,
+            // as MicroSIP shows it.
+            Some((russian, phrase)) => tr!(
+                format!("{russian} ({status} {phrase})"),
+                format!("{phrase} ({status})"),
+            ),
+            None => tr!(
+                format!("вызов не прошёл (код {status})"),
+                format!("call failed (code {status})"),
+            ),
+        },
         EndReason::Cancelled => tr!("отменён", "cancelled").to_owned(),
         EndReason::Timeout => tr!("нет ответа", "no answer").to_owned(),
         EndReason::Failed => tr!("не удалось позвонить", "could not call").to_owned(),
     }
+}
+
+/// What a SIP answer code means: in Russian words, and its standard name
+/// (RFC 3261 and later), which MicroSIP shows.
+fn sip_status_text(status: u16) -> Option<(&'static str, &'static str)> {
+    Some(match status {
+        400 => ("неверный запрос", "Bad Request"),
+        401 => ("нужен пароль", "Unauthorized"),
+        402 => ("нужна оплата", "Payment Required"),
+        403 => ("запрещено АТС", "Forbidden"),
+        404 => ("номер не найден", "Not Found"),
+        405 => ("действие не разрешено", "Method Not Allowed"),
+        406 => ("неприемлемо", "Not Acceptable"),
+        407 => ("нужен пароль для прокси", "Proxy Authentication Required"),
+        408 => ("нет ответа", "Request Timeout"),
+        410 => ("номера больше нет", "Gone"),
+        413 => ("слишком большой запрос", "Request Entity Too Large"),
+        414 => ("слишком длинный адрес", "Request-URI Too Long"),
+        415 => ("формат не поддерживается", "Unsupported Media Type"),
+        416 => ("адрес не поддерживается", "Unsupported URI Scheme"),
+        420 => ("неизвестное расширение SIP", "Bad Extension"),
+        421 => ("нужно расширение SIP", "Extension Required"),
+        423 => ("слишком короткий срок", "Interval Too Brief"),
+        480 => ("абонент недоступен", "Temporarily Unavailable"),
+        481 => ("такого вызова нет", "Call/Transaction Does Not Exist"),
+        482 => ("вызов зациклился", "Loop Detected"),
+        483 => ("слишком много переходов", "Too Many Hops"),
+        484 => ("номер набран не полностью", "Address Incomplete"),
+        485 => ("неоднозначный номер", "Ambiguous"),
+        486 => ("занято", "Busy Here"),
+        487 => ("вызов отменён", "Request Terminated"),
+        488 => ("не подошли кодеки или шифрование", "Not Acceptable Here"),
+        489 => ("событие не поддерживается", "Bad Event"),
+        491 => ("запрос уже обрабатывается", "Request Pending"),
+        493 => ("не удалось расшифровать", "Undecipherable"),
+        500 => ("внутренняя ошибка АТС", "Server Internal Error"),
+        501 => ("АТС этого не умеет", "Not Implemented"),
+        502 => ("ошибка шлюза", "Bad Gateway"),
+        503 => ("сервис недоступен", "Service Unavailable"),
+        504 => ("АТС не дождалась ответа", "Server Time-out"),
+        505 => ("версия SIP не поддерживается", "Version Not Supported"),
+        513 => ("слишком большое сообщение", "Message Too Large"),
+        580 => ("условия вызова не выполнены", "Precondition Failure"),
+        600 => ("занято везде", "Busy Everywhere"),
+        603 => ("вызов отклонён", "Decline"),
+        604 => ("номер нигде не существует", "Does Not Exist Anywhere"),
+        606 => ("вызов не принят", "Not Acceptable"),
+        _ => return None,
+    })
 }
 
 /// Messages of the phone's core, in Russian where they are known. The text
@@ -4246,4 +4303,29 @@ fn main() -> eframe::Result<()> {
             )))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_calls_say_what_the_code_means() {
+        set_english(false);
+        assert_eq!(
+            end_reason_text(EndReason::Rejected(503)),
+            "сервис недоступен (503 Service Unavailable)"
+        );
+        assert_eq!(
+            result_text("486").as_deref(),
+            Some("занято (486 Busy Here)")
+        );
+        assert_eq!(
+            end_reason_text(EndReason::Rejected(499)),
+            "вызов не прошёл (код 499)"
+        );
+        set_english(true);
+        assert_eq!(end_reason_text(EndReason::Rejected(404)), "Not Found (404)");
+        set_english(false);
+    }
 }
