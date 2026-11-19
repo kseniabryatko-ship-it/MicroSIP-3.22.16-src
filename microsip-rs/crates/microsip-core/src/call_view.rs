@@ -5,6 +5,7 @@
 
 use crate::call_runner::{EndReason, Event};
 use crate::codec::Codec;
+use crate::live_quality::LiveQuality;
 use std::net::SocketAddr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -46,6 +47,7 @@ pub struct CallView {
     remote_held: bool,
     codec: Option<Codec>,
     encrypted: bool,
+    quality: Option<LiveQuality>,
 }
 
 impl CallView {
@@ -76,6 +78,12 @@ impl CallView {
     /// The codec of the call's audio, once it has started.
     pub fn codec(&self) -> Option<Codec> {
         self.codec
+    }
+
+    /// What the last seconds of the connected call were like (the quality
+    /// lamp); `None` before the first look, on hold and without a call.
+    pub fn live_quality(&self) -> Option<LiveQuality> {
+        self.quality
     }
 
     /// The call's audio is encrypted (SRTP).
@@ -163,11 +171,24 @@ impl CallView {
                 }
             }
             Event::Established => self.phase = Phase::Connected,
+            Event::LiveQuality(quality) => {
+                if self.phase == Phase::Connected {
+                    self.quality = Some(*quality);
+                }
+            }
             Event::Codec(codec) => self.codec = Some(*codec),
             Event::Encrypted(encrypted) => self.encrypted = *encrypted,
             Event::MediaStats { sent, received } => self.stats = Some((*sent, *received)),
-            Event::Hold(held) => self.held = *held,
-            Event::RemoteHold(held) => self.remote_held = *held,
+            // A held call has no sound to judge: the lamp waits for the
+            // first look after it is resumed.
+            Event::Hold(held) => {
+                self.held = *held;
+                self.quality = None;
+            }
+            Event::RemoteHold(held) => {
+                self.remote_held = *held;
+                self.quality = None;
+            }
             Event::Ended(reason) => {
                 self.phase = Phase::Idle;
                 self.last_end = Some(*reason);
@@ -175,6 +196,7 @@ impl CallView {
                 self.remote_held = false;
                 self.codec = None;
                 self.encrypted = false;
+                self.quality = None;
             }
             Event::AudioQuality(_)
             | Event::Recording(_)
@@ -200,6 +222,7 @@ impl CallView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live_quality::Lamp;
 
     fn peer() -> SocketAddr {
         "127.0.0.1:5070".parse().unwrap()
@@ -230,6 +253,34 @@ mod tests {
         assert_eq!(view.stats(), Some((10, 12)));
         assert_eq!(view.last_end(), Some(EndReason::Completed));
         assert_eq!(view.peer(), Some(peer()));
+    }
+
+    #[test]
+    fn the_quality_lamp_follows_the_connected_call() {
+        let mut view = CallView::default();
+        let poor = LiveQuality {
+            lamp: Lamp::Poor,
+            ..LiveQuality::default()
+        };
+        view.dialing(peer());
+        // Nothing to show before the call is connected.
+        view.on_event(&Event::LiveQuality(poor));
+        assert_eq!(view.live_quality(), None);
+        view.on_event(&Event::Established);
+        view.on_event(&Event::LiveQuality(LiveQuality::default()));
+        assert_eq!(view.live_quality().map(|live| live.lamp), Some(Lamp::Good));
+        view.on_event(&Event::LiveQuality(poor));
+        assert_eq!(view.live_quality(), Some(poor));
+        // On hold, and after the call, the lamp is off.
+        view.on_event(&Event::Hold(true));
+        assert_eq!(view.live_quality(), None);
+        view.on_event(&Event::Hold(false));
+        view.on_event(&Event::LiveQuality(poor));
+        view.on_event(&Event::RemoteHold(true));
+        assert_eq!(view.live_quality(), None);
+        view.on_event(&Event::LiveQuality(poor));
+        view.on_event(&Event::Ended(EndReason::Completed));
+        assert_eq!(view.live_quality(), None);
     }
 
     #[test]

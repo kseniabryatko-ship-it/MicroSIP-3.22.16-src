@@ -207,7 +207,10 @@ LIMITATIONS
 -----------
 SIP over UDP, TCP or TLS; SRTP; STUN; two lines; one account;
 voicemail indicator, busy lamps (BLF) and text messages;
-echo cancellation, noise suppression and RTCP quality reports. Codecs: G.711 (PCMU, PCMA), G.722, Opus, G.729.
+echo cancellation, noise suppression and RTCP quality reports;
+a call-quality lamp; tel:, sip: and callto: links and a number on the
+command line, handed to the copy that already runs.
+Codecs: G.711 (PCMU, PCMA), G.722, Opus, G.729, GSM, Speex (8 and 16 kHz).
 Behind a router the phone registers the public address the server
 reports and sends keep-alives, but it uses no STUN: audio works only if
 the server sends it back to where the phone's audio comes from.

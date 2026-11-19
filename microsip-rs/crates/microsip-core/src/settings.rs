@@ -112,7 +112,7 @@ impl Default for Settings {
             close_to_tray: true,
             hotkeys: true,
             light_theme: false,
-            codecs: crate::codec::Codec::format_list(&crate::codec::Codec::PREFERRED),
+            codecs: crate::codec::Codec::format_list(&crate::codec::Codec::DEFAULT),
             transport: "UDP".to_owned(),
             proxy: String::new(),
             tls_verify: true,

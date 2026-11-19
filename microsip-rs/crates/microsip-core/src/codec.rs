@@ -4,6 +4,8 @@
 //! (16 kHz in the same 64 kbit/s), Opus and G.729 (8 kbit/s) come from the
 //! `audio-codec` library. Those three keep state from packet to packet, so
 //! a call has one [`VoiceEncoder`] and one [`VoiceDecoder`] per codec.
+//! GSM 06.10 (13 kbit/s) and Speex (narrowband and 16 kHz wideband) come
+//! from the `oxideav` libraries; they too keep state between packets.
 
 use crate::rtp::{decode_pcmu, encode_pcmu};
 use std::fmt;
@@ -16,16 +18,27 @@ pub enum Codec {
     G722,
     Opus,
     G729,
+    Gsm,
+    Speex,
+    SpeexWide,
 }
 
 /// Bit rate the Opus encoder aims at: clear wideband speech.
 const OPUS_BITRATE: i32 = 24_000;
 
+/// Speex quality, 0 to 10. 8 is the usual default of Speex phones:
+/// 15 kbit/s narrowband, about 28 kbit/s wideband.
+const SPEEX_QUALITY: u8 = 8;
+
+/// Bytes of one GSM 06.10 frame (20 ms) as RTP carries it.
+const GSM_FRAME_BYTES: usize = 33;
+
 impl Codec {
-    /// Every codec, in the order a new installation prefers them. G.711
+    /// The codecs a new installation has switched on, in its order. G.711
     /// comes first: every telephone exchange has it and it costs nothing
-    /// to compute.
-    pub const PREFERRED: [Codec; 5] = [
+    /// to compute. GSM and Speex are there for the exchanges that need
+    /// them; the user switches them on, as in MicroSIP.
+    pub const DEFAULT: [Codec; 5] = [
         Codec::Pcmu,
         Codec::Pcma,
         Codec::G722,
@@ -33,14 +46,30 @@ impl Codec {
         Codec::G729,
     ];
 
+    /// Every codec the phone has, in the order the list shows them.
+    pub const PREFERRED: [Codec; 8] = [
+        Codec::Pcmu,
+        Codec::Pcma,
+        Codec::G722,
+        Codec::Opus,
+        Codec::G729,
+        Codec::Gsm,
+        Codec::Speex,
+        Codec::SpeexWide,
+    ];
+
     /// The RTP payload type this phone offers the codec with. For Opus it
-    /// is only a proposal: the type agreed in SDP is what is used.
+    /// and Speex it is only a proposal: the type agreed in SDP is what is
+    /// used.
     pub const fn payload_type(self) -> u8 {
         match self {
             Codec::Pcmu => 0,
+            Codec::Gsm => 3,
             Codec::Pcma => 8,
             Codec::G722 => 9,
             Codec::G729 => 18,
+            Codec::Speex => 97,
+            Codec::SpeexWide => 98,
             Codec::Opus => 111,
         }
     }
@@ -48,7 +77,7 @@ impl Codec {
     /// True when the payload type is fixed by the standard, so that the
     /// number alone names the codec.
     pub const fn has_fixed_payload_type(self) -> bool {
-        !matches!(self, Codec::Opus)
+        !matches!(self, Codec::Opus | Codec::Speex | Codec::SpeexWide)
     }
 
     /// Name and clock rate as written in SDP.
@@ -59,6 +88,9 @@ impl Codec {
             // The standard says 8000 for G.722 although it carries 16 kHz.
             Codec::G722 => "G722/8000",
             Codec::G729 => "G729/8000",
+            Codec::Gsm => "GSM/8000",
+            Codec::Speex => "speex/8000",
+            Codec::SpeexWide => "speex/16000",
             // Opus is always announced this way, also for mono speech.
             Codec::Opus => "opus/48000/2",
         }
@@ -79,8 +111,8 @@ impl Codec {
     /// Rate of the sound the codec takes and gives, in samples per second.
     pub const fn sample_rate(self) -> u32 {
         match self {
-            Codec::Pcmu | Codec::Pcma | Codec::G729 => 8_000,
-            Codec::G722 | Codec::Opus => 16_000,
+            Codec::Pcmu | Codec::Pcma | Codec::G729 | Codec::Gsm | Codec::Speex => 8_000,
+            Codec::G722 | Codec::Opus | Codec::SpeexWide => 16_000,
         }
     }
 
@@ -88,6 +120,7 @@ impl Codec {
     pub const fn clock_rate(self) -> u32 {
         match self {
             Codec::Opus => 48_000,
+            Codec::SpeexWide => 16_000,
             _ => 8_000,
         }
     }
@@ -105,6 +138,9 @@ impl Codec {
             Codec::G722 => "G722",
             Codec::G729 => "G729",
             Codec::Opus => "opus",
+            Codec::Gsm => "GSM",
+            Codec::Speex => "speex",
+            Codec::SpeexWide => "speex16",
         }
     }
 
@@ -116,6 +152,8 @@ impl Codec {
             .or_else(|| match name.to_ascii_lowercase().as_str() {
                 "ulaw" | "g711u" => Some(Codec::Pcmu),
                 "alaw" | "g711a" => Some(Codec::Pcma),
+                "speex8" | "speex/8000" => Some(Codec::Speex),
+                "speex-wb" | "speexwb" | "speex/16000" => Some(Codec::SpeexWide),
                 _ => None,
             })
     }
@@ -139,8 +177,8 @@ impl Codec {
     }
 
     /// Reads a list such as `PCMA, G722, opus`. Unknown names and repeats
-    /// are dropped; an empty result is the full default list, so the phone
-    /// is never left without a codec.
+    /// are dropped; an empty result is the default list, so the phone is
+    /// never left without a codec.
     pub fn parse_list(text: &str) -> Vec<Self> {
         let mut list = Vec::new();
         for codec in text.split([',', ' ', ';']).filter_map(Self::from_name) {
@@ -149,7 +187,7 @@ impl Codec {
             }
         }
         if list.is_empty() {
-            list = Self::PREFERRED.to_vec();
+            list = Self::DEFAULT.to_vec();
         }
         list
     }
@@ -217,6 +255,9 @@ impl fmt::Display for Codec {
             Codec::G722 => "G.722",
             Codec::G729 => "G.729",
             Codec::Opus => "Opus",
+            Codec::Gsm => "GSM",
+            Codec::Speex => "Speex",
+            Codec::SpeexWide => "Speex 16 кГц",
         })
     }
 }
@@ -235,19 +276,32 @@ fn from_pcm(samples: &[i16]) -> Vec<f32> {
         .collect()
 }
 
+/// The encoder behind a [`VoiceEncoder`]; G.711 needs none.
+enum EncoderEngine {
+    Plain,
+    Library(Box<dyn audio_codec::Encoder>),
+    Gsm(Box<oxideav_gsm::EncoderState>),
+    Speex(Box<oxideav_speex::NarrowbandEncoder>),
+    SpeexWide(Box<oxideav_speex::WidebandEncoder>),
+}
+
 /// Turns the sound of one call into packets of one codec.
 pub struct VoiceEncoder {
     codec: Codec,
-    /// The library's encoder; G.711 needs none.
-    library: Option<Box<dyn audio_codec::Encoder>>,
+    engine: EncoderEngine,
 }
 
 impl VoiceEncoder {
     pub fn new(codec: Codec) -> Self {
-        let library: Option<Box<dyn audio_codec::Encoder>> = match codec {
-            Codec::Pcmu | Codec::Pcma => None,
-            Codec::G722 => Some(Box::new(audio_codec::g722::G722Encoder::new())),
-            Codec::G729 => Some(Box::new(audio_codec::g729::G729Encoder::new())),
+        let engine = match codec {
+            Codec::Pcmu | Codec::Pcma => EncoderEngine::Plain,
+            Codec::G722 => EncoderEngine::Library(Box::new(audio_codec::g722::G722Encoder::new())),
+            Codec::G729 => EncoderEngine::Library(Box::new(audio_codec::g729::G729Encoder::new())),
+            Codec::Gsm => EncoderEngine::Gsm(Box::new(oxideav_gsm::EncoderState::new())),
+            Codec::Speex => EncoderEngine::Speex(Box::new(oxideav_speex::NarrowbandEncoder::new())),
+            Codec::SpeexWide => {
+                EncoderEngine::SpeexWide(Box::new(oxideav_speex::WidebandEncoder::new()))
+            }
             Codec::Opus => {
                 let mut encoder = audio_codec::opus::OpusEncoder::new(codec.sample_rate(), 1);
                 encoder.set_bitrate(OPUS_BITRATE);
@@ -256,10 +310,10 @@ impl VoiceEncoder {
                 // networks that lose a few percent.
                 encoder.set_inband_fec(true);
                 encoder.set_packet_loss_perc(5);
-                Some(Box::new(encoder))
+                EncoderEngine::Library(Box::new(encoder))
             }
         };
-        Self { codec, library }
+        Self { codec, engine }
     }
 
     pub fn codec(&self) -> Codec {
@@ -269,11 +323,31 @@ impl VoiceEncoder {
     /// Encodes samples in `-1.0..=1.0` at the codec's sample rate; one
     /// packet's worth ([`Codec::frame_samples`]) per call.
     pub fn encode(&mut self, samples: &[f32]) -> Vec<u8> {
-        match (self.codec, self.library.as_mut()) {
+        match (self.codec, &mut self.engine) {
             (Codec::Pcmu, _) => encode_pcmu(samples),
             (Codec::Pcma, _) => encode_pcma(samples),
-            (_, Some(library)) => library.encode(&to_pcm(samples)),
-            (_, None) => Vec::new(),
+            (_, EncoderEngine::Library(library)) => library.encode(&to_pcm(samples)),
+            (_, EncoderEngine::Gsm(encoder)) => {
+                let mut packet = Vec::new();
+                for frame in frames::<160>(samples) {
+                    let frame = encoder.encode_frame(&frame);
+                    packet.extend_from_slice(&frame.to_gsm_byte_frame());
+                }
+                packet
+            }
+            (_, EncoderEngine::Speex(encoder)) => {
+                let frames = frames::<160>(samples);
+                encoder
+                    .encode_packet_quality(&frames, SPEEX_QUALITY)
+                    .unwrap_or_default()
+            }
+            (_, EncoderEngine::SpeexWide(encoder)) => {
+                let frames = frames::<320>(samples);
+                encoder
+                    .encode_packet_quality(&frames, SPEEX_QUALITY)
+                    .unwrap_or_default()
+            }
+            (_, EncoderEngine::Plain) => Vec::new(),
         }
     }
 }
@@ -284,31 +358,68 @@ impl fmt::Debug for VoiceEncoder {
     }
 }
 
+/// Splits sound into whole frames of `N` samples for the codecs that work
+/// frame by frame; a short rest is filled with silence.
+fn frames<const N: usize>(samples: &[f32]) -> Vec<[i16; N]> {
+    to_pcm(samples)
+        .chunks(N)
+        .map(|chunk| {
+            let mut frame = [0_i16; N];
+            frame[..chunk.len()].copy_from_slice(chunk);
+            frame
+        })
+        .collect()
+}
+
+/// Loudest sample a Speex frame may come out with before the decoder is
+/// taken to have run away. Real speech stays within the 16-bit range, give
+/// or take a little overshoot.
+///
+/// The Speex library computes in 64-bit floating point while the encoders
+/// of other phones use 32 bits. On a long, loud, steady tone (music on
+/// hold, a test tone) the tiny difference can grow from packet to packet
+/// until the sound is nothing but full-scale noise. The reference decoder
+/// limits its excitation; the library does not let that be done from
+/// outside, so a decoder that has run away is replaced by a fresh one:
+/// 20 ms of silence instead of noise for the rest of the call.
+const SPEEX_RUNAWAY_PEAK: f64 = 1.1 * 32_768.0;
+
+/// The decoder behind a [`VoiceDecoder`]; G.711 needs none.
+enum DecoderEngine {
+    Plain,
+    Library(Box<dyn audio_codec::Decoder>),
+    Gsm(Box<oxideav_gsm::DecoderState>),
+    Speex(Box<oxideav_speex::SpeexDecoder>),
+}
+
 /// Turns received packets of one codec back into sound.
 pub struct VoiceDecoder {
     codec: Codec,
-    library: Option<Box<dyn audio_codec::Decoder>>,
+    engine: DecoderEngine,
     /// The library's decoder fills lost packets by itself.
     conceals: bool,
 }
 
 impl VoiceDecoder {
     pub fn new(codec: Codec) -> Self {
-        let mut library: Option<Box<dyn audio_codec::Decoder>> = match codec {
-            Codec::Pcmu | Codec::Pcma => None,
-            Codec::G722 => Some(Box::new(audio_codec::g722::G722Decoder::new())),
-            Codec::G729 => Some(Box::new(audio_codec::g729::G729Decoder::new())),
-            Codec::Opus => Some(Box::new(audio_codec::opus::OpusDecoder::new(
+        let mut engine = match codec {
+            Codec::Pcmu | Codec::Pcma => DecoderEngine::Plain,
+            Codec::G722 => DecoderEngine::Library(Box::new(audio_codec::g722::G722Decoder::new())),
+            Codec::G729 => DecoderEngine::Library(Box::new(audio_codec::g729::G729Decoder::new())),
+            Codec::Opus => DecoderEngine::Library(Box::new(audio_codec::opus::OpusDecoder::new(
                 codec.sample_rate(),
                 1,
             ))),
+            Codec::Gsm => DecoderEngine::Gsm(Box::new(oxideav_gsm::DecoderState::new())),
+            Codec::Speex | Codec::SpeexWide => DecoderEngine::Speex(new_speex_decoder()),
         };
-        let conceals = library
-            .as_mut()
-            .is_some_and(|library| library.enable_concealment());
+        let conceals = match &mut engine {
+            DecoderEngine::Library(library) => library.enable_concealment(),
+            _ => false,
+        };
         Self {
             codec,
-            library,
+            engine,
             conceals,
         }
     }
@@ -320,11 +431,50 @@ impl VoiceDecoder {
     /// Sound of one packet, at the codec's sample rate. Bytes that are not
     /// a packet of this codec give no sound.
     pub fn decode(&mut self, payload: &[u8]) -> Vec<f32> {
-        match (self.codec, self.library.as_mut()) {
+        match (self.codec, &mut self.engine) {
             (Codec::Pcmu, _) => decode_pcmu(payload),
             (Codec::Pcma, _) => decode_pcma(payload),
-            (_, Some(library)) => from_pcm(&library.decode(payload)),
-            (_, None) => Vec::new(),
+            (_, DecoderEngine::Library(library)) => from_pcm(&library.decode(payload)),
+            (_, DecoderEngine::Gsm(decoder)) => {
+                // A packet may carry several frames; a broken one ends it.
+                let mut sound = Vec::new();
+                for bytes in payload.as_chunks::<GSM_FRAME_BYTES>().0 {
+                    let Ok(frame) = oxideav_gsm::UnpackedFrame::from_gsm_byte_frame(bytes) else {
+                        break;
+                    };
+                    sound.extend(from_pcm(&decoder.decode_frame(&frame)));
+                }
+                sound
+            }
+            (codec, DecoderEngine::Speex(decoder)) => {
+                let frames = decoder.decode_packet(payload).unwrap_or_default();
+                let mut sound = Vec::new();
+                for frame in frames {
+                    // Only frames of the agreed band are sound for this call.
+                    if frame.sample_rate_hz() != Some(codec.sample_rate()) {
+                        continue;
+                    }
+                    let Some(samples) = speex_samples(&frame) else {
+                        continue;
+                    };
+                    let peak = samples
+                        .iter()
+                        .fold(0.0_f64, |peak, sample| peak.max(sample.abs()));
+                    // NaN counts as running away too.
+                    if peak.is_nan() || peak > SPEEX_RUNAWAY_PEAK {
+                        *decoder = new_speex_decoder();
+                        sound.extend(std::iter::repeat_n(0.0, samples.len()));
+                        continue;
+                    }
+                    sound.extend(
+                        samples
+                            .iter()
+                            .map(|sample| (sample / 32_768.0).clamp(-1.0, 1.0) as f32),
+                    );
+                }
+                sound
+            }
+            (_, DecoderEngine::Plain) => Vec::new(),
         }
     }
 
@@ -334,8 +484,28 @@ impl VoiceDecoder {
         if !self.conceals {
             return None;
         }
-        let made = self.library.as_mut()?.conceal(samples);
+        let DecoderEngine::Library(library) = &mut self.engine else {
+            return None;
+        };
+        let made = library.conceal(samples);
         (!made.is_empty()).then(|| from_pcm(&made))
+    }
+}
+
+fn new_speex_decoder() -> Box<oxideav_speex::SpeexDecoder> {
+    let mut decoder = oxideav_speex::SpeexDecoder::new();
+    // The perceptual enhancer that Speex phones switch on.
+    decoder.set_enhancer(true);
+    Box::new(decoder)
+}
+
+/// The sound of a decoded Speex frame before rounding, so that a decoder
+/// running away shows as samples far outside the 16-bit range.
+fn speex_samples(frame: &oxideav_speex::DecodedFrame) -> Option<&[f64]> {
+    match frame {
+        oxideav_speex::DecodedFrame::Narrowband(samples) => Some(&samples[..]),
+        oxideav_speex::DecodedFrame::Wideband { wideband_pcm, .. } => Some(&wideband_pcm[..]),
+        _ => None,
     }
 }
 
@@ -477,6 +647,14 @@ mod tests {
         assert_eq!(Codec::from_rtpmap("g729/8000"), Some(Codec::G729));
         assert_eq!(Codec::from_rtpmap("G722/16000"), None);
         assert_eq!(Codec::from_rtpmap("telephone-event/8000"), None);
+        assert_eq!(Codec::Gsm.payload_type(), 3);
+        assert_eq!(Codec::from_payload_type(3), Some(Codec::Gsm));
+        assert_eq!(Codec::Gsm.rtpmap(), "GSM/8000");
+        assert_eq!(Codec::from_rtpmap("SPEEX/8000"), Some(Codec::Speex));
+        assert_eq!(Codec::from_rtpmap("speex/16000"), Some(Codec::SpeexWide));
+        // Speex numbers are agreed in SDP, like those of Opus.
+        assert!(!Codec::Speex.has_fixed_payload_type());
+        assert_eq!(Codec::from_payload_type(97), None);
     }
 
     #[test]
@@ -488,6 +666,9 @@ mod tests {
             (Codec::G722, 16_000, 8_000, 320),
             (Codec::G729, 8_000, 8_000, 160),
             (Codec::Opus, 16_000, 48_000, 320),
+            (Codec::Gsm, 8_000, 8_000, 160),
+            (Codec::Speex, 8_000, 8_000, 160),
+            (Codec::SpeexWide, 16_000, 16_000, 320),
         ] {
             assert_eq!(codec.sample_rate(), rate, "{codec}");
             assert_eq!(codec.clock_rate(), clock, "{codec}");
@@ -502,10 +683,14 @@ mod tests {
             [Codec::Pcma, Codec::G722, Codec::Opus, Codec::Pcmu]
         );
         // Repeats and unknown names are dropped.
-        assert_eq!(Codec::parse_list("G729,speex,g729"), [Codec::G729]);
+        assert_eq!(Codec::parse_list("G729,ilbc,g729"), [Codec::G729]);
+        assert_eq!(
+            Codec::parse_list("gsm, speex, speex16, speex-wb"),
+            [Codec::Gsm, Codec::Speex, Codec::SpeexWide]
+        );
         // Nothing usable: the phone keeps all its codecs.
-        assert_eq!(Codec::parse_list(""), Codec::PREFERRED);
-        assert_eq!(Codec::parse_list("gsm"), Codec::PREFERRED);
+        assert_eq!(Codec::parse_list(""), Codec::DEFAULT);
+        assert_eq!(Codec::parse_list("ilbc"), Codec::DEFAULT);
         assert_eq!(Codec::format_list(&[Codec::Opus, Codec::Pcma]), "opus,PCMA");
         for codec in Codec::PREFERRED {
             assert_eq!(Codec::from_name(codec.name()), Some(codec));
@@ -558,6 +743,10 @@ mod tests {
             (Codec::G722, Some(160)),
             (Codec::G729, Some(20)),
             (Codec::Opus, None),
+            (Codec::Gsm, Some(33)),
+            // Speex quality 8: 15 kbit/s and about 28 kbit/s.
+            (Codec::Speex, Some(39)),
+            (Codec::SpeexWide, Some(71)),
         ] {
             let rate = codec.sample_rate();
             let mut encoder = VoiceEncoder::new(codec);
@@ -616,12 +805,42 @@ mod tests {
 
     #[test]
     fn garbage_is_not_sound() {
-        for codec in [Codec::G722, Codec::G729, Codec::Opus] {
+        for codec in [
+            Codec::G722,
+            Codec::G729,
+            Codec::Opus,
+            Codec::Gsm,
+            Codec::Speex,
+            Codec::SpeexWide,
+        ] {
             let mut decoder = VoiceDecoder::new(codec);
             assert!(decoder.decode(&[]).is_empty(), "{codec}");
             // Odd bytes must not panic, whatever they decode to.
             let sound = decoder.decode(&[0xFF, 0x00, 0x13]);
             assert!(sound.iter().all(|sample| sample.is_finite()), "{codec}");
+        }
+    }
+
+    #[test]
+    fn random_packets_never_break_the_decoders() {
+        // Packets from the network can be anything; a decoder that panicked
+        // would end the sound of the call.
+        let mut seed = 0x2545_F491_u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for codec in [Codec::Gsm, Codec::Speex, Codec::SpeexWide] {
+            let mut decoder = VoiceDecoder::new(codec);
+            for _ in 0..2_000 {
+                let length = (next() % 120) as usize;
+                let packet: Vec<u8> = (0..length).map(|_| next() as u8).collect();
+                let sound = decoder.decode(&packet);
+                assert!(sound.iter().all(|sample| sample.is_finite()), "{codec}");
+                assert!(sound.len() <= 16 * codec.frame_samples(), "{codec}");
+            }
         }
     }
 
@@ -649,8 +868,16 @@ mod tests {
             Codec::listed(&formats("107 0 101 96 97"), &rtpmaps),
             [(107, Codec::Opus), (0, Codec::Pcmu), (96, Codec::G722)]
         );
-        // A fixed number given another meaning is not our codec.
-        assert_eq!(Codec::listed(&formats("9"), &["9 speex/8000"]), []);
+        // A fixed number given another meaning is not our codec...
+        assert_eq!(Codec::listed(&formats("9"), &["9 iLBC/8000"]), []);
+        // ...unless the meaning is one of ours. Speex goes by its rate.
+        assert_eq!(
+            Codec::listed(
+                &formats("9 97 98 3"),
+                &["9 speex/8000", "97 speex/16000", "98 speex/32000"]
+            ),
+            [(9, Codec::Speex), (97, Codec::SpeexWide), (3, Codec::Gsm)]
+        );
     }
 
     #[test]

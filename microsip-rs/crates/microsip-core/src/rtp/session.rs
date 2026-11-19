@@ -1118,12 +1118,13 @@ mod tests {
     #[test]
     fn receiver_knows_the_agreed_the_listed_and_the_fixed_payload_types() {
         let receiving = Receiving::new(Codec::G722, 9, vec![(107, Codec::Opus)]);
-        for known in [9, 107, 0, 8, 18] {
+        // GSM (3) has a number of its own, like G.711 and G.729.
+        for known in [9, 107, 0, 8, 18, 3] {
             assert!(receiving.knows(known), "{known}");
         }
-        // Keypad events, comfort noise, GSM and Opus's usual number, which
-        // this call did not agree on.
-        for unknown in [101, 13, 3, 111] {
+        // Keypad events, comfort noise, and the usual numbers of Opus and
+        // Speex, which this call did not agree on.
+        for unknown in [101, 13, 111, 97, 98] {
             assert!(!receiving.knows(unknown), "{unknown}");
         }
         // A number the other side gave another meaning keeps that meaning.

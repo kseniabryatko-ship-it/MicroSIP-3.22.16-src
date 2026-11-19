@@ -102,6 +102,23 @@ pub fn autostart_enabled() -> bool {
     platform::autostart_enabled()
 }
 
+/// Makes Windows open `tel:`, `sip:` and `callto:` links with this
+/// program, or stops that (only where they still open it).
+pub fn set_link_handler(enabled: bool) -> Result<(), String> {
+    platform::set_link_handler(enabled)
+}
+
+/// True when the links are registered to open this program.
+pub fn link_handler_enabled() -> bool {
+    platform::link_handler_enabled()
+}
+
+/// Opens the "Default apps" page of the Windows settings, where the user
+/// picks the program for each kind of link.
+pub fn open_default_apps() {
+    platform::open_default_apps();
+}
+
 /// Shows the system's "choose a folder" dialog. Blocks until it is closed.
 pub fn pick_folder() -> Option<PathBuf> {
     platform::dialog(
@@ -518,6 +535,67 @@ mod platform {
             .is_ok_and(|output| output.status.success())
     }
 
+    fn reg(arguments: &[String]) -> Result<(), String> {
+        let status = hidden("reg")
+            .args(arguments)
+            .status()
+            .map_err(|error| error.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("reg.exe finished with {status}"))
+        }
+    }
+
+    fn open_command(key: &str) -> Option<String> {
+        let output = hidden("reg")
+            .args(["query", &format!("{key}\\shell\\open\\command"), "/ve"])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    pub fn set_link_handler(enabled: bool) -> Result<(), String> {
+        let program = std::env::current_exe().map_err(|error| error.to_string())?;
+        let program = program.display().to_string();
+        if enabled {
+            for command in crate::links::registry_commands(&program, true) {
+                reg(&command)?;
+            }
+            return Ok(());
+        }
+        // Another program's links are left alone.
+        for scheme in crate::links::SCHEMES {
+            let key = crate::links::scheme_key(scheme);
+            if open_command(&key).is_some_and(|text| crate::links::owns_scheme(&text, &program)) {
+                let _ = reg(&["delete".to_owned(), key, "/f".to_owned()]);
+            }
+        }
+        // Deleting what is not there is not a failure for the user.
+        for command in crate::links::registry_commands(&program, false) {
+            let _ = reg(&command);
+        }
+        Ok(())
+    }
+
+    pub fn link_handler_enabled() -> bool {
+        let Ok(program) = std::env::current_exe() else {
+            return false;
+        };
+        let program = program.display().to_string();
+        open_command(&crate::links::scheme_key("tel"))
+            .is_some_and(|text| crate::links::owns_scheme(&text, &program))
+    }
+
+    pub fn open_default_apps() {
+        let _ = hidden("cmd")
+            .args(["/c", "start", "", "ms-settings:defaultapps"])
+            .spawn();
+    }
+
     /// Runs a Windows Forms dialog and returns the path it printed.
     pub fn dialog(script: &str) -> Option<PathBuf> {
         let script = format!(
@@ -556,6 +634,16 @@ mod platform {
     pub fn dialog(_script: &str) -> Option<PathBuf> {
         None
     }
+
+    pub fn set_link_handler(_enabled: bool) -> Result<(), String> {
+        Err("opening links is set up on Windows only".to_owned())
+    }
+
+    pub fn link_handler_enabled() -> bool {
+        false
+    }
+
+    pub fn open_default_apps() {}
 }
 
 #[cfg(test)]

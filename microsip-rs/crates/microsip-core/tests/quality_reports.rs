@@ -168,3 +168,47 @@ fn after_a_call_the_quality_includes_the_other_sides_view() {
     wait_for(&a, |event| *event == Event::Ended(EndReason::Completed));
     wait_for(&b, |event| *event == Event::Ended(EndReason::Completed));
 }
+
+#[test]
+fn a_connected_call_shows_a_green_lamp_and_none_on_hold() {
+    use microsip_core::live_quality::Lamp;
+    let a = phone(440.0);
+    let b = phone(1_000.0);
+    assert!(a.send(UiCommand::Dial(b.local_address())));
+    wait_for(&b, |event| matches!(event, Event::Incoming { .. }));
+    assert!(b.send(UiCommand::Answer));
+    wait_for(&a, |event| *event == Event::Established);
+    // The lamp comes every two seconds; on a clean loopback it is green and
+    // counts about a hundred packets.
+    for _ in 0..2 {
+        let Event::LiveQuality(live) = wait_for(&a, |event| matches!(event, Event::LiveQuality(_)))
+        else {
+            unreachable!();
+        };
+        assert_eq!(live.lamp, Lamp::Good, "{live:?}");
+        assert!((80..=120).contains(&live.received), "{live:?}");
+        assert_eq!(live.incoming_loss_percent, 0);
+    }
+    // On hold there is no sound to judge, and no lamp.
+    assert!(a.send(UiCommand::Hold(true)));
+    wait_for(&a, |event| *event == Event::Hold(true));
+    let quiet_until = Instant::now() + Duration::from_millis(4_500);
+    while Instant::now() < quiet_until {
+        if let Some(event) = a.wait_event(Duration::from_millis(50)) {
+            assert!(
+                !matches!(event, Event::LiveQuality(_)),
+                "lamp on hold: {event:?}"
+            );
+        }
+    }
+    // Resumed, it comes back green.
+    assert!(a.send(UiCommand::Hold(false)));
+    wait_for(&a, |event| *event == Event::Hold(false));
+    let Event::LiveQuality(live) = wait_for(&a, |event| matches!(event, Event::LiveQuality(_)))
+    else {
+        unreachable!();
+    };
+    assert_eq!(live.lamp, Lamp::Good, "{live:?}");
+    assert!(a.send(UiCommand::Hangup));
+    wait_for(&a, |event| *event == Event::Ended(EndReason::Completed));
+}

@@ -141,6 +141,10 @@ impl Phone {
                 println!("RTP sent: {sent}; RTP received: {received}");
             }
             Event::AudioQuality(quality) => println!("Audio quality: {quality}"),
+            Event::LiveQuality(live) => println!(
+                "Quality lamp: {:?} (incoming loss {}%, received {}, gaps {}, remote {:?})",
+                live.lamp, live.incoming_loss_percent, live.received, live.gaps, live.remote
+            ),
             Event::Caller { number, name } => println!("Caller: {number} {name}"),
             Event::Recording(Some(path)) => println!("Recording to {}", path.display()),
             Event::Recording(None) => println!("Recording stopped."),

@@ -1,3 +1,15 @@
 [workspace]
 resolver = "2"
 members = ["crates/microsip-core"]
+
+# Speech codecs do a lot of arithmetic per packet. Tests are built without
+# optimisation, which makes the Speex encoder too slow for a live call, so
+# the codec libraries are optimised there too.
+[profile.dev.package.oxideav-speex]
+opt-level = 3
+
+[profile.dev.package.oxideav-gsm]
+opt-level = 3
+
+[profile.dev.package.oxideav-core]
+opt-level = 3

@@ -23,6 +23,7 @@ use crate::call_media::{Media, MediaQuality};
 use crate::codec::Codec;
 use crate::dialog::{DialogConfig, EstablishedDialog};
 use crate::invite_control::{build_cancel, build_failure_ack};
+use crate::live_quality::{LiveQuality, QualityMeter};
 use crate::registration::{
     Account, Output, RETRY_DELAY, Registration, RegistrationState, add_rport,
 };
@@ -54,6 +55,8 @@ type Result<T> = std::result::Result<T, BoxError>;
 
 const TICK: Duration = Duration::from_millis(10);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// How often the quality lamp of a connected call is brought up to date.
+const QUALITY_LOOK: Duration = Duration::from_secs(2);
 /// How often the route to the server is looked at for a change of network.
 const NETWORK_CHECK: Duration = Duration::from_secs(3);
 /// Pause before a lost connection to the server is made again.
@@ -216,6 +219,9 @@ pub enum Event {
     /// How well the received audio played, sent just before the media stops
     /// when real audio was used.
     AudioQuality(MediaQuality),
+    /// What the last seconds of the connected call were like: the quality
+    /// lamp. Sent every couple of seconds while audio flows both ways.
+    LiveQuality(LiveQuality),
     /// The call is now on hold by this phone (`true`) or resumed.
     Hold(bool),
     /// The other side put the call on hold (`true`) or resumed it.
@@ -614,6 +620,10 @@ struct Line<M: Media> {
     pending: VecDeque<Input>,
     /// An incoming call is ringing here.
     rings: bool,
+    /// Follows the call's audio for the quality lamp.
+    meter: QualityMeter,
+    /// When the lamp is next brought up to date; `None` without audio.
+    next_quality: Option<Instant>,
 }
 
 impl<M: Media> Line<M> {
@@ -625,6 +635,8 @@ impl<M: Media> Line<M> {
             media_running: false,
             pending: VecDeque::new(),
             rings: false,
+            meter: QualityMeter::new(),
+            next_quality: None,
         }
     }
 }
@@ -773,7 +785,7 @@ impl<M: Media> Runner<M> {
             told_line: std::cell::Cell::new(0),
             conference: false,
             forward_to: None,
-            codecs: Codec::PREFERRED.to_vec(),
+            codecs: Codec::DEFAULT.to_vec(),
             encryption: MediaEncryption::Off,
             subscriptions: Vec::new(),
             watched: Vec::new(),
@@ -836,6 +848,7 @@ impl<M: Media> Runner<M> {
             for line in 0..self.lines.len() {
                 self.cur = line;
                 self.pump_media();
+                self.look_at_quality();
             }
             self.tick_timers();
             for line in 0..self.lines.len() {
@@ -996,7 +1009,7 @@ impl<M: Media> Runner<M> {
             UiCommand::Codecs(codecs) => {
                 // The phone is never left without a codec.
                 self.codecs = if codecs.is_empty() {
-                    Codec::PREFERRED.to_vec()
+                    Codec::DEFAULT.to_vec()
                 } else {
                     codecs
                 };
@@ -1063,7 +1076,36 @@ impl<M: Media> Runner<M> {
     fn stop_media(&mut self) {
         self.lines[self.cur].media.stop();
         self.lines[self.cur].media_running = false;
+        self.lines[self.cur].next_quality = None;
         self.set_rings(false);
+    }
+
+    /// Brings the quality lamp of the current line up to date when it is
+    /// time. A call on hold carries no sound to judge, so the counting
+    /// starts over once it is resumed.
+    fn look_at_quality(&mut self) {
+        let now = Instant::now();
+        let line = &mut self.lines[self.cur];
+        let Some(due) = line.next_quality else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        line.next_quality = Some(now + QUALITY_LOOK);
+        let held = line
+            .call
+            .as_ref()
+            .is_some_and(|call| call.local_hold || call.remote_hold);
+        if !line.media_running || line.engine.state() != State::Established || held {
+            line.meter.reset();
+            return;
+        }
+        let Some(quality) = line.media.quality() else {
+            return;
+        };
+        let live = line.meter.look(quality, line.media.stats());
+        self.emit(Event::LiveQuality(live));
     }
 
     /// Starts or stops the phone's own ringing. A phone that cannot ring
@@ -2097,7 +2139,10 @@ impl<M: Media> Runner<M> {
                 };
                 match started {
                     Ok(()) => {
-                        self.lines[self.cur].media_running = true;
+                        let line = &mut self.lines[self.cur];
+                        line.media_running = true;
+                        line.meter.reset();
+                        line.next_quality = Some(Instant::now() + QUALITY_LOOK);
                         self.emit(Event::Codec(codec));
                         self.emit(Event::Encrypted(encrypted));
                     }
@@ -3693,6 +3738,9 @@ fn server_target(text: &str, domain: &str) -> Result<String> {
 const OFFERED_DTMF_PAYLOAD_TYPE: u8 = 101;
 /// Payload type offered for telephone-event on the 48 kHz clock of Opus.
 const OFFERED_WIDE_DTMF_PAYLOAD_TYPE: u8 = 102;
+/// Payload type offered for telephone-event on the 16 kHz clock of
+/// wideband Speex.
+const OFFERED_SPEEX_WIDE_DTMF_PAYLOAD_TYPE: u8 = 103;
 
 /// The first offer of a call: every codec this phone has, in its order of
 /// preference, and telephone-event.
@@ -3701,10 +3749,17 @@ fn offer_sdp(address: SocketAddr, codecs: &[Codec], crypto: Option<(&CryptoLine,
         .iter()
         .map(|codec| (*codec, codec.payload_type()))
         .collect();
-    // Digits are events on the clock of the voice: Opus runs at 48 kHz.
+    // Digits are events on the clock of the voice: Opus runs at 48 kHz,
+    // wideband Speex at 16 kHz.
     let mut events = vec![(OFFERED_DTMF_PAYLOAD_TYPE, 8_000)];
     if codecs.contains(&Codec::Opus) {
         events.push((OFFERED_WIDE_DTMF_PAYLOAD_TYPE, Codec::Opus.clock_rate()));
+    }
+    if codecs.contains(&Codec::SpeexWide) {
+        events.push((
+            OFFERED_SPEEX_WIDE_DTMF_PAYLOAD_TYPE,
+            Codec::SpeexWide.clock_rate(),
+        ));
     }
     make_sdp(address, &offered, &events, crypto, 1, "sendrecv")
 }
@@ -3925,7 +3980,7 @@ mod tests {
         let address = "192.0.2.5:40000".parse().unwrap();
         let offer = offer_sdp(address, &Codec::PREFERRED, None);
         assert!(
-            offer.contains("m=audio 40000 RTP/AVP 0 8 9 111 18 101 102\r\n"),
+            offer.contains("m=audio 40000 RTP/AVP 0 8 9 111 18 3 97 98 101 102 103\r\n"),
             "{offer}"
         );
         assert!(offer.contains(
@@ -3933,9 +3988,14 @@ mod tests {
              a=rtpmap:111 opus/48000/2\r\na=fmtp:111 useinbandfec=1"
         ));
         assert!(offer.contains("a=rtpmap:18 G729/8000\r\na=fmtp:18 annexb=no\r\n"));
-        // Digits for the 8 kHz codecs and for the 48 kHz clock of Opus.
+        assert!(offer.contains(
+            "a=rtpmap:3 GSM/8000\r\na=rtpmap:97 speex/8000\r\na=rtpmap:98 speex/16000\r\n"
+        ));
+        // Digits for the 8 kHz codecs, the 48 kHz clock of Opus and the
+        // 16 kHz clock of wideband Speex.
         assert!(offer.contains("a=rtpmap:101 telephone-event/8000\r\n"));
         assert!(offer.contains("a=rtpmap:102 telephone-event/48000\r\n"));
+        assert!(offer.contains("a=rtpmap:103 telephone-event/16000\r\n"));
 
         // Only what the user left switched on is offered, in their order.
         let narrow = offer_sdp(address, &[Codec::Pcma, Codec::Pcmu], None);
@@ -3944,6 +4004,7 @@ mod tests {
             "{narrow}"
         );
         assert!(!narrow.contains("opus") && !narrow.contains("48000"));
+        assert!(!narrow.contains("16000"));
 
         let answer = make_sdp(address, &[(Codec::Pcma, 8)], &[], None, 1, "sendrecv");
         assert!(answer.contains("m=audio 40000 RTP/AVP 8\r\n"), "{answer}");
@@ -3999,15 +4060,17 @@ mod tests {
         assert_eq!(agreed("18 9", true, &all), Ok((Codec::G722, 9)));
         // Nothing in common, or nothing the user allows.
         assert!(
-            agreed("3 4", true, &all)
+            agreed("4 5", true, &all)
                 .unwrap_err()
                 .contains("no common codec")
         );
-        assert!(agreed("3 4", false, &all).is_err());
+        assert!(agreed("4 5", false, &all).is_err());
+        // GSM has the fixed number 3.
+        assert_eq!(agreed("3 4", true, &all), Ok((Codec::Gsm, 3)));
         assert!(agreed("0 8", true, &[Codec::G729]).is_err());
 
         // Everything of ours they list is remembered for receiving.
-        let listed = negotiate(sdp("9 107 3 0").as_bytes(), true, &all)
+        let listed = negotiate(sdp("9 107 4 0").as_bytes(), true, &all)
             .unwrap()
             .listed;
         assert_eq!(

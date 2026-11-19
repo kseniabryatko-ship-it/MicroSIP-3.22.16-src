@@ -14,6 +14,8 @@ use microsip_core::chat::{Chat, ChatMessage};
 use microsip_core::codec::Codec;
 use microsip_core::contacts::{Contacts, dialable};
 use microsip_core::history::{CallRecord, Direction, History};
+use microsip_core::links::{self, Instance, Request as LinkRequest};
+use microsip_core::live_quality::{Lamp, LiveQuality};
 use microsip_core::localtime::{
     DateTime, format_duration, format_timestamp, now_unix, utc_offset_seconds,
 };
@@ -34,13 +36,17 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const LOG_LIMIT: usize = 1_000;
 const WINDOW_TITLE: &str = "MicroSIP Rust";
+/// How long a number from a link or the command line waits for the phone
+/// to get registered before it is only left in the number field.
+const LINK_WAIT: Duration = Duration::from_secs(20);
 /// Contacts offered under the number while it is typed.
 const SUGGESTIONS: usize = 4;
 const KEYPAD: [&str; 4] = ["123", "456", "789", "*0#"];
@@ -100,6 +106,8 @@ enum Action {
     /// Shows a system dialog; its answer is taken when it closes.
     Browse(Dialog),
     Autostart(bool),
+    /// Open `tel:`, `sip:` and `callto:` links with this program, or not.
+    LinkHandler(bool),
     /// The codecs or their order were changed.
     CodecsChanged,
     /// A box of the "Window" settings was changed.
@@ -212,6 +220,12 @@ struct PhoneWindow {
     hotkeys: bool,
     light_theme: bool,
     autostart: bool,
+    /// Windows opens call links with this program.
+    link_handler: bool,
+    /// Takes the numbers that later copies of the program hand over.
+    instance: Option<Instance>,
+    /// A number from a link waiting for the registration, and until when.
+    link_target: Option<(String, Instant)>,
     /// Started with Windows: the window goes out of the way once drawn.
     start_hidden: bool,
     /// A system dialog that is open now, and what it answers.
@@ -270,7 +284,12 @@ struct PhoneWindow {
 }
 
 impl PhoneWindow {
-    fn new(ctx: &egui::Context, start_hidden: bool) -> Self {
+    fn new(
+        ctx: &egui::Context,
+        start_hidden: bool,
+        instance: Option<Instance>,
+        start_target: Option<String>,
+    ) -> Self {
         let settings_path = settings::default_path();
         let sibling = |name: &str| settings_path.as_ref().map(|path| path.with_file_name(name));
         let history_path = sibling("history.tsv");
@@ -357,6 +376,9 @@ impl PhoneWindow {
             hotkeys: saved.hotkeys,
             light_theme: saved.light_theme,
             autostart: winshell::autostart_enabled(),
+            link_handler: winshell::link_handler_enabled(),
+            instance,
+            link_target: start_target.map(|target| (target.clone(), Instant::now() + LINK_WAIT)),
             start_hidden,
             dialog: None,
             last_dialled,
@@ -713,6 +735,52 @@ impl PhoneWindow {
         }
     }
 
+    /// Numbers from links and the command line, and requests of later
+    /// copies of the program to come to the front.
+    fn take_links(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let requests = self
+            .instance
+            .as_ref()
+            .map(Instance::requests)
+            .unwrap_or_default();
+        for request in requests {
+            self.bring_forward(ctx);
+            if let LinkRequest::Dial(target) = request {
+                self.log(format!("Номер из ссылки: {target}"));
+                self.link_target = Some((target, Instant::now() + LINK_WAIT));
+            }
+        }
+        let Some((target, deadline)) = self.link_target.take() else {
+            return;
+        };
+        // The number is shown at once; it is dialled as soon as the phone
+        // can, as MicroSIP does.
+        if self.number != target && self.lines[self.at].view.can_dial() {
+            self.number = target.clone();
+            self.number_changed = true;
+            self.tab = Tab::Dialpad;
+        }
+        let direct = target.parse::<SocketAddr>().is_ok();
+        if (self.is_online() || direct) && self.handle.is_some() {
+            actions.push(Action::Call(target));
+        } else if Instant::now() < deadline {
+            self.link_target = Some((target, deadline));
+        } else {
+            self.log("Номер из ссылки не набран: нет регистрации на сервере");
+        }
+    }
+
+    /// Shows the window, also from the tray, on top of the others.
+    fn bring_forward(&mut self, ctx: &egui::Context) {
+        self.start_hidden = false;
+        if let Some(shell) = self.shell.as_ref() {
+            shell.show_window();
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
     fn is_online(&self) -> bool {
         matches!(
             self.registration,
@@ -1056,7 +1124,8 @@ impl PhoneWindow {
                     peer,
                     text,
                 } => self.trace(outgoing, peer, &text),
-                Event::Line(_) | Event::Codec(_) | Event::Encrypted(_) => {}
+                // The call view keeps the lamp; the window draws it.
+                Event::Line(_) | Event::Codec(_) | Event::Encrypted(_) | Event::LiveQuality(_) => {}
                 Event::Voicemail(voicemail) => {
                     if voicemail.new > self.voicemail.map_or(0, |known| known.new) {
                         self.log(format!("Новых голосовых сообщений: {}", voicemail.new));
@@ -1262,6 +1331,13 @@ impl PhoneWindow {
                 Err(error) => {
                     self.autostart = winshell::autostart_enabled();
                     self.error(format!("Не удалось изменить автозапуск: {error}"));
+                }
+            },
+            Action::LinkHandler(on) => match winshell::set_link_handler(on) {
+                Ok(()) => self.link_handler = winshell::link_handler_enabled(),
+                Err(error) => {
+                    self.link_handler = winshell::link_handler_enabled();
+                    self.error(format!("Не удалось настроить открытие ссылок: {error}"));
                 }
             },
             Action::WindowChanged => self.save_settings(),
@@ -2244,7 +2320,22 @@ impl PhoneWindow {
                 _ => phase_text(phase).to_owned(),
             };
             ui.label(egui::RichText::new(who).size(18.0));
-            ui.label(state);
+            let live = self.lines[self.at]
+                .view
+                .live_quality()
+                .filter(|_| phase == Phase::Connected);
+            ui.horizontal_wrapped(|ui| {
+                // The quality lamp, as in MicroSIP: green, yellow or red,
+                // with the numbers under the mouse.
+                if let Some(live) = live {
+                    let (color, meaning) = quality_look(live.lamp);
+                    let (dot, response) =
+                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 6.0, color);
+                    response.on_hover_text(quality_details(&live, meaning));
+                }
+                ui.label(state);
+            });
             if let Some(at) = self.lines[self.at].answer_at {
                 let left = at.saturating_duration_since(Instant::now()).as_secs() + 1;
                 ui.label(format!("Автоответ через {left} с"));
@@ -2746,6 +2837,22 @@ if self.transport == SipTransport::Tls {
                             {
                                 actions.push(Action::Autostart(autostart));
                             }
+                            let mut links = self.link_handler;
+                            if ui
+                                .checkbox(&mut links, "Открывать ссылки tel:, sip: и callto:")
+                                .changed()
+                            {
+                                actions.push(Action::LinkHandler(links));
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                ui.weak(
+                                    "Если по ссылке открывается другая программа, выберите \
+                                     MicroSIP-Rust для TEL и SIP в «Приложениях по умолчанию».",
+                                );
+                                if ui.small_button("Открыть").clicked() {
+                                    winshell::open_default_apps();
+                                }
+                            });
                             ui.checkbox(&mut self.hotkeys, "Горячие клавиши в любой программе");
                             ui.weak(
                                 "Ctrl+Alt+PageUp — ответить, Ctrl+Alt+PageDown — завершить или \
@@ -2978,6 +3085,39 @@ fn result_text(code: &str) -> Option<String> {
     })
 }
 
+/// The colour of the call-quality lamp and what it means.
+fn quality_look(lamp: Lamp) -> (egui::Color32, &'static str) {
+    match lamp {
+        Lamp::Good => (egui::Color32::from_rgb(60, 180, 75), "Связь хорошая"),
+        Lamp::Fair => (egui::Color32::from_rgb(230, 160, 0), "Связь с помехами"),
+        Lamp::Poor => (egui::Color32::from_rgb(210, 50, 50), "Связь плохая"),
+    }
+}
+
+/// The numbers behind the quality lamp, for its hover text.
+fn quality_details(live: &LiveQuality, meaning: &str) -> String {
+    let mut text = format!(
+        "{meaning}\nПотеряно входящих пакетов: {} %",
+        live.incoming_loss_percent
+    );
+    if live.received == 0 {
+        text.push_str("\nОт собеседника не приходит звук");
+    }
+    if live.gaps > 0 {
+        text.push_str(&format!("\nПерерывов в звуке: {}", live.gaps));
+    }
+    if let Some(remote) = live.remote {
+        text.push_str(&format!(
+            "\nУ собеседника потеряно: {} %\nДжиттер: {} мс",
+            remote.lost_percent, remote.jitter_ms
+        ));
+        if let Some(round_trip) = remote.round_trip_ms {
+            text.push_str(&format!("\nЗадержка туда и обратно: {round_trip} мс"));
+        }
+    }
+    text
+}
+
 /// The colour of a busy lamp and what it means.
 fn lamp_look(state: LineState) -> (egui::Color32, &'static str) {
     match state {
@@ -3004,6 +3144,9 @@ fn codec_note(codec: Codec) -> &'static str {
         Codec::G722 => "чистый широкополосный звук",
         Codec::Opus => "широкополосный, стойкий к потерям",
         Codec::G729 => "для медленных каналов",
+        Codec::Gsm => "старые АТС и GSM-шлюзы",
+        Codec::Speex => "экономный, 15 кбит/с",
+        Codec::SpeexWide => "широкополосный Speex",
     }
 }
 
@@ -3060,6 +3203,7 @@ impl eframe::App for PhoneWindow {
         ctx.request_repaint_after(Duration::from_millis(100));
         let mut actions = Vec::new();
         self.keys_and_tray(ctx, &mut actions);
+        self.take_links(ctx, &mut actions);
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -3117,8 +3261,31 @@ impl eframe::App for PhoneWindow {
 }
 
 fn main() -> eframe::Result<()> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
     // Windows starts the phone with this word when it starts by itself.
-    let start_hidden = std::env::args().any(|argument| argument == "--minimized");
+    let start_hidden = arguments.iter().any(|argument| argument == "--minimized");
+    // A link (`tel:2205`) or a number to call.
+    let start_target = arguments
+        .iter()
+        .find_map(|argument| links::target_from_argument(argument));
+    // Only one copy runs: a later one hands its number over and exits.
+    let window_context: Arc<OnceLock<egui::Context>> = Arc::default();
+    let wake = {
+        let window_context = Arc::clone(&window_context);
+        move || {
+            if let Some(context) = window_context.get() {
+                context.request_repaint();
+            }
+        }
+    };
+    let settings_dir = settings::default_path().and_then(|path| path.parent().map(Path::to_owned));
+    let instance = match settings_dir {
+        Some(dir) => match links::start(&dir, start_target.clone().map(LinkRequest::Dial), wake) {
+            links::Start::Handed => return Ok(()),
+            links::Start::First(instance) => Some(instance),
+        },
+        None => None,
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([400.0, 640.0])
@@ -3129,6 +3296,14 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         WINDOW_TITLE,
         options,
-        Box::new(move |creation| Ok(Box::new(PhoneWindow::new(&creation.egui_ctx, start_hidden)))),
+        Box::new(move |creation| {
+            let _ = window_context.set(creation.egui_ctx.clone());
+            Ok(Box::new(PhoneWindow::new(
+                &creation.egui_ctx,
+                start_hidden,
+                instance,
+                start_target,
+            )))
+        }),
     )
 }
