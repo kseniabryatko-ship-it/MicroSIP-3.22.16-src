@@ -2,12 +2,13 @@
 resolver = "2"
 members = ["crates/microsip-core"]
 
-# The program people run: the whole program is optimised as one piece and
-# the names kept for debugging are left out. It comes out about half the
-# size and needs a little less memory; building takes a minute longer.
+# The program people run: optimised across its libraries and without the
+# names kept for debugging, so it comes out smaller. "thin" does this in
+# pieces on every core of the computer at once (Cargo counts them itself),
+# so a build stays quick; the program is a little larger than with the
+# slow whole-program setting, about 10 MB instead of 8.
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
 strip = true
 
 # Speech codecs do a lot of arithmetic per packet. Tests are built without

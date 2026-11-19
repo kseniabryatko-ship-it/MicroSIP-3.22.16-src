@@ -65,34 +65,39 @@ impl Server {
         self.socket.local_addr().unwrap()
     }
 
-    fn receive(&self) -> (Message, SocketAddr) {
+    /// The next datagram; `wanted` and what was skipped so far tell, if
+    /// none comes, what the test was waiting for.
+    fn receive(&self, wanted: &str, skipped: &[String]) -> (Message, SocketAddr) {
         let mut buffer = [0_u8; 65_535];
-        let (length, source) = self
-            .socket
-            .recv_from(&mut buffer)
-            .expect("expected a datagram");
+        let (length, source) = self.socket.recv_from(&mut buffer).unwrap_or_else(|error| {
+            panic!("no {wanted} came ({error}); before that came: {skipped:?}")
+        });
         let text = std::str::from_utf8(&buffer[..length]).unwrap();
         (Message::parse(text).unwrap(), source)
     }
 
     /// Next request with this method; other datagrams are skipped.
     fn request(&self, method: &str) -> (Request, SocketAddr) {
+        let mut skipped = Vec::new();
         loop {
-            if let (Message::Request(request), source) = self.receive()
-                && request.method.as_str() == method
-            {
-                return (request, source);
+            match self.receive(method, &skipped) {
+                (Message::Request(request), source) if request.method.as_str() == method => {
+                    return (request, source);
+                }
+                (other, _) => skipped.push(first_line(&other)),
             }
         }
     }
 
     /// Next response with this status; other datagrams are skipped.
     fn response(&self, status: u16) -> Response {
+        let mut skipped = Vec::new();
         loop {
-            if let (Message::Response(response), _) = self.receive()
-                && response.status_code == status
-            {
-                return response;
+            match self.receive(&format!("response {status}"), &skipped) {
+                (Message::Response(response), _) if response.status_code == status => {
+                    return response;
+                }
+                (other, _) => skipped.push(first_line(&other)),
             }
         }
     }
@@ -177,6 +182,22 @@ impl Server {
             handle,
             Event::Registration(RegistrationState::Registered { expires: 3600 }),
         );
+    }
+}
+
+/// `INVITE 1` or `407 INVITE`: enough to tell what a skipped datagram was.
+fn first_line(message: &Message) -> String {
+    match message {
+        Message::Request(request) => format!(
+            "{} {}",
+            request.method.as_str(),
+            request.headers.get("cseq").unwrap_or("")
+        ),
+        Message::Response(response) => format!(
+            "{} {}",
+            response.status_code,
+            response.headers.get("cseq").unwrap_or("")
+        ),
     }
 }
 

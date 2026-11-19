@@ -1260,6 +1260,7 @@ impl PhoneWindow {
             name: call.name,
             recording: call.recording,
             result: result_code(reason, call.incoming, call.connected.is_some()),
+            ended: now_unix(),
         });
         self.save_history();
     }
@@ -1367,6 +1368,7 @@ impl PhoneWindow {
                         name,
                         recording: String::new(),
                         result: "dnd".to_owned(),
+                        ended: now_unix(),
                     });
                     self.save_history();
                 }
@@ -1564,6 +1566,7 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
                         name,
                         recording: String::new(),
                         result: format!("forwarded {to}"),
+                        ended: now_unix(),
                     });
                     self.save_history();
                 }
@@ -1922,6 +1925,7 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
             headings: [
                 tr!("Дата", "Date"),
                 tr!("Время", "Time"),
+                tr!("Окончание", "Ended"),
                 tr!("Направление", "Direction"),
                 tr!("Номер", "Number"),
                 tr!("Имя", "Name"),
@@ -3710,8 +3714,9 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                     };
                     ui.horizontal_wrapped(|ui| {
                         ui.weak(format!(
-                            "{}{length}",
-                            format_timestamp(record.time, self.utc_offset)
+                            "{}{}{length}",
+                            format_timestamp(record.time, self.utc_offset),
+                            end_text(record.time, record.ended, self.utc_offset)
                         ));
                         // Why the call did not take place, as MicroSIP shows it.
                         if let Some(why) = result_text(&record.result) {
@@ -4660,6 +4665,22 @@ fn paint_band(painter: &egui::Painter, rect: egui::Rect, colors: &Palette) {
     painter.add(egui::Shape::mesh(mesh));
 }
 
+/// ` – 14:35` after the start of a call in the list: when it ended, with
+/// the date when that was another day; nothing when it was not noted.
+fn end_text(started: u64, ended: u64, offset: i64) -> String {
+    if ended == 0 {
+        return String::new();
+    }
+    let start = format_timestamp(started, offset);
+    let end = format_timestamp(ended, offset);
+    match (start.split_once(' '), end.split_once(' ')) {
+        (Some((start_day, _)), Some((end_day, clock))) if start_day == end_day => {
+            format!(" – {clock}")
+        }
+        _ => format!(" – {end}"),
+    }
+}
+
 /// The picture of the top band, built into the program.
 const HEADER_PICTURE: &[u8] = include_bytes!("../../assets/header-logo.png");
 
@@ -5223,6 +5244,18 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_end_of_a_call_follows_its_start() {
+        // 19.11.2026 14:30 in Moscow.
+        let start = 1_795_087_800;
+        assert_eq!(end_text(start, 0, 3 * 3_600), "");
+        assert_eq!(end_text(start, start + 302, 3 * 3_600), " – 14:35");
+        assert_eq!(
+            end_text(start, start + 10 * 3_600, 3 * 3_600),
+            " – 20.11.2026 00:30"
+        );
+    }
 
     #[test]
     fn failed_calls_say_what_the_code_means() {

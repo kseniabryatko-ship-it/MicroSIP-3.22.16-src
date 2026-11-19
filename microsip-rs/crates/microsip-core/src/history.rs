@@ -1,9 +1,9 @@
 //! The list of recent calls, kept in a plain text file next to the settings.
 //!
 //! One call per line, fields separated by tabs:
-//! `time  direction  seconds  number  name  recording  result`. The last
-//! fields (the recording's file path, why the call did not take place) may
-//! be missing. Unreadable lines are skipped, so a damaged file loses those
+//! `time  direction  seconds  number  name  recording  result  ended`. The
+//! last fields (the recording's file path, why the call did not take place,
+//! when it ended) may be missing. Unreadable lines are skipped, so a damaged file loses those
 //! calls only.
 
 use std::fs;
@@ -57,6 +57,9 @@ pub struct CallRecord {
     /// `cancelled`, `timeout`, `failed`, `declined`, `dnd`, or
     /// `forwarded NUMBER`. Empty for a call that went normally.
     pub result: String,
+    /// End of the call, seconds since 1970-01-01 UTC; zero for calls kept
+    /// by older versions, which did not note it.
+    pub ended: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -105,6 +108,10 @@ impl History {
                 let name = fields.next().unwrap_or("").trim().to_owned();
                 let recording = fields.next().unwrap_or("").trim().to_owned();
                 let result = fields.next().unwrap_or("").trim().to_owned();
+                let ended = fields
+                    .next()
+                    .and_then(|ended| ended.trim().parse().ok())
+                    .unwrap_or(0);
                 (!number.is_empty()).then_some(CallRecord {
                     time,
                     direction,
@@ -113,6 +120,7 @@ impl History {
                     name,
                     recording,
                     result,
+                    ended,
                 })
             })
             .collect();
@@ -124,9 +132,11 @@ impl History {
         self.records
             .iter()
             .map(|record| {
-                // The result only when there is one: files of calls that
-                // went normally look as they always did.
-                let result = if record.result.trim().is_empty() {
+                // The result only when there is one, and the end only when
+                // it is known: lines without them look as they always did.
+                let result = if record.ended > 0 {
+                    format!("\t{}\t{}", field(&record.result), record.ended)
+                } else if record.result.trim().is_empty() {
                     String::new()
                 } else {
                     format!("\t{}", field(&record.result))
@@ -214,8 +224,8 @@ impl CallRecord {
 
 /// The words of a call table, in the window's language.
 pub struct TableWords<'a> {
-    /// Date, time, direction, number, name, length, status, reason.
-    pub headings: [&'a str; 8],
+    /// Date, time, end, direction, number, name, length, status, reason.
+    pub headings: [&'a str; 9],
     /// Outgoing, incoming, missed.
     pub directions: [&'a str; 3],
     /// Answered, not answered, failed.
@@ -227,7 +237,9 @@ pub struct TableWords<'a> {
 impl History {
     /// The whole list as a table for Excel: newest call first, in UTF-8
     /// with the mark Excel needs, `;` between columns. The date and the
-    /// time of day are local (`offset` seconds from UTC); the length is
+    /// times of day are local (`offset` seconds from UTC); the end is
+    /// empty when it was not noted, and has its date when it fell on
+    /// another day than the start; the length is
     /// `H:MM:SS` and empty without a conversation. Numbers are written so
     /// that Excel keeps them as text (no 7,92E+10, no lost leading zero).
     pub fn to_csv(&self, offset: i64, words: &TableWords<'_>) -> String {
@@ -268,9 +280,26 @@ impl History {
             } else {
                 csv_cell(&record.number)
             };
+            let date = |time: &crate::localtime::DateTime| {
+                format!("{:02}.{:02}.{}", time.day, time.month, time.year)
+            };
+            let clock = |time: &crate::localtime::DateTime| {
+                format!("{:02}:{:02}:{:02}", time.hour, time.minute, time.second)
+            };
+            let end = if record.ended > 0 {
+                let end = crate::localtime::DateTime::from_unix(record.ended, offset);
+                if date(&end) == date(&time) {
+                    clock(&end)
+                } else {
+                    format!("{} {}", date(&end), clock(&end))
+                }
+            } else {
+                String::new()
+            };
             let cells = [
-                format!("{:02}.{:02}.{}", time.day, time.month, time.year),
-                format!("{:02}:{:02}:{:02}", time.hour, time.minute, time.second),
+                date(&time),
+                clock(&time),
+                end,
                 csv_cell(direction),
                 number,
                 csv_cell(&record.name),
@@ -298,6 +327,7 @@ mod tests {
             name: String::new(),
             recording: String::new(),
             result: result.to_owned(),
+            ended: 0,
         }
     }
 
@@ -323,18 +353,32 @@ mod tests {
 
     #[test]
     fn the_call_table_opens_in_excel_with_every_column() {
-        let mut history = History::default();
-        history.add(call(Direction::Outgoing, 0, "503"));
+        let mut failed = call(Direction::Outgoing, 0, "503");
+        failed.ended = failed.time + 1;
         let mut talked = call(Direction::Incoming, 3_725, "");
         talked.time += 60;
+        // Rang ten seconds, then the conversation.
+        talked.ended = talked.time + 10 + 3_725;
+        // A late call that ends after midnight, and one of an older
+        // version, whose end was not noted.
+        let mut late = call(Direction::Outgoing, 120, "");
+        late.time = 1_795_121_940; // 19.11.2026 23:59:00 in Moscow
+        late.ended = late.time + 125;
+        let mut old = call(Direction::Outgoing, 30, "");
+        old.time -= 60;
+        let mut history = History::default();
+        history.add(old);
         talked.number = "4010".to_owned();
         talked.name = "Анна; бухгалтерия".to_owned();
+        history.add(failed);
         history.add(talked);
+        history.add(late);
         let reason = |code: &str| (code == "503").then(|| "сервис недоступен (503)".to_owned());
         let words = TableWords {
             headings: [
                 "Дата",
                 "Время",
+                "Окончание",
                 "Направление",
                 "Номер",
                 "Имя",
@@ -351,18 +395,28 @@ mod tests {
         let lines: Vec<&str> = table.split("\r\n").collect();
         assert_eq!(
             lines[0],
-            "\u{feff}Дата;Время;Направление;Номер;Имя;Длительность;Статус;Причина"
+            "\u{feff}Дата;Время;Окончание;Направление;Номер;Имя;Длительность;Статус;Причина"
         );
-        // Newest first; a name with the separator is quoted.
+        // Newest first; the end has its date when it is on another day.
         assert_eq!(
             lines[1],
-            "19.11.2026;06:47:40;Входящий;=\"4010\";\"Анна; бухгалтерия\";1:02:05;Дозвон;"
+            "19.11.2026;23:59:00;20.11.2026 00:01:05;Исходящий;=\"79203181933\";;0:02:00;Дозвон;"
         );
+        // A name with the separator is quoted.
         assert_eq!(
             lines[2],
-            "19.11.2026;06:46:40;Исходящий;=\"79203181933\";;;Ошибка;сервис недоступен (503)"
+            "19.11.2026;06:47:40;07:49:55;Входящий;=\"4010\";\"Анна; бухгалтерия\";1:02:05;Дозвон;"
         );
-        assert_eq!(lines.len(), 4);
+        assert_eq!(
+            lines[3],
+            "19.11.2026;06:46:40;06:46:41;Исходящий;=\"79203181933\";;;Ошибка;сервис недоступен (503)"
+        );
+        // An end that was not noted is an empty cell.
+        assert_eq!(
+            lines[4],
+            "19.11.2026;06:45:40;;Исходящий;=\"79203181933\";;0:00:30;Дозвон;"
+        );
+        assert_eq!(lines.len(), 6);
     }
 
     fn record(time: u64, direction: Direction, number: &str) -> CallRecord {
@@ -374,6 +428,7 @@ mod tests {
             name: String::new(),
             recording: String::new(),
             result: String::new(),
+            ended: 0,
         }
     }
 
@@ -403,6 +458,7 @@ mod tests {
             name: "Иван Петров".to_owned(),
             recording: r"C:\Users\kseni\Documents\calls\2026-11-12_01-31-40_in_4010.wav".to_owned(),
             result: String::new(),
+            ended: 1_794_436_380,
         });
         history.add(record(
             1_794_436_400,
@@ -413,6 +469,8 @@ mod tests {
         let text = history.serialize();
         assert_eq!(text.lines().count(), 3);
         assert!(text.starts_with("1794436400\tmissed\t0\t+7 (901) 075-06-27\t\t\n"));
+        // The end follows an empty result.
+        assert!(text.contains("_in_4010.wav\t\t1794436380\n"), "{text}");
         assert!(text.contains("\tИван Петров\tC:\\Users\\kseni\\Documents\\calls\\"));
         assert_eq!(History::parse(&text), history);
     }
@@ -442,6 +500,7 @@ mod tests {
             name: "two\nlines".to_owned(),
             recording: String::new(),
             result: String::new(),
+            ended: 0,
         });
         let parsed = History::parse(&history.serialize());
         assert_eq!(parsed.records().len(), 1);
