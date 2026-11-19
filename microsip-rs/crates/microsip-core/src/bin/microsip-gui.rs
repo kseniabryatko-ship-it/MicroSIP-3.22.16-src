@@ -227,6 +227,8 @@ struct PhoneWindow {
     /// The keypad sounds its tones.
     key_tones_on: bool,
     key_tones: KeyTones,
+    /// When the key sounds' speaker was last asked to be ready.
+    key_tones_warmed: Option<Instant>,
     /// An incoming call shows a small window above everything.
     incoming_popup: bool,
     /// The user closed that window for the call ringing now.
@@ -548,6 +550,7 @@ impl PhoneWindow {
             extra_states: HashMap::new(),
             key_tones_on: saved.key_tones,
             key_tones: KeyTones::new(controls.clone()),
+            key_tones_warmed: None,
             incoming_popup: saved.incoming_popup,
             popup_dismissed: false,
             always_on_top: saved.always_on_top,
@@ -2658,6 +2661,16 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
     }
 
     fn dialpad_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        // The keypad is in sight: its sounds' speaker is kept awake, so the
+        // first key is heard whole (Windows needs a moment to wake one).
+        if self.key_tones_on
+            && self
+                .key_tones_warmed
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
+        {
+            self.key_tones.warm();
+            self.key_tones_warmed = Some(Instant::now());
+        }
         // Everything is sized from the room there is, so the window can be
         // made any size; when it is too small for even the smallest keys,
         // the page scrolls instead of being cut off.
