@@ -155,8 +155,18 @@ fn after_a_call_the_quality_includes_the_other_sides_view() {
     wait_for(&b, |event| matches!(event, Event::Incoming { .. }));
     assert!(b.send(UiCommand::Answer));
     wait_for(&a, |event| *event == Event::Established);
-    // The first reports go out a second into the call.
-    thread::sleep(Duration::from_millis(2_000));
+    // The first reports go out a second into the call; on a busy computer
+    // they can take longer, so the call lasts until the lamp shows one.
+    // The lamp comes every two seconds.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(Instant::now() < deadline, "no report from the other phone");
+        match a.wait_event(Duration::from_millis(50)) {
+            Some(Event::LiveQuality(live)) if live.remote.is_some() => break,
+            Some(Event::Error(message)) => panic!("executor reported an error: {message}"),
+            _ => {}
+        }
+    }
     assert!(a.send(UiCommand::Hangup));
     let quality = wait_for(&a, |event| matches!(event, Event::AudioQuality(_)));
     let Event::AudioQuality(quality) = quality else {

@@ -479,3 +479,22 @@ fn ringing_flag_is_up_only_while_an_incoming_call_rings() {
     wait_for(&b, Event::Ended(EndReason::Rejected(486)));
     assert!(ringing_becomes(&b, false));
 }
+
+#[test]
+fn the_window_is_woken_for_every_event() {
+    let (a, _) = default_phone();
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&wakes);
+    a.set_wake(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+    });
+    // Nothing happens: nobody is woken.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(wakes.load(Ordering::SeqCst), 0);
+    // A failed call is an error and an end: two events, two wakes, and
+    // each event is already waiting when its wake comes.
+    a.send(UiCommand::Dial("0.0.0.0:5060".parse().unwrap()));
+    assert!(matches!(a.wait_event(WAIT), Some(Event::Error(_))));
+    assert_eq!(a.wait_event(WAIT), Some(Event::Ended(EndReason::Failed)));
+    assert_eq!(wakes.load(Ordering::SeqCst), 2);
+}

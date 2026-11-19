@@ -4,9 +4,10 @@
 //!
 //! Windows needs a moment to wake a sound device, headsets most of all, and
 //! eats or garbles what is played in that moment. So the speaker is opened
-//! ahead of time, while the keypad is on the screen ([`KeyTones::warm`]),
-//! and kept open for a while after the last key; a freshly opened one gets
-//! a little silence before its first tone.
+//! ahead of time, while the user is at the window with the keypad
+//! ([`KeyTones::warm`]), and kept open for a minute after the last key or
+//! warm-up, then let go; a freshly opened one gets a little silence before
+//! its first tone.
 
 use crate::audio::Speaker;
 use crate::call_media::AudioControls;
@@ -110,7 +111,7 @@ impl KeyTones {
     }
 
     /// Opens the speaker now, so that the next key sounds at once and
-    /// whole; call it while the keypad is shown.
+    /// whole; call it while the user is at the keypad.
     pub fn warm(&self) {
         let _ = self.requests.send(Request::Warm);
     }

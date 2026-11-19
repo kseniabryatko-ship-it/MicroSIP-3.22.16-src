@@ -271,6 +271,20 @@ redistribution. No credentials should be stored in this directory.
         [Text.Encoding]::ASCII
     )
 
+    # Old packages pile up with every build: the three newest are kept.
+    $keep = 3
+    $old = Get-ChildItem -LiteralPath $output -Directory -Filter 'microsip-rs-gui-preview-*' |
+        Sort-Object Name -Descending | Select-Object -Skip $keep
+    foreach ($folder in $old) {
+        Remove-Item -LiteralPath $folder.FullName -Recurse -Force
+        foreach ($suffix in @('.zip', '.zip.sha256')) {
+            $file = $folder.FullName + $suffix
+            if (Test-Path -LiteralPath $file -PathType Leaf) {
+                Remove-Item -LiteralPath $file -Force
+            }
+        }
+    }
+
     Write-Host ''
     Write-Host 'PASS: checks, release build and GUI package creation.'
     Write-Host "Folder: $package"

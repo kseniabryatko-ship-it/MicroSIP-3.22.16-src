@@ -46,9 +46,9 @@ use std::error::Error;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -324,7 +324,30 @@ pub struct CallHandle {
     events: Receiver<Event>,
     local: SocketAddr,
     ringing: Arc<AtomicBool>,
+    wake: Wake,
     thread: Option<JoinHandle<()>>,
+}
+
+/// Who is told that an event is waiting, once it has been sent.
+type Wake = Arc<Mutex<Option<Box<dyn Fn() + Send>>>>;
+
+/// The executor's end of the event channel: each event also wakes the
+/// window, which then reads it, so the window need not keep looking.
+struct EventSender {
+    sender: Sender<Event>,
+    wake: Wake,
+}
+
+impl EventSender {
+    fn send(&self, event: Event) -> std::result::Result<(), mpsc::SendError<Event>> {
+        let sent = self.sender.send(event);
+        if let Ok(wake) = self.wake.lock()
+            && let Some(wake) = wake.as_ref()
+        {
+            wake();
+        }
+        sent
+    }
 }
 
 impl CallHandle {
@@ -333,6 +356,13 @@ impl CallHandle {
     /// to bring a hidden window back when someone calls.
     pub fn ringing_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.ringing)
+    }
+
+    /// `wake` is called, on the executor's thread, after every event.
+    pub fn set_wake(&self, wake: impl Fn() + Send + 'static) {
+        if let Ok(mut slot) = self.wake.lock() {
+            *slot = Some(Box::new(wake));
+        }
     }
 
     pub fn local_address(&self) -> SocketAddr {
@@ -430,6 +460,11 @@ where
 
     let ringing = Arc::new(AtomicBool::new(false));
     let shared_ringing = Arc::clone(&ringing);
+    let wake = Wake::default();
+    let event_sender = EventSender {
+        sender: event_sender,
+        wake: Arc::clone(&wake),
+    };
     let thread = thread::spawn(move || {
         let mut runner = Runner::new(socket, local, user, timers, make_medias(), event_sender);
         runner.ringing = shared_ringing;
@@ -441,6 +476,7 @@ where
         events: event_receiver,
         local,
         ringing,
+        wake,
         thread: Some(thread),
     })
 }
@@ -799,7 +835,7 @@ struct Runner<M: Media> {
     stun_rest_until: Option<Instant>,
     /// Shared with [`CallHandle::ringing_flag`].
     ringing: Arc<AtomicBool>,
-    events: Sender<Event>,
+    events: EventSender,
     registration: Option<Registration>,
     /// The account being kept registered, for registering again after the
     /// connection or the network was lost.
@@ -838,7 +874,7 @@ impl<M: Media> Runner<M> {
         user: String,
         timers: Timers,
         medias: Vec<M>,
-        events: Sender<Event>,
+        events: EventSender,
     ) -> Self {
         Self {
             socket,

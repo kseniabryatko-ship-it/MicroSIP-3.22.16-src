@@ -174,6 +174,7 @@ mod platform {
     use std::sync::{Arc, OnceLock};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         MOD_ALT, MOD_CONTROL, RegisterHotKey, VK_INSERT, VK_NEXT, VK_PRIOR,
     };
@@ -181,14 +182,14 @@ mod platform {
         NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-        DispatchMessageW, FindWindowW, FlashWindow, GetCursorPos, GetMessageW, HWND_MESSAGE,
-        HWND_NOTOPMOST, HWND_TOPMOST, IDI_APPLICATION, IsIconic, IsWindowVisible, LoadIconW,
-        MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_RESTORE,
-        SW_SHOW, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetTimer,
-        SetWindowPos, ShowWindow, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
-        WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER,
-        WNDCLASSW,
+        AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+        DestroyMenu, DispatchMessageW, FindWindowW, FlashWindow, GetCursorPos, GetMessageW,
+        GetSystemMetrics, HICON, HWND_MESSAGE, HWND_NOTOPMOST, HWND_TOPMOST, IDI_APPLICATION,
+        IsIconic, IsWindowVisible, LR_DEFAULTCOLOR, LoadIconW, MF_STRING, MSG, PostMessageW,
+        PostQuitMessage, RegisterClassW, SM_CXSMICON, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
+        TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
+        WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
     };
 
     /// Do not open a console window for helper programs.
@@ -236,6 +237,10 @@ mod platform {
         unsafe {
             if !visible {
                 ShowWindow(window, SW_HIDE);
+                // In the tray the window is not drawn: the memory the
+                // drawing held goes back to Windows, as MicroSIP's does.
+                // It is taken again, a little at a time, when needed.
+                SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
             } else {
                 let command = if IsIconic(window) != 0 {
                     SW_RESTORE
@@ -470,7 +475,10 @@ mod platform {
             icon.uID = 1;
             icon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
             icon.uCallbackMessage = TRAY_MESSAGE;
-            icon.hIcon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
+            icon.hIcon = tray_icon();
+            if icon.hIcon.is_null() {
+                icon.hIcon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
+            }
             for (slot, unit) in icon.szTip.iter_mut().zip(tip.encode_utf16().take(127)) {
                 *slot = unit;
             }
@@ -491,6 +499,53 @@ mod platform {
                 DispatchMessageW(&message);
             }
             Shell_NotifyIconW(NIM_DELETE, &icon);
+        }
+    }
+
+    /// The tray icon, NAVI on black, in the size the tray uses here.
+    fn tray_icon() -> HICON {
+        const SMALL: &[u8] = include_bytes!("../assets/tray-16.png");
+        const LARGE: &[u8] = include_bytes!("../assets/tray-32.png");
+        // SAFETY: only reads a system setting.
+        let wanted = unsafe { GetSystemMetrics(SM_CXSMICON) };
+        let png = if wanted <= 16 { SMALL } else { LARGE };
+        let Ok(picture) = image::load_from_memory_with_format(png, image::ImageFormat::Png) else {
+            return std::ptr::null_mut();
+        };
+        let picture = picture.to_rgba8();
+        let (width, height) = (picture.width(), picture.height());
+        // An icon as Windows keeps it in a program's resources: a header,
+        // the colours from the bottom row up (blue, green, red, alpha) and
+        // an empty mask, the transparency being in the alpha.
+        let mask_row = width.div_ceil(32) * 4;
+        let mut resource = Vec::new();
+        for value in [40, width, height * 2] {
+            resource.extend(value.to_le_bytes());
+        }
+        resource.extend(1_u16.to_le_bytes());
+        resource.extend(32_u16.to_le_bytes());
+        resource.extend(0_u32.to_le_bytes());
+        resource.extend((width * height * 4 + mask_row * height).to_le_bytes());
+        resource.extend([0; 16]);
+        for row in picture.rows().rev() {
+            for pixel in row {
+                let [red, green, blue, alpha] = pixel.0;
+                resource.extend([blue, green, red, alpha]);
+            }
+        }
+        resource.resize(resource.len() + (mask_row * height) as usize, 0);
+        // SAFETY: the buffer is a complete icon image as described above
+        // and lives until the call returns; the system copies it.
+        unsafe {
+            CreateIconFromResourceEx(
+                resource.as_ptr(),
+                resource.len() as u32,
+                1,
+                0x0003_0000,
+                width as i32,
+                height as i32,
+                LR_DEFAULTCOLOR,
+            )
         }
     }
 

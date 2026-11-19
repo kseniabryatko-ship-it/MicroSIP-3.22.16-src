@@ -2,6 +2,14 @@
 resolver = "2"
 members = ["crates/microsip-core"]
 
+# The program people run: the whole program is optimised as one piece and
+# the names kept for debugging are left out. It comes out about half the
+# size and needs a little less memory; building takes a minute longer.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
 # Speech codecs do a lot of arithmetic per packet. Tests are built without
 # optimisation, which makes the Speex encoder too slow for a live call, so
 # the codec libraries are optimised there too.

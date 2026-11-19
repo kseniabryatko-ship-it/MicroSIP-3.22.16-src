@@ -236,6 +236,9 @@ struct PhoneWindow {
     header_texture: Option<egui::TextureHandle>,
     /// When the key sounds' speaker was last asked to be ready.
     key_tones_warmed: Option<Instant>,
+    /// Asks the window to look again from other threads: the phone engine
+    /// and the system dialogs call it when they have news.
+    repaint: egui::Context,
     /// An incoming call shows a small window above everything.
     incoming_popup: bool,
     /// The user closed that window for the call ringing now.
@@ -560,6 +563,7 @@ impl PhoneWindow {
             key_tones_on: saved.key_tones,
             key_tones: KeyTones::new(controls.clone()),
             key_tones_warmed: None,
+            repaint: ctx.clone(),
             exiting: false,
             header_picture: saved.header_picture,
             header_texture: None,
@@ -867,6 +871,10 @@ impl PhoneWindow {
                 ));
             }
         };
+        // The window is drawn when something happens, not on a timer: the
+        // engine wakes it with each piece of news.
+        let repaint = self.repaint.clone();
+        handle.set_wake(move || repaint.request_repaint());
         let local = handle.local_address();
         self.log(tr!(
             format!("Телефон запущен на {local}"),
@@ -993,6 +1001,35 @@ impl PhoneWindow {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// How soon the window must look again even if nothing happens. News
+    /// from the phone, keys, the mouse, the tray and the dialogs wake it by
+    /// themselves; this is only for what changes with time alone. A window
+    /// at rest is drawn rarely, so it takes next to no processor time.
+    fn next_look(&self, ctx: &egui::Context) -> Duration {
+        if self.paste_requested.is_some() {
+            return Duration::from_millis(100);
+        }
+        // A number from a link waiting for the registration, a countdown
+        // to auto-answer.
+        if self.link_target.is_some() || self.lines.iter().any(|line| line.answer_at.is_some()) {
+            return Duration::from_millis(250);
+        }
+        // The call's clock counts seconds.
+        if self
+            .lines
+            .iter()
+            .any(|line| line.view.phase() != Phase::Idle)
+        {
+            return Duration::from_secs(1);
+        }
+        // Someone is at the window: the key sounds' speaker is kept ready.
+        if ctx.input(|input| input.focused) {
+            return Duration::from_secs(10);
+        }
+        // The greeting and "today" in the lists follow the clock.
+        Duration::from_secs(30)
     }
 
     fn is_online(&self) -> bool {
@@ -1790,6 +1827,7 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
             };
         }
         let (sender, receiver) = mpsc::channel();
+        let repaint = self.repaint.clone();
         std::thread::spawn(move || {
             let chosen = match dialog {
                 Dialog::RecordingsFolder => winshell::pick_folder(),
@@ -1799,6 +1837,7 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
                 Dialog::ExportHistory => winshell::pick_save_file(&history_file_name(), "csv"),
             };
             let _ = sender.send(chosen);
+            repaint.request_repaint();
         });
         self.dialog = Some((dialog, receiver));
     }
@@ -2581,9 +2620,16 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
     }
 
     fn dialpad_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        // The keypad is in sight: its sounds' speaker is kept awake, so the
-        // first key is heard whole (Windows needs a moment to wake one).
+        // The keypad is in sight and the user is at the window: its sounds'
+        // speaker is kept awake, so the first key is heard whole (Windows
+        // needs a moment to wake one). Away from the window the sound card
+        // is let go after a minute; calls have their own sound and are not
+        // affected.
+        let at_window = ui
+            .ctx()
+            .input(|input| input.focused || input.pointer.has_pointer());
         if self.key_tones_on
+            && at_window
             && self
                 .key_tones_warmed
                 .is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
@@ -4617,6 +4663,26 @@ fn paint_band(painter: &egui::Painter, rect: egui::Rect, colors: &Palette) {
 /// The picture of the top band, built into the program.
 const HEADER_PICTURE: &[u8] = include_bytes!("../../assets/header-logo.png");
 
+/// The windows' own icon: NAVI on black. Small, so it costs next to
+/// nothing; without it the window library unpacks a large one of its own.
+const WINDOW_ICON: &[u8] = include_bytes!("../../assets/icon-64.png");
+
+fn window_icon() -> Arc<egui::IconData> {
+    static ICON: OnceLock<Arc<egui::IconData>> = OnceLock::new();
+    ICON.get_or_init(|| {
+        let icon = image::load_from_memory_with_format(WINDOW_ICON, image::ImageFormat::Png)
+            .map(|decoded| decoded.to_rgba8())
+            .map(|decoded| egui::IconData {
+                width: decoded.width(),
+                height: decoded.height(),
+                rgba: decoded.into_raw(),
+            })
+            .unwrap_or_default();
+        Arc::new(icon)
+    })
+    .clone()
+}
+
 /// The band with the picture: black like the picture's own background,
 /// the picture whole on the right, where the text of the band leaves room
 /// and the card does not cover it.
@@ -4975,7 +5041,7 @@ impl eframe::App for PhoneWindow {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
         self.poll_dialog();
-        ctx.request_repaint_after(Duration::from_millis(100));
+        ctx.request_repaint_after(self.next_look(ctx));
         let mut actions = Vec::new();
         self.keys_and_tray(ctx, &mut actions);
         self.take_links(ctx, &mut actions);
@@ -5042,6 +5108,7 @@ impl PhoneWindow {
             .with_title(tr!("Входящий вызов", "Incoming call"))
             .with_inner_size(size)
             .with_resizable(false)
+            .with_icon(window_icon())
             .with_always_on_top();
         if let Some(screen) = screen {
             builder = builder.with_position(egui::pos2(
@@ -5132,6 +5199,7 @@ fn main() -> eframe::Result<()> {
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(window_icon())
             .with_inner_size([400.0, 640.0])
             // Any size from small to full screen; the window adapts.
             .with_min_inner_size([280.0, 360.0]),
