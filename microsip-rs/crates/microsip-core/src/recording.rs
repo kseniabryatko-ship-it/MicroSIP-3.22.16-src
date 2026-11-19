@@ -405,6 +405,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         let path = directory.join("nested").join("call.wav");
 
+        let started = Instant::now();
         let recorder = CallRecorder::start(&path).unwrap();
         assert_eq!(recorder.path(), path);
         let mut local = recorder.local_input();
@@ -416,6 +417,10 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         recorder.stop().unwrap();
+        // The file follows the clock, and a sleep may last longer than
+        // asked (Windows rounds 20 ms up to about 31): it is as long as the
+        // recording really took, give or take the writer's lag.
+        let seconds = started.elapsed().as_secs_f64();
 
         let bytes = fs::read(&path).unwrap();
         assert_eq!(&bytes[0..4], b"RIFF");
@@ -423,9 +428,14 @@ mod tests {
         assert_eq!(u32_at(&bytes, 24), RECORDING_RATE);
         let data = u32_at(&bytes, 40) as usize;
         assert_eq!(bytes.len(), 44 + data);
-        // About half a second of stereo frames (4 bytes each).
+        // Stereo frames of 4 bytes, about as many as the time it took.
         let frames = data / 4;
-        assert!((3_500..=6_000).contains(&frames), "{frames} frames");
+        let expected = seconds * f64::from(RECORDING_RATE);
+        let lag = 0.4 * f64::from(RECORDING_RATE);
+        assert!(
+            (expected - lag..=expected + 800.0).contains(&(frames as f64)),
+            "{frames} frames in {seconds:.2} s"
+        );
 
         // Both voices are in the file, each on its own channel.
         let left: Vec<i16> = (0..frames)

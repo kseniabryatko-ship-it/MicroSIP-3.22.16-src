@@ -230,6 +230,10 @@ struct PhoneWindow {
     key_tones: KeyTones,
     /// "Exit" was chosen in the menu: closing really closes.
     exiting: bool,
+    /// The band at the top shows the picture.
+    header_picture: bool,
+    /// The picture, once loaded into the window.
+    header_texture: Option<egui::TextureHandle>,
     /// When the key sounds' speaker was last asked to be ready.
     key_tones_warmed: Option<Instant>,
     /// An incoming call shows a small window above everything.
@@ -557,6 +561,8 @@ impl PhoneWindow {
             key_tones: KeyTones::new(controls.clone()),
             key_tones_warmed: None,
             exiting: false,
+            header_picture: saved.header_picture,
+            header_texture: None,
             incoming_popup: saved.incoming_popup,
             popup_dismissed: false,
             always_on_top: saved.always_on_top,
@@ -662,14 +668,44 @@ impl PhoneWindow {
     }
 
     fn apply_theme(&self, ctx: &egui::Context) {
-        ctx.set_visuals(if self.light_theme {
-            let mut light = egui::Visuals::light();
-            // White text fields are lost on the almost white window.
-            light.extreme_bg_color = egui::Color32::from_gray(228);
-            light
+        let colors = palette(self.light_theme);
+        let mut visuals = if self.light_theme {
+            egui::Visuals::light()
         } else {
             egui::Visuals::dark()
-        });
+        };
+        visuals.panel_fill = colors.page;
+        visuals.window_fill = colors.card;
+        visuals.extreme_bg_color = colors.key;
+        visuals.faint_bg_color = colors.key;
+        visuals.selection.bg_fill = colors.accent;
+        visuals.selection.stroke.color = egui::Color32::WHITE;
+        visuals.hyperlink_color = colors.accent;
+        visuals.window_corner_radius = egui::CornerRadius::same(14);
+        visuals.menu_corner_radius = egui::CornerRadius::same(10);
+        visuals.window_stroke = egui::Stroke::NONE;
+        let widgets = &mut visuals.widgets;
+        for state in [
+            &mut widgets.noninteractive,
+            &mut widgets.inactive,
+            &mut widgets.hovered,
+            &mut widgets.active,
+            &mut widgets.open,
+        ] {
+            state.corner_radius = egui::CornerRadius::same(10);
+        }
+        widgets.inactive.weak_bg_fill = colors.key;
+        widgets.inactive.bg_fill = colors.key;
+        widgets.inactive.bg_stroke = egui::Stroke::NONE;
+        widgets.inactive.fg_stroke.color = colors.text;
+        widgets.hovered.weak_bg_fill = colors.key_hover;
+        widgets.hovered.bg_fill = colors.key_hover;
+        widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, colors.accent);
+        widgets.active.weak_bg_fill = colors.key_hover;
+        widgets.active.bg_fill = colors.accent;
+        widgets.noninteractive.fg_stroke.color = colors.text;
+        widgets.noninteractive.bg_stroke.color = colors.line;
+        ctx.set_visuals(visuals);
     }
 
     /// A colour for marks and states that reads on the current theme.
@@ -728,6 +764,7 @@ impl PhoneWindow {
             key_tones: self.key_tones_on,
             incoming_popup: self.incoming_popup,
             always_on_top: self.always_on_top,
+            header_picture: self.header_picture,
             accounts: self.other_accounts.clone(),
         };
         if current == self.saved {
@@ -2391,58 +2428,6 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
 
     // ----- drawing -------------------------------------------------------
 
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
-        // A narrow window: the status on its own line, the buttons on the
-        // next one.
-        let narrow = ui.available_width() < 420.0;
-        ui.horizontal(|ui| {
-            let (color, text) = match self.registration.as_ref() {
-                Some(RegistrationState::Registered { .. }) => (
-                    egui::Color32::from_rgb(60, 180, 75),
-                    tr!("В сети", "Online").to_owned(),
-                ),
-                Some(RegistrationState::Registering) => {
-                    let yellow =
-                        self.tint(egui::Color32::YELLOW, egui::Color32::from_rgb(200, 140, 0));
-                    (yellow, tr!("Подключение…", "Connecting…").to_owned())
-                }
-                Some(state @ RegistrationState::Failed(_)) => {
-                    (egui::Color32::RED, registration_text(state))
-                }
-                Some(RegistrationState::Unregistered) | None => {
-                    (egui::Color32::GRAY, tr!("Не в сети", "Offline").to_owned())
-                }
-            };
-            // A drawn dot: the fonts have no glyph for a round bullet.
-            let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-            ui.painter().circle_filled(dot.center(), 5.0, color);
-            let user = self.user.trim();
-            // With several accounts the number is in the list next to it.
-            let status = if user.is_empty() || !self.other_accounts.is_empty() {
-                text
-            } else {
-                format!("{user} — {text}")
-            };
-            if narrow {
-                self.account_choice(ui);
-                ui.add(egui::Label::new(status).truncate());
-                return;
-            }
-            self.account_choice(ui);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.status_buttons(ui, true);
-                // The status takes the room that is left and is cut short
-                // rather than running under the buttons.
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.add(egui::Label::new(status).truncate());
-                });
-            });
-        });
-        if narrow {
-            ui.horizontal_wrapped(|ui| self.status_buttons(ui, false));
-        }
-    }
-
     /// With several accounts the active one is chosen here.
     fn account_choice(&mut self, ui: &mut egui::Ui) {
         if self.other_accounts.is_empty() {
@@ -2511,149 +2496,6 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 "Все аккаунты в сети; здесь — с какого номера звонить",
                 "All accounts are online; choose here which number calls go out from"
             ));
-    }
-
-    /// Log, voicemail, settings and do-not-disturb. `reversed` for a
-    /// right-to-left row, where the first one added is the rightmost.
-    fn status_buttons(&mut self, ui: &mut egui::Ui, reversed: bool) {
-        let mut order = [0, 1, 2, 3, 4];
-        if !reversed {
-            order.reverse();
-        }
-        for item in order {
-            match item {
-                0 => {
-                    // Settings, the log and staying on top live in one menu.
-                    ui.menu_button(tr!("Меню", "Menu"), |ui| {
-                        if ui.button(tr!("Настройки", "Settings")).clicked() {
-                            self.settings_open = !self.settings_open;
-                            ui.close_menu();
-                        }
-                        if ui.button(tr!("Журнал", "Log")).clicked() {
-                            self.log_open = !self.log_open;
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui
-                            .checkbox(
-                                &mut self.always_on_top,
-                                tr!("Поверх всех окон", "Always on top"),
-                            )
-                            .changed()
-                        {
-                            self.save_settings();
-                            ui.close_menu();
-                        }
-                        if ui
-                            .checkbox(&mut self.key_tones_on, tr!("Звук кнопок", "Keypad sounds"))
-                            .changed()
-                        {
-                            self.save_settings();
-                        }
-                        ui.separator();
-                        // Closes the program, not only the window: calls end
-                        // and the account goes off the exchange.
-                        if ui
-                            .button(tr!("Выход", "Exit"))
-                            .on_hover_text(tr!(
-                                "Закрыть программу полностью, а не свернуть в трей",
-                                "Close the program completely, not to the tray"
-                            ))
-                            .clicked()
-                        {
-                            self.exiting = true;
-                            self.save_settings();
-                            ui.close_menu();
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
-                }
-                1 => self.voicemail_button(ui),
-                2 => {}
-                3 => self.status_choice(ui),
-                _ => {
-                    let mut dnd = self.do_not_disturb;
-                    let label = if dnd {
-                        egui::RichText::new(tr!("Не беспокоить", "Do not disturb"))
-                            .color(egui::Color32::RED)
-                    } else {
-                        egui::RichText::new(tr!("Не беспокоить", "Do not disturb"))
-                    };
-                    if ui.checkbox(&mut dnd, label).changed() {
-                        self.pending_dnd = Some(dnd);
-                    }
-                }
-            }
-        }
-    }
-
-    /// The user's own status for colleagues, when statuses are on.
-    fn status_choice(&mut self, ui: &mut egui::Ui) {
-        if !self.presence_on {
-            return;
-        }
-        let before = self.my_status;
-        let hint = match self.status_refused.as_ref() {
-            Some(why) => tr!(
-                format!(
-                    "АТС не принимает статус ({why}). Коллеги видят только, свободен ли номер."
-                ),
-                format!(
-                    "The exchange does not take the status ({why}). Colleagues see only whether the number is free."
-                ),
-            ),
-            None => tr!(
-                "Ваш статус, который видят коллеги",
-                "Your status as colleagues see it"
-            )
-            .to_owned(),
-        };
-        egui::ComboBox::from_id_salt("my-status")
-            .selected_text(egui::RichText::new(status_text(self.my_status)).small())
-            .width(90.0)
-            .show_ui(ui, |ui| {
-                for status in PresenceStatus::ALL {
-                    ui.selectable_value(&mut self.my_status, status, status_text(status));
-                }
-            })
-            .response
-            .on_hover_text(hint);
-        if self.my_status != before {
-            self.send(UiCommand::Presence(Some(self.my_status)));
-            self.save_settings();
-        }
-    }
-
-    fn voicemail_button(&mut self, ui: &mut egui::Ui) {
-        let Some(voicemail) = self.voicemail else {
-            return;
-        };
-        let text = if voicemail.new > 0 {
-            egui::RichText::new(tr!(
-                format!("Почта: {}", voicemail.new),
-                format!("Voicemail: {}", voicemail.new),
-            ))
-            .color(egui::Color32::RED)
-            .strong()
-        } else {
-            egui::RichText::new(tr!("Почта", "Voicemail"))
-        };
-        if ui
-            .button(text)
-            .on_hover_text(tr!(
-                format!(
-                    "Новых: {}, прослушанных: {}. Нажмите, чтобы позвонить в ящик.",
-                    voicemail.new, voicemail.old
-                ),
-                format!(
-                    "New: {}, heard: {}. Click to call the mailbox.",
-                    voicemail.new, voicemail.old
-                ),
-            ))
-            .clicked()
-        {
-            self.voicemail_requested = true;
-        }
     }
 
     /// What a line's button says: its number and what is on it.
@@ -2749,41 +2591,570 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             self.key_tones.warm();
             self.key_tones_warmed = Some(Instant::now());
         }
-        // Everything is sized from the room there is, so the window can be
-        // made any size; when it is too small for even the smallest keys,
-        // the page scrolls instead of being cut off.
+        // Everything is sized from the room the card has, so the window can
+        // be made any size; when it is too small for even the smallest keys,
+        // the card scrolls instead of being cut off.
         let room = ui.available_size();
         let gap = ui.spacing().item_spacing;
-        let idle = self.lines[self.at].view.phase() == Phase::Idle;
-        // Below the keys: two rows of buttons when idle, about four in a
-        // call; above them the lines, the number and a line of hints; at
-        // the bottom the volumes and a few lines of state.
-        let rows_below = if idle { 2.0 } else { 4.0 };
-        let fixed = 210.0;
-        let key_height = ((room.y - fixed - rows_below * 56.0) / 4.0 - gap.y).clamp(30.0, 130.0);
+        // A ringing call has one row of buttons under the keys, like idle.
+        let idle = matches!(
+            self.lines[self.at].view.phase(),
+            Phase::Idle | Phase::Incoming
+        );
+        let calls = self
+            .lines
+            .iter()
+            .any(|line| line.view.phase() != Phase::Idle);
+        // Above the keys: the number (or who is on the line) and a line of
+        // hints, and the lines when there are calls; below them one row of
+        // buttons when idle, about four in a call.
+        let dialling = self.lines[self.at].view.phase() == Phase::Idle;
+        let above = if dialling { 40.0 } else { 70.0 } + if calls { 34.0 } else { 0.0 };
+        // Rows under the keys, in key heights and in fixed pixels: the
+        // call button (0.95 of a key); in a call also two smaller rows and
+        // the transfer field.
+        let (below, fixed) = if idle {
+            (0.95, 5.0 * gap.y)
+        } else {
+            (0.95 + 2.0 * 0.71, 8.0 * gap.y + 30.0)
+        };
+        // The buttons under the keys stop growing at a comfortable height;
+        // what a large window has left goes to the keys.
+        let estimate = ((room.y - above - 14.0 - fixed) / (4.0 + below)).clamp(28.0, 150.0);
+        let row = (estimate * 0.95).clamp(30.0, 64.0);
+        let rows = row * below / 0.95;
+        let key_height = ((room.y - above - 14.0 - fixed - rows) / 4.0).clamp(28.0, 150.0);
         let sizes = PadSizes {
             key: egui::vec2(((room.x - 2.0 * gap.x) / 3.0).max(36.0), key_height),
-            key_font: (key_height * 0.42).clamp(16.0, 44.0),
-            row: (key_height * 0.7).clamp(30.0, 64.0),
-            row_font: (key_height * 0.3).clamp(13.0, 24.0),
+            key_font: (key_height * 0.42).clamp(15.0, 40.0),
+            row,
+            row_font: (row * 0.32).clamp(13.0, 20.0),
         };
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 self.dialpad_content(ui, actions, &sizes);
-                // The volumes sit at the bottom when there is room.
-                let used = ui.min_rect().height();
-                let volumes = 2.0 * ui.spacing().interact_size.y + 2.0 * gap.y + 8.0;
-                if used + volumes < room.y {
-                    ui.add_space(room.y - used - volumes);
-                }
-                self.volume_sliders(ui);
             });
+    }
+
+    /// The twelve keys: the digit large, its letters small under it.
+    fn keypad(
+        &mut self,
+        ui: &mut egui::Ui,
+        actions: &mut Vec<Action>,
+        sizes: &PadSizes,
+        colors: &Palette,
+    ) {
+        for row in KEYPAD {
+            ui.horizontal(|ui| {
+                for digit in row.chars() {
+                    let mut text = egui::text::LayoutJob {
+                        halign: egui::Align::Center,
+                        ..Default::default()
+                    };
+                    text.append(
+                        &digit.to_string(),
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(sizes.key_font),
+                            color: colors.text,
+                            ..Default::default()
+                        },
+                    );
+                    let letters = key_letters(digit);
+                    if !letters.is_empty() && sizes.key.y >= 40.0 {
+                        text.append(
+                            &format!("\n{letters}"),
+                            0.0,
+                            egui::TextFormat {
+                                font_id: egui::FontId::proportional(
+                                    (sizes.key_font * 0.36).max(9.0),
+                                ),
+                                color: colors.weak,
+                                extra_letter_spacing: 1.0,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    let key = egui::Button::new(text)
+                        .fill(colors.key)
+                        .stroke(egui::Stroke::NONE)
+                        .corner_radius(12);
+                    if ui.add_sized(sizes.key, key).clicked() {
+                        actions.push(Action::Digit(digit));
+                    }
+                }
+            });
+        }
+    }
+
+    /// Call and erase when idle; answer and decline while ringing; hang up,
+    /// mute, hold, record and transfer in a call.
+    fn call_buttons(
+        &mut self,
+        ui: &mut egui::Ui,
+        actions: &mut Vec<Action>,
+        sizes: &PadSizes,
+        phase: Phase,
+        colors: &Palette,
+    ) {
+        let spacing = ui.spacing().item_spacing.x;
+        let wide = egui::vec2(ui.available_width(), sizes.row);
+        let half = egui::vec2((ui.available_width() - spacing) / 2.0, sizes.row);
+        let small_row = egui::vec2(ui.available_width(), (sizes.row * 0.75).max(28.0));
+        let small_half = egui::vec2(half.x, small_row.y);
+        let big = |text: &str| {
+            egui::RichText::new(text)
+                .size(sizes.row_font + 1.0)
+                .color(egui::Color32::WHITE)
+        };
+        let colored = |text: &str, fill: egui::Color32| {
+            egui::Button::new(big(text))
+                .fill(fill)
+                .stroke(egui::Stroke::NONE)
+                .corner_radius(12)
+        };
+        let plain = |text: &str| {
+            egui::Button::new(egui::RichText::new(text).color(colors.text))
+                .fill(colors.key)
+                .stroke(egui::Stroke::NONE)
+                .corner_radius(10)
+        };
+        match phase {
+            Phase::Idle => {
+                ui.horizontal(|ui| {
+                    let erase_width = (sizes.key.x * 0.55).clamp(48.0, 90.0);
+                    let call_width = ui.available_width() - erase_width - spacing;
+                    let call = colored(tr!("✆  Позвонить", "✆  Call"), colors.green);
+                    if ui
+                        .add_sized([call_width, sizes.row], call)
+                        .on_hover_text(tr!(
+                            "На пустом поле — вернуть последний набранный номер",
+                            "With an empty field: bring back the last number dialled"
+                        ))
+                        .clicked()
+                    {
+                        actions.push(Action::Call(self.number.clone()));
+                    }
+                    let has_number = !self.number.is_empty();
+                    let erase = ui
+                        .add_enabled(
+                            has_number,
+                            egui::Button::new("")
+                                .fill(colors.key)
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(12)
+                                .min_size(egui::vec2(erase_width, sizes.row)),
+                        )
+                        .on_hover_text(tr!(
+                            "Стереть цифру. Правый клик — стереть весь номер",
+                            "Erase a digit. Right click: erase the whole number"
+                        ));
+                    let ink = if has_number { colors.text } else { colors.weak };
+                    paint_backspace(ui.painter(), erase.rect, ink);
+                    if erase.clicked() {
+                        actions.push(Action::Erase);
+                    }
+                    if erase.secondary_clicked() {
+                        actions.push(Action::ClearNumber);
+                    }
+                });
+            }
+            Phase::Incoming => {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized(half, colored(tr!("Ответить", "Answer"), colors.green))
+                        .clicked()
+                    {
+                        actions.push(Action::Answer);
+                    }
+                    if ui
+                        .add_sized(half, colored(tr!("Отклонить", "Decline"), colors.red))
+                        .clicked()
+                    {
+                        actions.push(Action::Reject);
+                    }
+                });
+            }
+            _ => {
+                let pressed = ui
+                    .add_enabled_ui(self.lines[self.at].view.can_hangup(), |ui| {
+                        ui.add_sized(wide, colored(tr!("Завершить", "Hang up"), colors.red))
+                    })
+                    .inner
+                    .clicked();
+                if pressed {
+                    actions.push(Action::Hangup);
+                }
+                let connected = phase == Phase::Connected;
+                let mute = if self.lines[self.at].muted {
+                    tr!("Включить микрофон", "Unmute")
+                } else {
+                    tr!("Выключить микрофон", "Mute")
+                };
+                let hold = if self.lines[self.at].view.is_held() {
+                    tr!("Продолжить", "Resume")
+                } else {
+                    tr!("Удержание", "Hold")
+                };
+                let record = if self.lines[self.at].recording.is_some() {
+                    tr!("Остановить запись", "Stop recording")
+                } else {
+                    tr!("Записать разговор", "Record the call")
+                };
+                ui.add_enabled_ui(connected, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.add_sized(small_half, plain(mute)).clicked() {
+                            actions.push(Action::ToggleMute);
+                        }
+                        if ui.add_sized(small_half, plain(hold)).clicked() {
+                            actions.push(Action::ToggleHold);
+                        }
+                    });
+                    if ui.add_sized(small_row, plain(record)).clicked() {
+                        actions.push(Action::ToggleRecording);
+                    }
+                    ui.horizontal(|ui| {
+                        let field = egui::TextEdit::singleline(&mut self.transfer_to)
+                            .hint_text(tr!("Перевести на номер", "Transfer to number"))
+                            .desired_width((ui.available_width() - 100.0).max(80.0));
+                        let typed = ui.add(field);
+                        let enter = typed.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                        if ui.add(plain(tr!("Перевести", "Transfer"))).clicked() || enter {
+                            actions.push(Action::Transfer(self.transfer_to.clone()));
+                        }
+                    });
+                });
+            }
+        }
+    }
+
+    /// The whole window: a coloured band with the account and a greeting,
+    /// a white card over it with the current page, tiles for the other
+    /// pages, and the volumes at the bottom of the dial page.
+    fn main_screen(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let colors = palette(self.light_theme);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(colors.page))
+            .show(ctx, |ui| {
+                let full = ui.max_rect();
+                let margin = 12.0;
+                // A low window keeps the band to one line.
+                let tall = full.height() >= 560.0;
+                let band = if tall { 122.0 } else { 52.0 };
+                let band_rect = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), band));
+                let overlap = if tall { 34.0 } else { 4.0 };
+                let picture = if self.header_picture {
+                    self.header_texture(ui.ctx())
+                } else {
+                    None
+                };
+                match picture.as_ref() {
+                    Some(texture) => {
+                        paint_picture_band(ui.painter(), band_rect, overlap, texture);
+                    }
+                    None => paint_band(ui.painter(), band_rect, &colors),
+                }
+                let head = egui::Rect::from_min_max(
+                    full.min + egui::vec2(16.0, 10.0),
+                    egui::pos2(full.right() - 12.0, band_rect.bottom()),
+                );
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(head), |ui| {
+                    self.header(ui, tall);
+                });
+
+                let bottom = full.bottom() - margin;
+                let volumes = if self.tab == Tab::Dialpad { 66.0 } else { 0.0 };
+                let tiles_height = if full.height() >= 460.0 { 62.0 } else { 44.0 };
+                let volume_rect = egui::Rect::from_min_max(
+                    egui::pos2(full.left() + margin, bottom - volumes),
+                    egui::pos2(full.right() - margin, bottom),
+                );
+                let tiles_bottom = if volumes > 0.0 {
+                    volume_rect.top() - 10.0
+                } else {
+                    bottom
+                };
+                let tiles_rect = egui::Rect::from_min_max(
+                    egui::pos2(full.left() + margin, tiles_bottom - tiles_height),
+                    egui::pos2(full.right() - margin, tiles_bottom),
+                );
+                // The card overlaps the band, as in the design.
+                let card_top = band_rect.bottom() - if tall { 34.0 } else { 4.0 };
+                let card_rect = egui::Rect::from_min_max(
+                    egui::pos2(full.left() + margin, card_top),
+                    egui::pos2(full.right() - margin, tiles_rect.top() - 10.0),
+                );
+                paint_card(ui.painter(), card_rect, 16, &colors);
+                let inside = card_rect.shrink(12.0);
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inside), |ui| {
+                    ui.set_clip_rect(card_rect.shrink(2.0));
+                    match self.tab {
+                        Tab::Dialpad => self.dialpad_tab(ui, actions),
+                        Tab::Calls => self.calls_tab(ui, actions),
+                        Tab::Contacts => self.contacts_tab(ui, actions),
+                        Tab::Messages => self.messages_tab(ui, actions),
+                    }
+                });
+                self.tiles(ui, tiles_rect, &colors);
+                if volumes > 0.0 {
+                    paint_card(ui.painter(), volume_rect, 14, &colors);
+                    let inside = volume_rect.shrink2(egui::vec2(14.0, 8.0));
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inside), |ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        self.volume_sliders(ui);
+                    });
+                }
+            });
+    }
+
+    /// The picture of the band, loaded once from the program itself.
+    fn header_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        if self.header_texture.is_none() {
+            let decoded =
+                image::load_from_memory_with_format(HEADER_PICTURE, image::ImageFormat::Png)
+                    .ok()?
+                    .to_rgba8();
+            let size = [decoded.width() as usize, decoded.height() as usize];
+            let picture = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
+            self.header_texture =
+                Some(ctx.load_texture("header-picture", picture, egui::TextureOptions::LINEAR));
+        }
+        self.header_texture.clone()
+    }
+
+    /// The band's contents: account and its state, the menu, a greeting.
+    fn header(&mut self, ui: &mut egui::Ui, tall: bool) {
+        let white = egui::Color32::WHITE;
+        // White on the band: text, and the account list's button.
+        {
+            let visuals = ui.visuals_mut();
+            visuals.override_text_color = Some(white);
+            let glass = egui::Color32::from_white_alpha(40);
+            visuals.widgets.inactive.weak_bg_fill = glass;
+            visuals.widgets.inactive.bg_fill = glass;
+            visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_white_alpha(70);
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_white_alpha(70);
+            visuals.widgets.inactive.fg_stroke.color = white;
+            visuals.widgets.hovered.fg_stroke.color = white;
+            visuals.widgets.active.fg_stroke.color = white;
+        }
+        let (dot, text) = match self.registration.as_ref() {
+            Some(RegistrationState::Registered { .. }) => (
+                egui::Color32::from_rgb(120, 240, 150),
+                tr!("в сети", "online").to_owned(),
+            ),
+            Some(RegistrationState::Registering) => (
+                egui::Color32::from_rgb(255, 214, 102),
+                tr!("подключение…", "connecting…").to_owned(),
+            ),
+            Some(state @ RegistrationState::Failed(_)) => (
+                egui::Color32::from_rgb(255, 130, 130),
+                registration_text(state),
+            ),
+            Some(RegistrationState::Unregistered) | None => (
+                egui::Color32::from_gray(210),
+                tr!("не в сети", "offline").to_owned(),
+            ),
+        };
+        ui.horizontal(|ui| {
+            let (spot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter().circle_filled(spot.center(), 5.0, dot);
+            self.account_choice(ui);
+            let user = self.user.trim();
+            let status = if user.is_empty() || !self.other_accounts.is_empty() {
+                text
+            } else {
+                format!("{user} · {text}")
+            };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.menu_button(egui::RichText::new("☰").size(20.0).color(white), |ui| {
+                    self.main_menu(ui);
+                });
+                if self.do_not_disturb {
+                    ui.label(
+                        egui::RichText::new(tr!("Не беспокоить", "Do not disturb"))
+                            .color(egui::Color32::from_rgb(255, 170, 170))
+                            .small(),
+                    );
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(status).truncate());
+                });
+            });
+        });
+        if tall {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(greeting(self.utc_offset))
+                    .size(24.0)
+                    .color(white),
+            );
+        }
+    }
+
+    /// The window's menu: settings, the log and the switches that used to
+    /// fill the top row.
+    fn main_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(200.0);
+        if ui.button(tr!("Настройки", "Settings")).clicked() {
+            self.settings_open = !self.settings_open;
+            ui.close_menu();
+        }
+        if ui.button(tr!("Журнал", "Log")).clicked() {
+            self.log_open = !self.log_open;
+            ui.close_menu();
+        }
+        ui.separator();
+        let mut dnd = self.do_not_disturb;
+        if ui
+            .checkbox(&mut dnd, tr!("Не беспокоить", "Do not disturb"))
+            .changed()
+        {
+            self.pending_dnd = Some(dnd);
+        }
+        if self.presence_on {
+            ui.label(egui::RichText::new(tr!("Мой статус", "My status")).weak());
+            let before = self.my_status;
+            for status in PresenceStatus::ALL {
+                ui.radio_value(&mut self.my_status, status, status_text(status));
+            }
+            if self.my_status != before {
+                self.send(UiCommand::Presence(Some(self.my_status)));
+                self.save_settings();
+            }
+            if let Some(why) = self.status_refused.as_ref() {
+                ui.weak(tr!(
+                    format!("АТС не принимает статус ({why})"),
+                    format!("The exchange does not take the status ({why})"),
+                ));
+            }
+        }
+        ui.separator();
+        if ui
+            .checkbox(
+                &mut self.always_on_top,
+                tr!("Поверх всех окон", "Always on top"),
+            )
+            .changed()
+        {
+            self.save_settings();
+        }
+        if ui
+            .checkbox(&mut self.key_tones_on, tr!("Звук кнопок", "Keypad sounds"))
+            .changed()
+        {
+            self.save_settings();
+        }
+        ui.separator();
+        // Closes the program, not only the window: calls end and the
+        // account goes off the exchange.
+        if ui
+            .button(tr!("Выход", "Exit"))
+            .on_hover_text(tr!(
+                "Закрыть программу полностью, а не свернуть в трей",
+                "Close the program completely, not to the tray"
+            ))
+            .clicked()
+        {
+            self.exiting = true;
+            self.save_settings();
+            ui.close_menu();
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// The tiles under the card: the other pages, and the mailbox.
+    fn tiles(&mut self, ui: &mut egui::Ui, rect: egui::Rect, colors: &Palette) {
+        let missed = self.history.missed_since(self.missed_seen);
+        let unread = self.chat.received_since(self.messages_seen);
+        let mut tiles: Vec<(Option<Tab>, &str, String, bool)> = Vec::new();
+        for tab in [Tab::Calls, Tab::Contacts, Tab::Messages] {
+            // The page shown has no tile; the dial page takes its place.
+            let tab = if tab == self.tab { Tab::Dialpad } else { tab };
+            let (icon, label, alert) = match tab {
+                Tab::Dialpad => ("⌨", tr!("Набор", "Dial").to_owned(), false),
+                Tab::Calls if missed > 0 => (
+                    "🕑",
+                    tr!(format!("Звонки ({missed})"), format!("Calls ({missed})"),),
+                    true,
+                ),
+                Tab::Calls => ("🕑", tr!("Звонки", "Calls").to_owned(), false),
+                Tab::Contacts => ("👤", tr!("Контакты", "Contacts").to_owned(), false),
+                Tab::Messages if unread > 0 => (
+                    "💬",
+                    tr!(format!("Чат ({unread})"), format!("Chat ({unread})"),),
+                    true,
+                ),
+                Tab::Messages => ("💬", tr!("Чат", "Chat").to_owned(), false),
+            };
+            tiles.push((Some(tab), icon, label, alert));
+        }
+        let new_mail = self.voicemail.map_or(0, |voicemail| voicemail.new);
+        let mail = if new_mail > 0 {
+            tr!(format!("Почта {new_mail}"), format!("Mail {new_mail}"),)
+        } else {
+            tr!("Почта", "Mail").to_owned()
+        };
+        tiles.push((None, "✉", mail, new_mail > 0));
+
+        let gap = 8.0;
+        let width = (rect.width() - gap * (tiles.len() as f32 - 1.0)) / tiles.len() as f32;
+        let compact = rect.height() < 56.0;
+        for (index, (tab, icon, label, alert)) in tiles.into_iter().enumerate() {
+            let tile = egui::Rect::from_min_size(
+                rect.min + egui::vec2(index as f32 * (width + gap), 0.0),
+                egui::vec2(width, rect.height()),
+            );
+            let response = ui.interact(tile, ui.id().with(("tile", index)), egui::Sense::click());
+            let fill = if response.hovered() {
+                colors.key
+            } else {
+                colors.card
+            };
+            paint_card(ui.painter(), tile, 12, colors);
+            ui.painter().rect_filled(tile, 12, fill);
+            let ink = if alert { colors.red } else { colors.text };
+            if compact {
+                ui.painter().text(
+                    tile.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{icon} {label}"),
+                    egui::FontId::proportional(12.0),
+                    ink,
+                );
+            } else {
+                ui.painter().text(
+                    tile.center() - egui::vec2(0.0, 10.0),
+                    egui::Align2::CENTER_CENTER,
+                    icon,
+                    egui::FontId::proportional(20.0),
+                    if alert { colors.red } else { colors.accent },
+                );
+                ui.painter().text(
+                    tile.center() + egui::vec2(0.0, 14.0),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(12.0),
+                    ink,
+                );
+            }
+            if response.clicked() {
+                match tab {
+                    Some(tab) => {
+                        self.tab = tab;
+                        self.settings_open = false;
+                    }
+                    None => self.voicemail_requested = true,
+                }
+            }
+        }
     }
 
     fn volume_sliders(&mut self, ui: &mut egui::Ui) {
         let before = (self.speaker_volume, self.microphone_volume);
-        let width = (ui.available_width() - 150.0).clamp(60.0, 400.0);
+        let width = (ui.available_width() - 100.0).clamp(60.0, 400.0);
         ui.spacing_mut().slider_width = width;
         // During a call the bars under the sliders show how loud the other
         // side is and how loud the microphone is, as in MicroSIP.
@@ -2821,9 +3192,17 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             ui.painter().rect_filled(filled, 1.0, color);
         };
         ui.horizontal(|ui| {
-            ui.add_sized([70.0, 18.0], egui::Label::new(tr!("Динамик", "Speaker")));
+            ui.add_sized(
+                [26.0, 18.0],
+                egui::Label::new(egui::RichText::new("🔈").size(17.0)),
+            )
+            .on_hover_text(tr!("Динамик", "Speaker"));
             let slider = ui
-                .add(egui::Slider::new(&mut self.speaker_volume, 0..=200).suffix("%"))
+                .add(
+                    egui::Slider::new(&mut self.speaker_volume, 0..=200)
+                        .suffix("%")
+                        .trailing_fill(true),
+                )
                 .on_hover_text(tr!(
                     "Полоска — как громко говорит собеседник",
                     "The bar shows how loud the other side speaks"
@@ -2832,11 +3211,16 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         });
         ui.horizontal(|ui| {
             ui.add_sized(
-                [70.0, 18.0],
-                egui::Label::new(tr!("Микрофон", "Microphone")),
-            );
+                [26.0, 18.0],
+                egui::Label::new(egui::RichText::new("🎤").size(17.0)),
+            )
+            .on_hover_text(tr!("Микрофон", "Microphone"));
             let slider = ui
-                .add(egui::Slider::new(&mut self.microphone_volume, 0..=200).suffix("%"))
+                .add(
+                    egui::Slider::new(&mut self.microphone_volume, 0..=200)
+                        .suffix("%")
+                        .trailing_fill(true),
+                )
                 .on_hover_text(tr!(
                     "Полоска — как громко вас слышно",
                     "The bar shows how loud you are"
@@ -2936,15 +3320,45 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
     }
 
     fn dialpad_content(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>, sizes: &PadSizes) {
-        self.lines_bar(ui, actions);
+        let colors = palette(self.light_theme);
+        // The lines only matter once there is a call.
+        if self
+            .lines
+            .iter()
+            .any(|line| line.view.phase() != Phase::Idle)
+        {
+            self.lines_bar(ui, actions);
+        }
         let phase = self.lines[self.at].view.phase();
         let idle = phase == Phase::Idle;
+        if idle {
+            self.number_field(ui, actions, &colors);
+        } else {
+            self.call_info(ui, phase);
+        }
+        ui.add_space(6.0);
+        self.keypad(ui, actions, sizes, &colors);
+        ui.add_space(8.0);
+        self.call_buttons(ui, actions, sizes, phase, &colors);
+        if let Some(error) = self.last_error.as_ref() {
+            ui.add_space(4.0);
+            ui.colored_label(egui::Color32::RED, error);
+        }
+    }
 
+    /// The number being dialled: large, in the middle of the card, with
+    /// the right-click menu and the contacts that fit under it.
+    fn number_field(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>, colors: &Palette) {
+        let idle = true;
         let number_id = egui::Id::new("number-field");
+        let size = (ui.available_width() / 11.0).clamp(20.0, 30.0);
         let field = egui::TextEdit::singleline(&mut self.number)
             .id(number_id)
-            .hint_text(tr!("Номер", "Number"))
-            .font(egui::TextStyle::Heading)
+            .hint_text(egui::RichText::new(tr!("Номер", "Number")).color(colors.weak))
+            .font(egui::FontId::proportional(size))
+            .text_color(colors.text)
+            .frame(false)
+            .horizontal_align(egui::Align::Center)
             .desired_width(f32::INFINITY);
         // The selection as it is before this frame's clicks, kept while the
         // menu is open.
@@ -3029,7 +3443,9 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             ui.ctx().request_repaint();
         }
         if idle && let Some(name) = self.contacts.name_of(&self.number) {
-            ui.label(name.to_owned());
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new(name.to_owned()).color(colors.weak));
+            });
         } else if idle && self.number.trim().chars().count() >= 2 {
             // Contacts that fit what has been typed so far; a click puts
             // the number into the field.
@@ -3045,145 +3461,11 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 });
             }
         }
-        ui.add_space(6.0);
+    }
 
-        for row in KEYPAD {
-            ui.horizontal(|ui| {
-                for digit in row.chars() {
-                    let label = egui::RichText::new(digit.to_string()).size(sizes.key_font);
-                    if ui.add_sized(sizes.key, egui::Button::new(label)).clicked() {
-                        actions.push(Action::Digit(digit));
-                    }
-                }
-            });
-        }
-        ui.add_space(6.0);
-
-        let spacing = ui.spacing().item_spacing.x;
-        let wide = egui::vec2(ui.available_width(), sizes.row);
-        let half = egui::vec2((ui.available_width() - spacing) / 2.0, sizes.row);
-        let third = egui::vec2(
-            (ui.available_width() - 2.0 * spacing) / 3.0,
-            sizes.row * 0.85,
-        );
-        let green = egui::Color32::from_rgb(40, 140, 60);
-        let red = egui::Color32::from_rgb(170, 50, 50);
-        let big = |text: &str| {
-            egui::RichText::new(text)
-                .size(sizes.row_font)
-                .color(egui::Color32::WHITE)
-        };
-        let small = |text: &str| egui::RichText::new(text).size((sizes.row_font * 0.8).max(12.0));
-        match phase {
-            Phase::Idle => {
-                let call = egui::Button::new(big(tr!("Позвонить", "Call"))).fill(green);
-                if ui
-                    .add_sized(wide, call)
-                    .on_hover_text(tr!(
-                        "На пустом поле — вернуть последний набранный номер",
-                        "With an empty field: bring back the last number dialled"
-                    ))
-                    .clicked()
-                {
-                    actions.push(Action::Call(self.number.clone()));
-                }
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_sized(third, egui::Button::new(small(tr!("Вставить", "Paste"))))
-                        .on_hover_text(tr!(
-                            "Номер из буфера обмена (Ctrl+V)",
-                            "Number from the clipboard (Ctrl+V)"
-                        ))
-                        .clicked()
-                    {
-                        actions.push(Action::Paste);
-                    }
-                    let has_number = !self.number.is_empty();
-                    ui.add_enabled_ui(has_number, |ui| {
-                        if ui
-                            .add_sized(third, egui::Button::new(small(tr!("Стереть", "Erase"))))
-                            .on_hover_text(tr!("Убрать последнюю цифру", "Remove the last digit"))
-                            .clicked()
-                        {
-                            actions.push(Action::Erase);
-                        }
-                        if ui
-                            .add_sized(third, egui::Button::new(small(tr!("Очистить", "Clear"))))
-                            .on_hover_text(tr!("Убрать весь номер", "Remove the whole number"))
-                            .clicked()
-                        {
-                            actions.push(Action::ClearNumber);
-                        }
-                    });
-                });
-            }
-            Phase::Incoming => {
-                ui.horizontal(|ui| {
-                    let answer = egui::Button::new(big(tr!("Ответить", "Answer"))).fill(green);
-                    if ui.add_sized(half, answer).clicked() {
-                        actions.push(Action::Answer);
-                    }
-                    let reject = egui::Button::new(big(tr!("Отклонить", "Decline"))).fill(red);
-                    if ui.add_sized(half, reject).clicked() {
-                        actions.push(Action::Reject);
-                    }
-                });
-            }
-            _ => {
-                let hangup = egui::Button::new(big(tr!("Завершить", "Hang up"))).fill(red);
-                let pressed = ui
-                    .add_enabled_ui(self.lines[self.at].view.can_hangup(), |ui| {
-                        ui.add_sized(wide, hangup)
-                    })
-                    .inner
-                    .clicked();
-                if pressed {
-                    actions.push(Action::Hangup);
-                }
-                let connected = phase == Phase::Connected;
-                let mute = if self.lines[self.at].muted {
-                    tr!("Включить микрофон", "Unmute")
-                } else {
-                    tr!("Выключить микрофон", "Mute")
-                };
-                let hold = if self.lines[self.at].view.is_held() {
-                    tr!("Продолжить", "Resume")
-                } else {
-                    tr!("Удержание", "Hold")
-                };
-                let record = if self.lines[self.at].recording.is_some() {
-                    tr!("Остановить запись", "Stop recording")
-                } else {
-                    tr!("Записать разговор", "Record the call")
-                };
-                ui.add_enabled_ui(connected, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.add_sized(half, egui::Button::new(mute)).clicked() {
-                            actions.push(Action::ToggleMute);
-                        }
-                        if ui.add_sized(half, egui::Button::new(hold)).clicked() {
-                            actions.push(Action::ToggleHold);
-                        }
-                    });
-                    if ui.add_sized(wide, egui::Button::new(record)).clicked() {
-                        actions.push(Action::ToggleRecording);
-                    }
-                    ui.horizontal(|ui| {
-                        let field = egui::TextEdit::singleline(&mut self.transfer_to)
-                            .hint_text(tr!("Перевести на номер", "Transfer to number"))
-                            .desired_width((ui.available_width() - 100.0).max(80.0));
-                        let typed = ui.add(field);
-                        let enter = typed.lost_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                        if ui.button(tr!("Перевести", "Transfer")).clicked() || enter {
-                            actions.push(Action::Transfer(self.transfer_to.clone()));
-                        }
-                    });
-                });
-            }
-        }
-
-        ui.add_space(6.0);
+    /// Who is on the line and how the call is going, in place of the
+    /// number while there is a call.
+    fn call_info(&mut self, ui: &mut egui::Ui, phase: Phase) {
         if let Some(call) = self.lines[self.at].current.as_ref() {
             let who = if call.name.is_empty() {
                 call.number.clone()
@@ -3211,12 +3493,27 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 }
                 _ => phase_text(phase).to_owned(),
             };
-            ui.label(egui::RichText::new(who).size(18.0));
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new(who).size(22.0));
+            });
             let live = self.lines[self.at]
                 .view
                 .live_quality()
                 .filter(|_| phase == Phase::Connected);
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
+                // In the middle of the card: the lamp and the state together.
+                let text_width = ui.fonts(|fonts| {
+                    fonts
+                        .layout_no_wrap(
+                            state.clone(),
+                            egui::TextStyle::Body.resolve(ui.style()),
+                            egui::Color32::WHITE,
+                        )
+                        .size()
+                        .x
+                });
+                let lamp_width = if live.is_some() { 18.0 } else { 0.0 };
+                ui.add_space(((ui.available_width() - text_width - lamp_width) / 2.0).max(0.0));
                 // The quality lamp, as in MicroSIP: green, yellow or red,
                 // with the numbers under the mouse.
                 if let Some(live) = live {
@@ -3262,9 +3559,6 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                     ),
                 );
             }
-        }
-        if let Some(error) = self.last_error.as_ref() {
-            ui.colored_label(egui::Color32::RED, error);
         }
     }
 
@@ -3864,6 +4158,15 @@ format!("Phone address: {local}"),
                         });
                         let before = (self.close_to_tray, self.hotkeys, self.light_theme);
                         ui.checkbox(&mut self.light_theme, tr!("Светлая тема", "Light theme"));
+                        if ui
+                            .checkbox(
+                                &mut self.header_picture,
+                                tr!("Картинка в шапке", "Picture in the top band"),
+                            )
+                            .changed()
+                        {
+                            self.save_settings();
+                        }
                         let before_window =
                             (self.always_on_top, self.incoming_popup, self.key_tones_on);
                         ui.checkbox(
@@ -4244,6 +4547,179 @@ fn result_text(code: &str) -> Option<String> {
     })
 }
 
+/// The colours of the window, light or dark.
+#[derive(Clone, Copy)]
+struct Palette {
+    page: egui::Color32,
+    card: egui::Color32,
+    key: egui::Color32,
+    key_hover: egui::Color32,
+    text: egui::Color32,
+    weak: egui::Color32,
+    line: egui::Color32,
+    accent: egui::Color32,
+    band_left: egui::Color32,
+    band_right: egui::Color32,
+    green: egui::Color32,
+    red: egui::Color32,
+    shadow: egui::Color32,
+}
+
+fn palette(light: bool) -> Palette {
+    let rgb = egui::Color32::from_rgb;
+    if light {
+        Palette {
+            page: rgb(246, 247, 251),
+            card: rgb(255, 255, 255),
+            key: rgb(238, 240, 247),
+            key_hover: rgb(226, 229, 242),
+            text: rgb(29, 36, 51),
+            weak: rgb(107, 114, 128),
+            line: rgb(229, 231, 240),
+            accent: rgb(124, 58, 237),
+            band_left: rgb(79, 70, 229),
+            band_right: rgb(124, 58, 237),
+            green: rgb(34, 197, 94),
+            red: rgb(239, 68, 68),
+            shadow: egui::Color32::from_black_alpha(28),
+        }
+    } else {
+        Palette {
+            page: rgb(18, 20, 23),
+            card: rgb(30, 33, 39),
+            key: rgb(42, 46, 54),
+            key_hover: rgb(54, 59, 69),
+            text: rgb(230, 232, 236),
+            weak: rgb(150, 156, 168),
+            line: rgb(48, 52, 60),
+            accent: rgb(139, 92, 246),
+            band_left: rgb(55, 48, 163),
+            band_right: rgb(91, 33, 182),
+            green: rgb(34, 170, 84),
+            red: rgb(220, 60, 60),
+            shadow: egui::Color32::from_black_alpha(90),
+        }
+    }
+}
+
+/// The coloured band at the top: a gradient from left to right.
+fn paint_band(painter: &egui::Painter, rect: egui::Rect, colors: &Palette) {
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), colors.band_left);
+    mesh.colored_vertex(rect.right_top(), colors.band_right);
+    mesh.colored_vertex(rect.right_bottom(), colors.band_right);
+    mesh.colored_vertex(rect.left_bottom(), colors.band_left);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// The picture of the top band, built into the program.
+const HEADER_PICTURE: &[u8] = include_bytes!("../../assets/header-logo.png");
+
+/// The band with the picture: black like the picture's own background,
+/// the picture whole on the right, where the text of the band leaves room
+/// and the card does not cover it.
+fn paint_picture_band(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    overlap: f32,
+    texture: &egui::TextureHandle,
+) {
+    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(5, 5, 5));
+    let [width, height] = texture.size();
+    let aspect = width as f32 / height as f32;
+    // The part of the band that stays in sight above the card, less the
+    // room of the menu button on the right.
+    let room = egui::Rect::from_min_max(
+        // A low band has the account on the same line: more room for it.
+        egui::pos2(
+            rect.left() + rect.width() * if overlap < 10.0 { 0.58 } else { 0.42 },
+            rect.top() + 6.0,
+        ),
+        egui::pos2(rect.right() - 48.0, rect.bottom() - overlap - 6.0),
+    );
+    let mut size = egui::vec2(room.height() * aspect, room.height());
+    if size.x > room.width() {
+        size = egui::vec2(room.width(), room.width() / aspect);
+    }
+    let place = egui::Rect::from_center_size(room.center(), size);
+    painter.image(
+        texture.id(),
+        place,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
+/// A rounded card with a soft shadow under it.
+fn paint_card(painter: &egui::Painter, rect: egui::Rect, radius: u8, colors: &Palette) {
+    let shadow = egui::Shadow {
+        offset: [0, 4],
+        blur: 14,
+        spread: 0,
+        color: colors.shadow,
+    };
+    painter.add(shadow.as_shape(rect, egui::CornerRadius::same(radius)));
+    painter.rect_filled(rect, radius, colors.card);
+}
+
+/// The backspace mark (the fonts have no glyph for it): a key pointing
+/// left with a cross in it.
+fn paint_backspace(painter: &egui::Painter, rect: egui::Rect, ink: egui::Color32) {
+    let center = rect.center();
+    let (width, height) = (22.0, 16.0);
+    let left = center.x - width / 2.0;
+    let right = center.x + width / 2.0;
+    let top = center.y - height / 2.0;
+    let bottom = center.y + height / 2.0;
+    let outline = vec![
+        egui::pos2(left, center.y),
+        egui::pos2(left + 7.0, top),
+        egui::pos2(right, top),
+        egui::pos2(right, bottom),
+        egui::pos2(left + 7.0, bottom),
+    ];
+    let stroke = egui::Stroke::new(1.6_f32, ink);
+    painter.add(egui::Shape::closed_line(outline, stroke));
+    let cross = egui::pos2(center.x + 3.5, center.y);
+    let arm = 3.5;
+    painter.line_segment(
+        [cross + egui::vec2(-arm, -arm), cross + egui::vec2(arm, arm)],
+        stroke,
+    );
+    painter.line_segment(
+        [cross + egui::vec2(-arm, arm), cross + egui::vec2(arm, -arm)],
+        stroke,
+    );
+}
+
+/// The letters of a key, as on a telephone.
+fn key_letters(digit: char) -> &'static str {
+    match digit {
+        '2' => "ABC",
+        '3' => "DEF",
+        '4' => "GHI",
+        '5' => "JKL",
+        '6' => "MNO",
+        '7' => "PQRS",
+        '8' => "TUV",
+        '9' => "WXYZ",
+        '0' => "+",
+        _ => "",
+    }
+}
+
+/// "Good morning" and so on, by the local time of day.
+fn greeting(offset: i64) -> &'static str {
+    match DateTime::from_unix(now_unix(), offset).hour {
+        5..=11 => tr!("Доброе утро!", "Good morning!"),
+        12..=17 => tr!("Добрый день!", "Good afternoon!"),
+        18..=22 => tr!("Добрый вечер!", "Good evening!"),
+        _ => tr!("Доброй ночи!", "Good night!"),
+    }
+}
+
 /// The suggested name of a saved call history: `calls-2026-11-19.csv`.
 fn history_file_name() -> String {
     let today = DateTime::from_unix(now_unix(), utc_offset_seconds());
@@ -4504,42 +4980,7 @@ impl eframe::App for PhoneWindow {
         self.keys_and_tray(ctx, &mut actions);
         self.take_links(ctx, &mut actions);
 
-        egui::TopBottomPanel::top("status").show(ctx, |ui| {
-            ui.add_space(4.0);
-            self.status_bar(ui);
-            ui.add_space(4.0);
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let missed = self.history.missed_since(self.missed_seen);
-            let calls = if missed > 0 {
-                tr!(format!("Звонки ({missed})"), format!("Calls ({missed})"),)
-            } else {
-                tr!("Звонки", "Calls").to_owned()
-            };
-            ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Dialpad, tr!("Набор", "Dial"));
-                ui.selectable_value(&mut self.tab, Tab::Calls, calls);
-                ui.selectable_value(&mut self.tab, Tab::Contacts, tr!("Контакты", "Contacts"));
-                let unread = self.chat.received_since(self.messages_seen);
-                let messages = if unread > 0 && self.tab != Tab::Messages {
-                    tr!(
-                        format!("Сообщения ({unread})"),
-                        format!("Messages ({unread})"),
-                    )
-                } else {
-                    tr!("Сообщения", "Messages").to_owned()
-                };
-                ui.selectable_value(&mut self.tab, Tab::Messages, messages);
-            });
-            ui.separator();
-            match self.tab {
-                Tab::Dialpad => self.dialpad_tab(ui, &mut actions),
-                Tab::Calls => self.calls_tab(ui, &mut actions),
-                Tab::Contacts => self.contacts_tab(ui, &mut actions),
-                Tab::Messages => self.messages_tab(ui, &mut actions),
-            }
-        });
+        self.main_screen(ctx, &mut actions);
 
         if self.settings_open {
             self.settings_window(ctx, &mut actions);

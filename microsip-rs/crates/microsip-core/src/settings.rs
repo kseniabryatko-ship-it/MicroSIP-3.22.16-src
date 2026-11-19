@@ -95,6 +95,8 @@ pub struct Settings {
     pub incoming_popup: bool,
     /// The phone's window stays above the other windows.
     pub always_on_top: bool,
+    /// The band at the top shows the picture instead of the colour.
+    pub header_picture: bool,
     /// The saved accounts other than the active one (whose settings are
     /// the fields above), in the order they were added.
     pub accounts: Vec<AccountSettings>,
@@ -145,6 +147,7 @@ impl Default for Settings {
             key_tones: true,
             incoming_popup: true,
             always_on_top: false,
+            header_picture: true,
             accounts: Vec::new(),
         }
     }
@@ -227,6 +230,7 @@ impl Settings {
                 "key_tones" => settings.key_tones = value != "0",
                 "incoming_popup" => settings.incoming_popup = value != "0",
                 "always_on_top" => settings.always_on_top = value != "0",
+                "header_picture" => settings.header_picture = value != "0",
                 "auto_answer_delay" => {
                     if let Some(delay) = value.parse::<u32>().ok().filter(|delay| *delay <= 60) {
                         settings.auto_answer_delay = delay;
@@ -276,6 +280,7 @@ impl Settings {
         let key_tones = flag(self.key_tones);
         let incoming_popup = flag(self.incoming_popup);
         let always_on_top = flag(self.always_on_top);
+        let header_picture = flag(self.header_picture);
         // Without permission to remember it, no form of the password is written.
         let password_protected = if self.save_password {
             self.password_protected.clone()
@@ -325,6 +330,7 @@ impl Settings {
             ("key_tones", &key_tones),
             ("incoming_popup", &incoming_popup),
             ("always_on_top", &always_on_top),
+            ("header_picture", &header_picture),
         ] {
             text.push_str(key);
             text.push('=');
@@ -585,6 +591,7 @@ mod tests {
             key_tones: false,
             incoming_popup: false,
             always_on_top: true,
+            header_picture: false,
             accounts: Vec::new(),
         }
     }
@@ -706,7 +713,8 @@ mod tests {
              media_encryption=required\nstun=stun.example.com:3478\n\
              voicemail_number=*98\necho_cancellation=0\nnoise_suppression=1\n\
              dtmf_method=info\npresence=1\npresence_status=away\nall_accounts=1\nlanguage=en\n\
-             key_tones=0\nincoming_popup=0\nalways_on_top=1\n"
+             key_tones=0\nincoming_popup=0\nalways_on_top=1\n\
+             header_picture=0\n"
         );
         // No line holds the password itself; `save_password` and
         // `password_protected` are different keys.

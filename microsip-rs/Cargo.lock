@@ -1438,6 +1438,7 @@ dependencies = [
  "eframe",
  "getrandom",
  "hmac",
+ "image",
  "md-5",
  "native-tls",
  "oxideav-gsm",
