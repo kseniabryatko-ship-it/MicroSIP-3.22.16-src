@@ -173,9 +173,197 @@ pub(crate) fn field(value: &str) -> String {
         .collect()
 }
 
+/// How a call went, as a table of calls sums it up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// There was a conversation.
+    Answered,
+    /// Nobody talked: not answered, busy, declined, cancelled, missed.
+    NotAnswered,
+    /// The call could not be made: an error of the phone or the exchange.
+    Failed,
+}
+
+impl CallRecord {
+    pub fn outcome(&self) -> Outcome {
+        let result = self.result.trim();
+        if self.seconds > 0 {
+            return Outcome::Answered;
+        }
+        if result.is_empty() {
+            return match self.direction {
+                Direction::Missed => Outcome::NotAnswered,
+                // Connected, if only for a moment.
+                Direction::Outgoing | Direction::Incoming => Outcome::Answered,
+            };
+        }
+        let not_answered = matches!(result, "cancelled" | "timeout" | "declined" | "dnd")
+            || result.starts_with("forwarded")
+            // Busy, unavailable, no answer, declined, ended before an answer.
+            || matches!(
+                result.parse::<u16>(),
+                Ok(408 | 480 | 486 | 487 | 600 | 603)
+            );
+        if not_answered {
+            Outcome::NotAnswered
+        } else {
+            Outcome::Failed
+        }
+    }
+}
+
+/// The words of a call table, in the window's language.
+pub struct TableWords<'a> {
+    /// Date, time, direction, number, name, length, status, reason.
+    pub headings: [&'a str; 8],
+    /// Outgoing, incoming, missed.
+    pub directions: [&'a str; 3],
+    /// Answered, not answered, failed.
+    pub outcomes: [&'a str; 3],
+    /// What a result code means, in words; `None` for none.
+    pub reason: &'a dyn Fn(&str) -> Option<String>,
+}
+
+impl History {
+    /// The whole list as a table for Excel: newest call first, in UTF-8
+    /// with the mark Excel needs, `;` between columns. The date and the
+    /// time of day are local (`offset` seconds from UTC); the length is
+    /// `H:MM:SS` and empty without a conversation. Numbers are written so
+    /// that Excel keeps them as text (no 7,92E+10, no lost leading zero).
+    pub fn to_csv(&self, offset: i64, words: &TableWords<'_>) -> String {
+        use crate::contacts::csv_cell;
+        let mut text = String::from("\u{feff}");
+        text.push_str(&words.headings.map(csv_cell).join(";"));
+        text.push_str("\r\n");
+        for record in &self.records {
+            let time = crate::localtime::DateTime::from_unix(record.time, offset);
+            let direction = match record.direction {
+                Direction::Outgoing => words.directions[0],
+                Direction::Incoming => words.directions[1],
+                Direction::Missed => words.directions[2],
+            };
+            let length = if record.seconds > 0 {
+                let seconds = record.seconds;
+                format!(
+                    "{}:{:02}:{:02}",
+                    seconds / 3_600,
+                    seconds % 3_600 / 60,
+                    seconds % 60
+                )
+            } else {
+                String::new()
+            };
+            let outcome = match record.outcome() {
+                Outcome::Answered => words.outcomes[0],
+                Outcome::NotAnswered => words.outcomes[1],
+                Outcome::Failed => words.outcomes[2],
+            };
+            let number = if record
+                .number
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '+')
+                && !record.number.is_empty()
+            {
+                format!("=\"{}\"", record.number)
+            } else {
+                csv_cell(&record.number)
+            };
+            let cells = [
+                format!("{:02}.{:02}.{}", time.day, time.month, time.year),
+                format!("{:02}:{:02}:{:02}", time.hour, time.minute, time.second),
+                csv_cell(direction),
+                number,
+                csv_cell(&record.name),
+                length,
+                csv_cell(outcome),
+                csv_cell(&(words.reason)(&record.result).unwrap_or_default()),
+            ];
+            text.push_str(&cells.join(";"));
+            text.push_str("\r\n");
+        }
+        text
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call(direction: Direction, seconds: u64, result: &str) -> CallRecord {
+        CallRecord {
+            time: 1_795_060_000,
+            direction,
+            seconds,
+            number: "79203181933".to_owned(),
+            name: String::new(),
+            recording: String::new(),
+            result: result.to_owned(),
+        }
+    }
+
+    #[test]
+    fn each_call_is_answered_not_answered_or_failed() {
+        use Direction::{Incoming, Missed, Outgoing};
+        for (record, outcome) in [
+            (call(Outgoing, 65, ""), Outcome::Answered),
+            (call(Incoming, 0, ""), Outcome::Answered),
+            (call(Missed, 0, ""), Outcome::NotAnswered),
+            (call(Outgoing, 0, "486"), Outcome::NotAnswered),
+            (call(Outgoing, 0, "cancelled"), Outcome::NotAnswered),
+            (call(Outgoing, 0, "timeout"), Outcome::NotAnswered),
+            (call(Missed, 0, "dnd"), Outcome::NotAnswered),
+            (call(Missed, 0, "forwarded 4011"), Outcome::NotAnswered),
+            (call(Outgoing, 0, "503"), Outcome::Failed),
+            (call(Outgoing, 0, "404"), Outcome::Failed),
+            (call(Outgoing, 0, "failed"), Outcome::Failed),
+        ] {
+            assert_eq!(record.outcome(), outcome, "{record:?}");
+        }
+    }
+
+    #[test]
+    fn the_call_table_opens_in_excel_with_every_column() {
+        let mut history = History::default();
+        history.add(call(Direction::Outgoing, 0, "503"));
+        let mut talked = call(Direction::Incoming, 3_725, "");
+        talked.time += 60;
+        talked.number = "4010".to_owned();
+        talked.name = "Анна; бухгалтерия".to_owned();
+        history.add(talked);
+        let reason = |code: &str| (code == "503").then(|| "сервис недоступен (503)".to_owned());
+        let words = TableWords {
+            headings: [
+                "Дата",
+                "Время",
+                "Направление",
+                "Номер",
+                "Имя",
+                "Длительность",
+                "Статус",
+                "Причина",
+            ],
+            directions: ["Исходящий", "Входящий", "Пропущенный"],
+            outcomes: ["Дозвон", "Недозвон", "Ошибка"],
+            reason: &reason,
+        };
+        // Moscow time, three hours from UTC.
+        let table = history.to_csv(3 * 3_600, &words);
+        let lines: Vec<&str> = table.split("\r\n").collect();
+        assert_eq!(
+            lines[0],
+            "\u{feff}Дата;Время;Направление;Номер;Имя;Длительность;Статус;Причина"
+        );
+        // Newest first; a name with the separator is quoted.
+        assert_eq!(
+            lines[1],
+            "19.11.2026;06:47:40;Входящий;=\"4010\";\"Анна; бухгалтерия\";1:02:05;Дозвон;"
+        );
+        assert_eq!(
+            lines[2],
+            "19.11.2026;06:46:40;Исходящий;=\"79203181933\";;;Ошибка;сервис недоступен (503)"
+        );
+        assert_eq!(lines.len(), 4);
+    }
 
     fn record(time: u64, direction: Direction, number: &str) -> CallRecord {
         CallRecord {

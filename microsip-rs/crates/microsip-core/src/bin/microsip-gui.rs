@@ -13,7 +13,7 @@ use microsip_core::call_view::{CallView, Phase};
 use microsip_core::chat::{Chat, ChatMessage};
 use microsip_core::codec::Codec;
 use microsip_core::contacts::{Contacts, dialable};
-use microsip_core::history::{CallRecord, Direction, History};
+use microsip_core::history::{CallRecord, Direction, History, TableWords};
 use microsip_core::key_tones::KeyTones;
 use microsip_core::links::{self, Instance, Request as LinkRequest};
 use microsip_core::live_quality::{Lamp, LiveQuality};
@@ -155,6 +155,7 @@ enum Dialog {
     Ringtone,
     ImportContacts,
     ExportContacts,
+    ExportHistory,
 }
 
 /// The call in progress, for the call list.
@@ -1742,6 +1743,9 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
             return match (dialog, table) {
                 (Dialog::ImportContacts, Some(path)) => self.import_contacts(&path),
                 (Dialog::ExportContacts, Some(path)) => self.export_contacts(&path),
+                (Dialog::ExportHistory, Some(path)) => {
+                    self.export_history(&path.with_file_name(history_file_name()))
+                }
                 _ => self.error(tr!(
                     "Выбор в окне доступен только в Windows — впишите путь вручную",
                     "Choosing in a dialog works on Windows only; type the path"
@@ -1755,6 +1759,7 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
                 Dialog::Ringtone => winshell::pick_open_file("wav"),
                 Dialog::ImportContacts => winshell::pick_open_file("csv"),
                 Dialog::ExportContacts => winshell::pick_save_file("contacts.csv", "csv"),
+                Dialog::ExportHistory => winshell::pick_save_file(&history_file_name(), "csv"),
             };
             let _ = sender.send(chosen);
         });
@@ -1789,6 +1794,7 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
             }
             Dialog::ImportContacts => self.import_contacts(&path),
             Dialog::ExportContacts => self.export_contacts(&path),
+            Dialog::ExportHistory => self.export_history(&path),
         }
     }
 
@@ -1824,6 +1830,56 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
                 self.log(tr!(
                     format!("Контакты сохранены в {}", path.display()),
                     format!("Contacts saved to {}", path.display()),
+                ));
+            }
+            Err(error) => self.error(tr!(
+                format!("Не удалось записать {}: {error}", path.display()),
+                format!("Cannot write {}: {error}", path.display()),
+            )),
+        }
+    }
+
+    /// Writes every call into a table for Excel.
+    fn export_history(&mut self, path: &std::path::Path) {
+        let reason = |code: &str| result_text(code);
+        let words = TableWords {
+            headings: [
+                tr!("Дата", "Date"),
+                tr!("Время", "Time"),
+                tr!("Направление", "Direction"),
+                tr!("Номер", "Number"),
+                tr!("Имя", "Name"),
+                tr!("Длительность разговора", "Conversation length"),
+                tr!("Статус", "Status"),
+                tr!("Причина", "Reason"),
+            ],
+            directions: [
+                tr!("Исходящий", "Outgoing"),
+                tr!("Входящий", "Incoming"),
+                tr!("Пропущенный", "Missed"),
+            ],
+            outcomes: [
+                tr!("Дозвон", "Answered"),
+                tr!("Недозвон", "Not answered"),
+                tr!("Ошибка", "Error"),
+            ],
+            reason: &reason,
+        };
+        let table = self.history.to_csv(self.utc_offset, &words);
+        match std::fs::write(path, table) {
+            Ok(()) => {
+                self.last_error = None;
+                self.log(tr!(
+                    format!(
+                        "История звонков ({}) сохранена в {}",
+                        self.history.records().len(),
+                        path.display()
+                    ),
+                    format!(
+                        "Call history ({}) saved to {}",
+                        self.history.records().len(),
+                        path.display()
+                    ),
                 ));
             }
             Err(error) => self.error(tr!(
@@ -3222,6 +3278,22 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             if !self.history.is_empty() && ui.button(tr!("Очистить", "Clear")).clicked() {
                 actions.push(Action::ClearHistory);
             }
+            let free = self.dialog.is_none();
+            if ui
+                .add_enabled(
+                    free && !self.history.is_empty(),
+                    egui::Button::new(tr!("Скачать историю…", "Download the history…")),
+                )
+                .on_hover_text(tr!(
+                    "Сохранить все звонки в файл CSV для Excel: дата, время, номер, \
+                     длительность разговора и статус",
+                    "Save every call to a CSV file for Excel: date, time, number, \
+                     length of the conversation and status"
+                ))
+                .clicked()
+            {
+                actions.push(Action::Browse(Dialog::ExportHistory));
+            }
         });
         ui.separator();
         let can_dial = self.lines[self.at].view.can_dial();
@@ -4170,6 +4242,15 @@ fn result_text(code: &str) -> Option<String> {
             Err(_) => other.to_owned(),
         },
     })
+}
+
+/// The suggested name of a saved call history: `calls-2026-11-19.csv`.
+fn history_file_name() -> String {
+    let today = DateTime::from_unix(now_unix(), utc_offset_seconds());
+    format!(
+        "calls-{}-{:02}-{:02}.csv",
+        today.year, today.month, today.day
+    )
 }
 
 /// "Copy the number" (and the name, when there is one) for a right click on

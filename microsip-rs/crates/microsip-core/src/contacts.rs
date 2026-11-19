@@ -195,7 +195,7 @@ impl Contacts {
     }
 }
 
-fn csv_cell(value: &str) -> String {
+pub(crate) fn csv_cell(value: &str) -> String {
     if value.contains([';', ',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
