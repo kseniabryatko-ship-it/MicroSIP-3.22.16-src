@@ -21,7 +21,9 @@ use microsip_core::recording::recording_file_name;
 use microsip_core::registration::{Account, RegistrationState};
 use microsip_core::secret;
 use microsip_core::services::{LineState, Voicemail};
-use microsip_core::settings::{self, Settings, default_recordings_dir};
+use microsip_core::settings::{
+    self, AccountSettings, Settings, account_title, default_recordings_dir,
+};
 use microsip_core::srtp::MediaEncryption;
 use microsip_core::stream::SipTransport;
 use microsip_core::tones::Melody;
@@ -87,6 +89,8 @@ enum Action {
     Voicemail,
     /// Removes the last character of the number.
     Erase,
+    /// Removes the whole number.
+    ClearNumber,
     /// Opens a file or folder with the program Windows uses for it.
     Open(PathBuf),
     /// Puts a contact's number into the number field.
@@ -100,6 +104,10 @@ enum Action {
     CodecsChanged,
     /// A box of the "Window" settings was changed.
     WindowChanged,
+    /// Makes the saved account with this number (among the others) active.
+    SwitchAccount(usize),
+    AddAccount,
+    RemoveAccount,
 }
 
 /// What a system dialog was opened for.
@@ -252,6 +260,13 @@ struct PhoneWindow {
     missed_seen: u64,
     /// "Почта" was pressed in the status bar.
     voicemail_requested: bool,
+    /// The saved accounts other than the active one.
+    other_accounts: Vec<AccountSettings>,
+    /// An account was chosen in the status bar.
+    account_requested: Option<usize>,
+    /// Passwords typed in this run, by account, so switching back and forth
+    /// does not ask again; never written anywhere.
+    typed_passwords: HashMap<(String, String), String>,
 }
 
 impl PhoneWindow {
@@ -402,6 +417,9 @@ impl PhoneWindow {
             last_error: None,
             missed_seen: now_unix(),
             voicemail_requested: false,
+            other_accounts: saved.accounts.clone(),
+            account_requested: None,
+            typed_passwords: HashMap::new(),
             messages_seen: now_unix(),
             chat_with: String::new(),
             chat_draft: String::new(),
@@ -524,18 +542,7 @@ impl PhoneWindow {
     /// Remembers everything typed. The password goes in encrypted, and only
     /// when the user allows it.
     fn save_settings(&mut self) {
-        let password_protected = if self.save_password && !self.password.is_empty() {
-            // Keep the stored form while the password is unchanged, so the
-            // file is not rewritten at every start.
-            match secret::unprotect(&self.saved.password_protected) {
-                Some(stored) if stored == self.password.trim() => {
-                    self.saved.password_protected.clone()
-                }
-                _ => secret::protect(self.password.trim()).unwrap_or_default(),
-            }
-        } else {
-            String::new()
-        };
+        let password_protected = self.protected_password();
         let current = Settings {
             local: self.saved.local.clone(),
             remote: self.number.trim().to_owned(),
@@ -571,6 +578,7 @@ impl PhoneWindow {
             tls_verify: self.tls_verify,
             media_encryption: self.encryption.name().to_owned(),
             stun: self.stun.trim().to_owned(),
+            accounts: self.other_accounts.clone(),
         };
         if current == self.saved {
             return;
@@ -887,6 +895,12 @@ impl PhoneWindow {
         let Some(call) = self.lines[self.at].current.take() else {
             return;
         };
+        // The field showed the number called; the call is over, so is it.
+        // ("Позвонить" on the empty field brings it back.)
+        if !call.incoming && dialable(&self.number) == dialable(&call.number) {
+            self.number.clear();
+            self.number_changed = true;
+        }
         if !record {
             return;
         }
@@ -907,6 +921,7 @@ impl PhoneWindow {
             number: call.number,
             name: call.name,
             recording: call.recording,
+            result: result_code(reason, call.incoming, call.connected.is_some()),
         });
         self.save_history();
     }
@@ -997,6 +1012,7 @@ impl PhoneWindow {
                         number,
                         name,
                         recording: String::new(),
+                        result: "dnd".to_owned(),
                     });
                     self.save_history();
                 }
@@ -1103,6 +1119,7 @@ impl PhoneWindow {
                         number,
                         name,
                         recording: String::new(),
+                        result: format!("forwarded {to}"),
                     });
                     self.save_history();
                 }
@@ -1201,6 +1218,11 @@ impl PhoneWindow {
                 self.number.pop();
                 self.number_changed = true;
             }
+            Action::ClearNumber => {
+                self.number.clear();
+                self.number_changed = true;
+                self.focus_number = true;
+            }
             Action::SwitchLine(line) => self.switch_line(line),
             Action::JoinLines => {
                 if let Some(other) = self.other_line() {
@@ -1243,6 +1265,9 @@ impl PhoneWindow {
                 }
             },
             Action::WindowChanged => self.save_settings(),
+            Action::SwitchAccount(index) => self.switch_account(index),
+            Action::AddAccount => self.add_account(),
+            Action::RemoveAccount => self.remove_account(),
             Action::Watch(number, on) => {
                 if self.contacts.set_watched(&number, on) {
                     self.save_contacts();
@@ -1597,9 +1622,152 @@ impl PhoneWindow {
         }
     }
 
+    // ----- several accounts -------------------------------------------------
+
+    /// The stored form of the password typed: kept as it is while the
+    /// password is unchanged, so the file is not rewritten at every start.
+    fn protected_password(&self) -> String {
+        if !self.save_password || self.password.is_empty() {
+            return String::new();
+        }
+        match secret::unprotect(&self.saved.password_protected) {
+            Some(stored) if stored == self.password.trim() => self.saved.password_protected.clone(),
+            _ => secret::protect(self.password.trim()).unwrap_or_default(),
+        }
+    }
+
+    /// The active account as it is typed in the settings.
+    fn current_account(&self) -> AccountSettings {
+        AccountSettings {
+            server: self.server.trim().to_owned(),
+            domain: self.domain.trim().to_owned(),
+            user: self.user.trim().to_owned(),
+            auth_user: self.auth_user.trim().to_owned(),
+            save_password: self.save_password,
+            password_protected: self.protected_password(),
+            transport: self.transport.name().to_owned(),
+            proxy: self.proxy.trim().to_owned(),
+            tls_verify: self.tls_verify,
+            media_encryption: self.encryption.name().to_owned(),
+            stun: self.stun.trim().to_owned(),
+            voicemail_number: self.voicemail_number.trim().to_owned(),
+        }
+    }
+
+    /// Makes `account` the one the settings show and the phone uses.
+    fn load_account(&mut self, account: &AccountSettings) {
+        // The password of the account being left stays at hand.
+        if !self.password.is_empty() {
+            self.typed_passwords.insert(
+                (self.server.trim().to_owned(), self.user.trim().to_owned()),
+                self.password.clone(),
+            );
+        }
+        self.server = account.server.clone();
+        self.domain = account.domain.clone();
+        self.user = account.user.clone();
+        self.auth_user = account.auth_user.clone();
+        self.save_password = account.save_password;
+        let saved = if account.save_password && !account.password_protected.is_empty() {
+            secret::unprotect(&account.password_protected)
+        } else {
+            None
+        };
+        self.password = saved
+            .or_else(|| {
+                self.typed_passwords
+                    .get(&(account.server.clone(), account.user.clone()))
+                    .cloned()
+            })
+            .unwrap_or_default();
+        // What is stored is this account's form of the password now.
+        self.saved.password_protected = account.password_protected.clone();
+        self.transport = SipTransport::from_name(&account.transport);
+        self.proxy = account.proxy.clone();
+        self.tls_verify = account.tls_verify;
+        self.encryption = MediaEncryption::from_name(&account.media_encryption);
+        self.stun = account.stun.clone();
+        self.voicemail_number = account.voicemail_number.clone();
+        // What the previous account's exchange said does not apply.
+        self.voicemail = None;
+        self.presence.clear();
+    }
+
+    /// Connects the account just made active, or asks for what is missing.
+    fn start_account(&mut self) {
+        self.save_settings();
+        if self.account_is_set() && !self.password.is_empty() {
+            self.log(format!(
+                "Аккаунт: {}",
+                account_title(&self.user, &self.server)
+            ));
+            self.connect();
+        } else {
+            self.disconnect();
+            self.settings_open = true;
+        }
+    }
+
+    fn switch_account(&mut self, index: usize) {
+        if index >= self.other_accounts.len() {
+            return;
+        }
+        if self
+            .lines
+            .iter()
+            .any(|line| line.view.phase() != Phase::Idle)
+        {
+            return self.error("Сменить аккаунт можно, когда нет звонков");
+        }
+        let current = self.current_account();
+        let chosen = self.other_accounts.remove(index);
+        self.other_accounts.push(current);
+        self.load_account(&chosen);
+        self.start_account();
+    }
+
+    fn add_account(&mut self) {
+        if self
+            .lines
+            .iter()
+            .any(|line| line.view.phase() != Phase::Idle)
+        {
+            return self.error("Добавить аккаунт можно, когда нет звонков");
+        }
+        let current = self.current_account();
+        self.other_accounts.push(current);
+        self.load_account(&AccountSettings::default());
+        self.disconnect();
+        self.save_settings();
+        self.settings_open = true;
+        self.log("Новый аккаунт: укажите сервер, номер и пароль");
+    }
+
+    /// Forgets the active account; the next saved one takes its place.
+    fn remove_account(&mut self) {
+        if self.other_accounts.is_empty() {
+            return;
+        }
+        if self
+            .lines
+            .iter()
+            .any(|line| line.view.phase() != Phase::Idle)
+        {
+            return self.error("Удалить аккаунт можно, когда нет звонков");
+        }
+        let removed = account_title(&self.user, &self.server);
+        let next = self.other_accounts.remove(0);
+        self.load_account(&next);
+        self.log(format!("Аккаунт удалён: {removed}"));
+        self.start_account();
+    }
+
     // ----- drawing -------------------------------------------------------
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        // A narrow window: the status on its own line, the buttons on the
+        // next one.
+        let narrow = ui.available_width() < 420.0;
         ui.horizontal(|ui| {
             let (color, text) = match self.registration.as_ref() {
                 Some(RegistrationState::Registered { .. }) => {
@@ -1621,46 +1789,20 @@ impl PhoneWindow {
             let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
             ui.painter().circle_filled(dot.center(), 5.0, color);
             let user = self.user.trim();
-            let status = if user.is_empty() {
+            // With several accounts the number is in the list next to it.
+            let status = if user.is_empty() || !self.other_accounts.is_empty() {
                 text
             } else {
                 format!("{user} — {text}")
             };
+            if narrow {
+                self.account_choice(ui);
+                ui.add(egui::Label::new(status).truncate());
+                return;
+            }
+            self.account_choice(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Журнал").clicked() {
-                    self.log_open = !self.log_open;
-                }
-                if let Some(voicemail) = self.voicemail {
-                    let text = if voicemail.new > 0 {
-                        egui::RichText::new(format!("Почта: {}", voicemail.new))
-                            .color(egui::Color32::RED)
-                            .strong()
-                    } else {
-                        egui::RichText::new("Почта")
-                    };
-                    if ui
-                        .button(text)
-                        .on_hover_text(format!(
-                            "Новых: {}, прослушанных: {}. Нажмите, чтобы позвонить в ящик.",
-                            voicemail.new, voicemail.old
-                        ))
-                        .clicked()
-                    {
-                        self.voicemail_requested = true;
-                    }
-                }
-                if ui.button("Настройки").clicked() {
-                    self.settings_open = !self.settings_open;
-                }
-                let mut dnd = self.do_not_disturb;
-                let label = if dnd {
-                    egui::RichText::new("Не беспокоить").color(egui::Color32::RED)
-                } else {
-                    egui::RichText::new("Не беспокоить")
-                };
-                if ui.checkbox(&mut dnd, label).changed() {
-                    self.pending_dnd = Some(dnd);
-                }
+                self.status_buttons(ui, true);
                 // The status takes the room that is left and is cut short
                 // rather than running under the buttons.
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -1668,6 +1810,92 @@ impl PhoneWindow {
                 });
             });
         });
+        if narrow {
+            ui.horizontal_wrapped(|ui| self.status_buttons(ui, false));
+        }
+    }
+
+    /// With several accounts the active one is chosen here.
+    fn account_choice(&mut self, ui: &mut egui::Ui) {
+        if self.other_accounts.is_empty() {
+            return;
+        }
+        let current = account_title(&self.user, &self.server);
+        // Closed it shows the number only: the bar is narrow.
+        let short = if self.user.trim().is_empty() {
+            "аккаунт".to_owned()
+        } else {
+            self.user.trim().to_owned()
+        };
+        egui::ComboBox::from_id_salt("account-choice")
+            .selected_text(egui::RichText::new(short).small())
+            .width(64.0)
+            .show_ui(ui, |ui| {
+                ui.add_enabled(false, egui::SelectableLabel::new(true, &current));
+                for (index, account) in self.other_accounts.iter().enumerate() {
+                    if ui.selectable_label(false, account.title()).clicked() {
+                        self.account_requested = Some(index);
+                    }
+                }
+            });
+    }
+
+    /// Log, voicemail, settings and do-not-disturb. `reversed` for a
+    /// right-to-left row, where the first one added is the rightmost.
+    fn status_buttons(&mut self, ui: &mut egui::Ui, reversed: bool) {
+        let mut order = [0, 1, 2, 3];
+        if !reversed {
+            order.reverse();
+        }
+        for item in order {
+            match item {
+                0 => {
+                    if ui.button("Журнал").clicked() {
+                        self.log_open = !self.log_open;
+                    }
+                }
+                1 => self.voicemail_button(ui),
+                2 => {
+                    if ui.button("Настройки").clicked() {
+                        self.settings_open = !self.settings_open;
+                    }
+                }
+                _ => {
+                    let mut dnd = self.do_not_disturb;
+                    let label = if dnd {
+                        egui::RichText::new("Не беспокоить").color(egui::Color32::RED)
+                    } else {
+                        egui::RichText::new("Не беспокоить")
+                    };
+                    if ui.checkbox(&mut dnd, label).changed() {
+                        self.pending_dnd = Some(dnd);
+                    }
+                }
+            }
+        }
+    }
+
+    fn voicemail_button(&mut self, ui: &mut egui::Ui) {
+        let Some(voicemail) = self.voicemail else {
+            return;
+        };
+        let text = if voicemail.new > 0 {
+            egui::RichText::new(format!("Почта: {}", voicemail.new))
+                .color(egui::Color32::RED)
+                .strong()
+        } else {
+            egui::RichText::new("Почта")
+        };
+        if ui
+            .button(text)
+            .on_hover_text(format!(
+                "Новых: {}, прослушанных: {}. Нажмите, чтобы позвонить в ящик.",
+                voicemail.new, voicemail.old
+            ))
+            .clicked()
+        {
+            self.voicemail_requested = true;
+        }
     }
 
     /// What a line's button says: its number and what is on it.
@@ -1695,7 +1923,7 @@ impl PhoneWindow {
     }
 
     fn lines_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for line in 0..LINES {
                 let label = self.line_label(line);
                 let ringing = self.lines[line].view.phase() == Phase::Incoming;
@@ -1745,6 +1973,57 @@ impl PhoneWindow {
     }
 
     fn dialpad_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        // Everything is sized from the room there is, so the window can be
+        // made any size; when it is too small for even the smallest keys,
+        // the page scrolls instead of being cut off.
+        let room = ui.available_size();
+        let gap = ui.spacing().item_spacing;
+        let idle = self.lines[self.at].view.phase() == Phase::Idle;
+        // Below the keys: two rows of buttons when idle, about four in a
+        // call; above them the lines, the number and a line of hints; at
+        // the bottom the volumes and a few lines of state.
+        let rows_below = if idle { 2.0 } else { 4.0 };
+        let fixed = 210.0;
+        let key_height = ((room.y - fixed - rows_below * 56.0) / 4.0 - gap.y).clamp(30.0, 130.0);
+        let sizes = PadSizes {
+            key: egui::vec2(((room.x - 2.0 * gap.x) / 3.0).max(36.0), key_height),
+            key_font: (key_height * 0.42).clamp(16.0, 44.0),
+            row: (key_height * 0.7).clamp(30.0, 64.0),
+            row_font: (key_height * 0.3).clamp(13.0, 24.0),
+        };
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.dialpad_content(ui, actions, &sizes);
+                // The volumes sit at the bottom when there is room.
+                let used = ui.min_rect().height();
+                let volumes = 2.0 * ui.spacing().interact_size.y + 2.0 * gap.y + 8.0;
+                if used + volumes < room.y {
+                    ui.add_space(room.y - used - volumes);
+                }
+                self.volume_sliders(ui);
+            });
+    }
+
+    fn volume_sliders(&mut self, ui: &mut egui::Ui) {
+        let before = (self.speaker_volume, self.microphone_volume);
+        let width = (ui.available_width() - 150.0).clamp(60.0, 400.0);
+        ui.spacing_mut().slider_width = width;
+        ui.horizontal(|ui| {
+            ui.add_sized([70.0, 18.0], egui::Label::new("Динамик"));
+            ui.add(egui::Slider::new(&mut self.speaker_volume, 0..=200).suffix("%"));
+        });
+        ui.horizontal(|ui| {
+            ui.add_sized([70.0, 18.0], egui::Label::new("Микрофон"));
+            ui.add(egui::Slider::new(&mut self.microphone_volume, 0..=200).suffix("%"));
+        });
+        if before != (self.speaker_volume, self.microphone_volume) {
+            // Volumes act at once; they are saved when the window closes.
+            self.apply_audio_settings();
+        }
+    }
+
+    fn dialpad_content(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>, sizes: &PadSizes) {
         self.lines_bar(ui, actions);
         let phase = self.lines[self.at].view.phase();
         let idle = phase == Phase::Idle;
@@ -1812,12 +2091,11 @@ impl PhoneWindow {
         }
         ui.add_space(6.0);
 
-        let size = egui::vec2((ui.available_width() - 16.0) / 3.0, 44.0);
         for row in KEYPAD {
             ui.horizontal(|ui| {
                 for digit in row.chars() {
-                    let label = egui::RichText::new(digit.to_string()).size(22.0);
-                    if ui.add_sized(size, egui::Button::new(label)).clicked() {
+                    let label = egui::RichText::new(digit.to_string()).size(sizes.key_font);
+                    if ui.add_sized(sizes.key, egui::Button::new(label)).clicked() {
                         actions.push(Action::Digit(digit));
                     }
                 }
@@ -1825,35 +2103,56 @@ impl PhoneWindow {
         }
         ui.add_space(6.0);
 
-        let wide = egui::vec2(ui.available_width(), 40.0);
-        let half = egui::vec2((ui.available_width() - 8.0) / 2.0, 40.0);
+        let spacing = ui.spacing().item_spacing.x;
+        let wide = egui::vec2(ui.available_width(), sizes.row);
+        let half = egui::vec2((ui.available_width() - spacing) / 2.0, sizes.row);
+        let third = egui::vec2(
+            (ui.available_width() - 2.0 * spacing) / 3.0,
+            sizes.row * 0.85,
+        );
         let green = egui::Color32::from_rgb(40, 140, 60);
         let red = egui::Color32::from_rgb(170, 50, 50);
         let big = |text: &str| {
             egui::RichText::new(text)
-                .size(18.0)
+                .size(sizes.row_font)
                 .color(egui::Color32::WHITE)
         };
+        let small = |text: &str| egui::RichText::new(text).size((sizes.row_font * 0.8).max(12.0));
         match phase {
             Phase::Idle => {
+                let call = egui::Button::new(big("Позвонить")).fill(green);
+                if ui
+                    .add_sized(wide, call)
+                    .on_hover_text("На пустом поле — вернуть последний набранный номер")
+                    .clicked()
+                {
+                    actions.push(Action::Call(self.number.clone()));
+                }
                 ui.horizontal(|ui| {
-                    let call = egui::Button::new(big("Позвонить")).fill(green);
-                    if ui.add_sized(half, call).clicked() {
-                        actions.push(Action::Call(self.number.clone()));
-                    }
-                    let quarter = egui::vec2((half.x - 8.0) / 2.0, half.y);
                     if ui
-                        .add_sized(quarter, egui::Button::new("Вставить"))
+                        .add_sized(third, egui::Button::new(small("Вставить")))
+                        .on_hover_text("Номер из буфера обмена (Ctrl+V)")
                         .clicked()
                     {
                         actions.push(Action::Paste);
                     }
-                    if ui
-                        .add_sized(quarter, egui::Button::new("Стереть"))
-                        .clicked()
-                    {
-                        actions.push(Action::Erase);
-                    }
+                    let has_number = !self.number.is_empty();
+                    ui.add_enabled_ui(has_number, |ui| {
+                        if ui
+                            .add_sized(third, egui::Button::new(small("Стереть")))
+                            .on_hover_text("Убрать последнюю цифру")
+                            .clicked()
+                        {
+                            actions.push(Action::Erase);
+                        }
+                        if ui
+                            .add_sized(third, egui::Button::new(small("Очистить")))
+                            .on_hover_text("Убрать весь номер")
+                            .clicked()
+                        {
+                            actions.push(Action::ClearNumber);
+                        }
+                    });
                 });
             }
             Phase::Incoming => {
@@ -1910,7 +2209,7 @@ impl PhoneWindow {
                     ui.horizontal(|ui| {
                         let field = egui::TextEdit::singleline(&mut self.transfer_to)
                             .hint_text("Перевести на номер")
-                            .desired_width(half.x);
+                            .desired_width((ui.available_width() - 100.0).max(80.0));
                         let typed = ui.add(field);
                         let enter = typed.lost_focus()
                             && ui.input(|input| input.key_pressed(egui::Key::Enter));
@@ -1966,22 +2265,6 @@ impl PhoneWindow {
         if let Some(error) = self.last_error.as_ref() {
             ui.colored_label(egui::Color32::RED, error);
         }
-
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            let before = (self.speaker_volume, self.microphone_volume);
-            ui.horizontal(|ui| {
-                ui.label("Микрофон");
-                ui.add(egui::Slider::new(&mut self.microphone_volume, 0..=200).suffix("%"));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Динамик   ");
-                ui.add(egui::Slider::new(&mut self.speaker_volume, 0..=200).suffix("%"));
-            });
-            if before != (self.speaker_volume, self.microphone_volume) {
-                // Volumes act at once; they are saved when the window closes.
-                self.apply_audio_settings();
-            }
-        });
     }
 
     fn calls_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -2027,7 +2310,6 @@ impl PhoneWindow {
                 ui.push_id(index, |ui| {
                     ui.horizontal(|ui| {
                         ui.colored_label(color, mark);
-                        ui.label(who);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .add_enabled(can_dial, egui::Button::new("Позвонить"))
@@ -2041,6 +2323,14 @@ impl PhoneWindow {
                             if !record.recording.is_empty() && ui.button("Запись").clicked() {
                                 actions.push(Action::Open(PathBuf::from(&record.recording)));
                             }
+                            // The name takes the room the buttons leave.
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add(egui::Label::new(&who).truncate())
+                                        .on_hover_text(&who);
+                                },
+                            );
                         });
                     });
                     let length = if record.seconds > 0 {
@@ -2048,10 +2338,16 @@ impl PhoneWindow {
                     } else {
                         String::new()
                     };
-                    ui.weak(format!(
-                        "{}{length}",
-                        format_timestamp(record.time, self.utc_offset)
-                    ));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.weak(format!(
+                            "{}{length}",
+                            format_timestamp(record.time, self.utc_offset)
+                        ));
+                        // Why the call did not take place, as MicroSIP shows it.
+                        if let Some(why) = result_text(&record.result) {
+                            ui.colored_label(egui::Color32::from_rgb(210, 80, 80), why);
+                        }
+                    });
                     ui.separator();
                 });
             }
@@ -2182,17 +2478,49 @@ impl PhoneWindow {
 
     fn settings_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let mut open = self.settings_open;
+        // Never larger than the phone's window, whatever its size; what
+        // does not fit scrolls.
+        let screen = ctx.screen_rect();
         egui::Window::new("Настройки")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
+            .constrain(true)
+            .max_width((screen.width() - 16.0).max(200.0))
+            .min_width((screen.width() - 16.0).clamp(200.0, 400.0))
             .show(ctx, |ui| {
-                // The settings are taller than the phone's window.
-                let room = (ui.ctx().screen_rect().height() - 70.0).max(200.0);
-                egui::ScrollArea::vertical()
+                let room = (screen.height() - 70.0).max(150.0);
+                egui::ScrollArea::both()
                     .max_height(room)
                     .show(ui, |ui| {
-                        ui.heading("Аккаунт");
+                        ui.horizontal(|ui| {
+                            ui.heading("Аккаунт");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .add_enabled(
+                                        !self.other_accounts.is_empty(),
+                                        egui::Button::new("Удалить этот"),
+                                    )
+                                    .on_hover_text("Забыть этот аккаунт; станет активным следующий")
+                                    .clicked()
+                                {
+                                    actions.push(Action::RemoveAccount);
+                                }
+                                if ui
+                                    .button("Добавить")
+                                    .on_hover_text("Ещё один аккаунт; переключение — в верхней строке окна")
+                                    .clicked()
+                                {
+                                    actions.push(Action::AddAccount);
+                                }
+                            });
+                        });
+                        if !self.other_accounts.is_empty() {
+                            ui.weak(format!(
+                                "Аккаунтов: {}. Работает один — выбранный в верхней строке окна.",
+                                self.other_accounts.len() + 1
+                            ));
+                        }
                         egui::Grid::new("account").num_columns(2).show(ui, |ui| {
                             ui.label("SIP-сервер");
                             ui.text_edit_singleline(&mut self.server);
@@ -2603,6 +2931,53 @@ fn error_text(message: &str) -> String {
     message.to_owned()
 }
 
+/// Sizes of the dial pad, worked out from the window's size.
+struct PadSizes {
+    key: egui::Vec2,
+    key_font: f32,
+    /// Height of the rows of buttons under the keys.
+    row: f32,
+    row_font: f32,
+}
+
+/// The code kept in the call list for how a call ended; empty for a call
+/// that went normally.
+fn result_code(reason: EndReason, incoming: bool, connected: bool) -> String {
+    match reason {
+        EndReason::Completed if connected => String::new(),
+        EndReason::Completed => "failed".to_owned(),
+        EndReason::Rejected(_) if incoming => "declined".to_owned(),
+        EndReason::Rejected(status) => status.to_string(),
+        // An incoming call given up by the caller is simply missed.
+        EndReason::Cancelled if incoming => String::new(),
+        EndReason::Cancelled => "cancelled".to_owned(),
+        EndReason::Timeout => "timeout".to_owned(),
+        EndReason::Failed => "failed".to_owned(),
+    }
+}
+
+/// What the call list says about such a code.
+fn result_text(code: &str) -> Option<String> {
+    let code = code.trim();
+    if code.is_empty() {
+        return None;
+    }
+    if let Some(to) = code.strip_prefix("forwarded ") {
+        return Some(format!("переадресован на {to}"));
+    }
+    Some(match code {
+        "cancelled" => "отменён".to_owned(),
+        "timeout" => "нет ответа".to_owned(),
+        "failed" => "не удалось позвонить".to_owned(),
+        "declined" => "отклонён".to_owned(),
+        "dnd" => "отклонён: «Не беспокоить»".to_owned(),
+        other => match other.parse::<u16>() {
+            Ok(status) => end_reason_text(EndReason::Rejected(status)),
+            Err(_) => other.to_owned(),
+        },
+    })
+}
+
 /// The colour of a busy lamp and what it means.
 fn lamp_look(state: LineState) -> (egui::Color32, &'static str) {
     match state {
@@ -2699,7 +3074,7 @@ impl eframe::App for PhoneWindow {
             } else {
                 "Звонки".to_owned()
             };
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Dialpad, "Набор");
                 ui.selectable_value(&mut self.tab, Tab::Calls, calls);
                 ui.selectable_value(&mut self.tab, Tab::Contacts, "Контакты");
@@ -2726,6 +3101,9 @@ impl eframe::App for PhoneWindow {
         if self.log_open {
             self.log_window(ctx);
         }
+        if let Some(index) = self.account_requested.take() {
+            actions.push(Action::SwitchAccount(index));
+        }
         if std::mem::take(&mut self.voicemail_requested) {
             actions.push(Action::Voicemail);
         }
@@ -2744,7 +3122,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([400.0, 640.0])
-            .with_min_inner_size([360.0, 560.0]),
+            // Any size from small to full screen; the window adapts.
+            .with_min_inner_size([280.0, 360.0]),
         ..Default::default()
     };
     eframe::run_native(

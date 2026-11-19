@@ -80,10 +80,20 @@ fn the_sender_learns_its_loss_and_the_delay_from_the_other_sides_reports() {
         let due = started + Duration::from_millis(u64::from(block + 1) * 20);
         thread::sleep(due.saturating_duration_since(Instant::now()));
     }
-    // Reports keep coming after the audio; the last one sums it all.
-    thread::sleep(interval * 3);
-
-    let quality = a.remote_quality().expect("B reported");
+    // Reports keep coming after the audio; one sent after its end sums it
+    // all. How soon it arrives depends on the computer's timers (Windows
+    // may sleep longer than asked), so it is waited for, up to 3 s; a
+    // report made in the middle of the audio counts fewer losses.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let quality = loop {
+        let quality = a.remote_quality();
+        let complete = quality
+            .is_some_and(|quality| quality.lost_total >= 8 && quality.round_trip_ms.is_some());
+        if complete || Instant::now() >= deadline {
+            break quality.expect("B reported");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
     assert!(
         (8..=12).contains(&quality.lost_total),
         "B lost {} of 100 packets",

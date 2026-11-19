@@ -1,9 +1,10 @@
 //! The list of recent calls, kept in a plain text file next to the settings.
 //!
 //! One call per line, fields separated by tabs:
-//! `time  direction  seconds  number  name  recording`. The last field (the
-//! recording's file path) may be missing. Unreadable lines are skipped, so a
-//! damaged file loses those calls only.
+//! `time  direction  seconds  number  name  recording  result`. The last
+//! fields (the recording's file path, why the call did not take place) may
+//! be missing. Unreadable lines are skipped, so a damaged file loses those
+//! calls only.
 
 use std::fs;
 use std::io;
@@ -52,6 +53,10 @@ pub struct CallRecord {
     pub name: String,
     /// Path of the call's recording; empty when it was not recorded.
     pub recording: String,
+    /// Why the call did not go as usual: a SIP status (`486`),
+    /// `cancelled`, `timeout`, `failed`, `declined`, `dnd`, or
+    /// `forwarded NUMBER`. Empty for a call that went normally.
+    pub result: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -99,6 +104,7 @@ impl History {
                 let number = fields.next()?.trim().to_owned();
                 let name = fields.next().unwrap_or("").trim().to_owned();
                 let recording = fields.next().unwrap_or("").trim().to_owned();
+                let result = fields.next().unwrap_or("").trim().to_owned();
                 (!number.is_empty()).then_some(CallRecord {
                     time,
                     direction,
@@ -106,6 +112,7 @@ impl History {
                     number,
                     name,
                     recording,
+                    result,
                 })
             })
             .collect();
@@ -117,8 +124,15 @@ impl History {
         self.records
             .iter()
             .map(|record| {
+                // The result only when there is one: files of calls that
+                // went normally look as they always did.
+                let result = if record.result.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\t{}", field(&record.result))
+                };
                 format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}{result}\n",
                     record.time,
                     record.direction.code(),
                     record.seconds,
@@ -171,6 +185,7 @@ mod tests {
             number: number.to_owned(),
             name: String::new(),
             recording: String::new(),
+            result: String::new(),
         }
     }
 
@@ -199,6 +214,7 @@ mod tests {
             number: "4010".to_owned(),
             name: "Иван Петров".to_owned(),
             recording: r"C:\Users\kseni\Documents\calls\2026-11-12_01-31-40_in_4010.wav".to_owned(),
+            result: String::new(),
         });
         history.add(record(
             1_794_436_400,
@@ -237,11 +253,36 @@ mod tests {
             number: "40\t10".to_owned(),
             name: "two\nlines".to_owned(),
             recording: String::new(),
+            result: String::new(),
         });
         let parsed = History::parse(&history.serialize());
         assert_eq!(parsed.records().len(), 1);
         assert_eq!(parsed.records()[0].number, "40 10");
         assert_eq!(parsed.records()[0].name, "two lines");
+    }
+
+    #[test]
+    fn why_a_call_failed_is_kept_and_old_lines_have_no_result() {
+        let mut history = History::default();
+        history.add(CallRecord {
+            result: "486".to_owned(),
+            ..record(100, Direction::Outgoing, "4010")
+        });
+        history.add(CallRecord {
+            result: "forwarded 4011".to_owned(),
+            ..record(200, Direction::Missed, "4012")
+        });
+        history.add(record(300, Direction::Incoming, "4013"));
+        let text = history.serialize();
+        assert!(text.contains("100\tout\t0\t4010\t\t\t486\n"), "{text}");
+        assert!(text.contains("\t\tforwarded 4011\n"), "{text}");
+        // A call that went normally is written as before.
+        assert!(text.starts_with("300\tin\t0\t4013\t\t\n"), "{text}");
+        assert_eq!(History::parse(&text), history);
+        // A line of an older version, with six fields, has no result.
+        let old = History::parse("1\tout\t3\t4010\tАнна\tC:\\rec.wav\n");
+        assert_eq!(old.records()[0].result, "");
+        assert_eq!(old.records()[0].recording, "C:\\rec.wav");
     }
 
     #[test]

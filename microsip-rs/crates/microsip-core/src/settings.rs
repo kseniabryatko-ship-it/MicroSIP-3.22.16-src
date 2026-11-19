@@ -79,6 +79,9 @@ pub struct Settings {
     pub echo_cancellation: bool,
     /// Lower steady background noise in the microphone.
     pub noise_suppression: bool,
+    /// The saved accounts other than the active one (whose settings are
+    /// the fields above), in the order they were added.
+    pub accounts: Vec<AccountSettings>,
 }
 
 impl Default for Settings {
@@ -118,6 +121,7 @@ impl Default for Settings {
             voicemail_number: "*97".to_owned(),
             echo_cancellation: true,
             noise_suppression: true,
+            accounts: Vec::new(),
         }
     }
 }
@@ -128,6 +132,9 @@ impl Settings {
     /// file never prevents the program from starting.
     pub fn parse(text: &str) -> Self {
         let mut settings = Self::default();
+        // Other accounts by their number, in the order of the numbers.
+        let mut accounts: std::collections::BTreeMap<usize, AccountSettings> =
+            std::collections::BTreeMap::new();
         // Notepad may put a byte-order mark in front of the first line.
         for line in text.trim_start_matches('\u{feff}').lines() {
             let line = line.trim();
@@ -138,6 +145,22 @@ impl Settings {
                 continue;
             };
             let value = value.trim().to_owned();
+            // `account.2.server=...`: a field of another saved account.
+            if let Some((number, field)) = key
+                .trim()
+                .strip_prefix("account.")
+                .and_then(|rest| rest.split_once('.'))
+                && let Ok(number) = number.parse::<usize>()
+            {
+                // An unknown key neither makes an account nor loses one.
+                let existing = accounts.remove(&number);
+                let known = existing.is_some();
+                let mut account = existing.unwrap_or_default();
+                if account.set(field, value) || known {
+                    accounts.insert(number, account);
+                }
+                continue;
+            }
             match key.trim() {
                 "local" => settings.local = value,
                 "remote" => settings.remote = value,
@@ -193,6 +216,7 @@ impl Settings {
                 _ => {}
             }
         }
+        settings.accounts = accounts.into_values().collect();
         settings
     }
 
@@ -262,6 +286,9 @@ impl Settings {
             text.push_str(&one_line(value));
             text.push('\n');
         }
+        for (index, account) in self.accounts.iter().enumerate() {
+            account.write(index + 1, &mut text);
+        }
         text
     }
 
@@ -291,6 +318,130 @@ pub(crate) fn write_through_temporary(path: &Path, text: &str) -> io::Result<()>
     let temporary = PathBuf::from(temporary);
     fs::write(&temporary, text)?;
     fs::rename(&temporary, path)
+}
+
+/// A saved account that is not the active one. The active account's
+/// settings are the top-level fields of [`Settings`]; switching swaps one
+/// of these with them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSettings {
+    pub server: String,
+    pub domain: String,
+    pub user: String,
+    pub auth_user: String,
+    pub save_password: bool,
+    /// As produced by `secret::protect`; empty when not saved.
+    pub password_protected: String,
+    pub transport: String,
+    pub proxy: String,
+    pub tls_verify: bool,
+    pub media_encryption: String,
+    pub stun: String,
+    pub voicemail_number: String,
+}
+
+impl Default for AccountSettings {
+    fn default() -> Self {
+        Self::of(&Settings::default())
+    }
+}
+
+impl AccountSettings {
+    /// The account part of `settings` (its active account).
+    pub fn of(settings: &Settings) -> Self {
+        Self {
+            server: settings.server.clone(),
+            domain: settings.domain.clone(),
+            user: settings.user.clone(),
+            auth_user: settings.auth_user.clone(),
+            save_password: settings.save_password,
+            password_protected: settings.password_protected.clone(),
+            transport: settings.transport.clone(),
+            proxy: settings.proxy.clone(),
+            tls_verify: settings.tls_verify,
+            media_encryption: settings.media_encryption.clone(),
+            stun: settings.stun.clone(),
+            voicemail_number: settings.voicemail_number.clone(),
+        }
+    }
+
+    /// Makes this the active account of `settings`.
+    pub fn apply_to(&self, settings: &mut Settings) {
+        settings.server = self.server.clone();
+        settings.domain = self.domain.clone();
+        settings.user = self.user.clone();
+        settings.auth_user = self.auth_user.clone();
+        settings.save_password = self.save_password;
+        settings.password_protected = self.password_protected.clone();
+        settings.transport = self.transport.clone();
+        settings.proxy = self.proxy.clone();
+        settings.tls_verify = self.tls_verify;
+        settings.media_encryption = self.media_encryption.clone();
+        settings.stun = self.stun.clone();
+        settings.voicemail_number = self.voicemail_number.clone();
+    }
+
+    /// How the account is shown in a list: `4009 @ pbx.example.com`.
+    pub fn title(&self) -> String {
+        account_title(&self.user, &self.server)
+    }
+
+    /// Sets one field from a settings line; false for an unknown key.
+    fn set(&mut self, key: &str, value: String) -> bool {
+        match key {
+            "server" => self.server = value,
+            "domain" => self.domain = value,
+            "user" => self.user = value,
+            "auth_user" => self.auth_user = value,
+            "save_password" => self.save_password = value != "0",
+            "password_protected" => self.password_protected = value,
+            "transport" => self.transport = value,
+            "proxy" => self.proxy = value,
+            "tls_verify" => self.tls_verify = value != "0",
+            "media_encryption" => self.media_encryption = value,
+            "stun" => self.stun = value,
+            "voicemail_number" => self.voicemail_number = value,
+            _ => return false,
+        }
+        true
+    }
+
+    /// The lines of this account, numbered `number`.
+    fn write(&self, number: usize, text: &mut String) {
+        let flag = |on: bool| if on { "1" } else { "0" }.to_owned();
+        // Without permission to remember it, no form of the password is written.
+        let password = if self.save_password {
+            self.password_protected.clone()
+        } else {
+            String::new()
+        };
+        for (key, value) in [
+            ("server", self.server.clone()),
+            ("domain", self.domain.clone()),
+            ("user", self.user.clone()),
+            ("auth_user", self.auth_user.clone()),
+            ("save_password", flag(self.save_password)),
+            ("password_protected", password),
+            ("transport", self.transport.clone()),
+            ("proxy", self.proxy.clone()),
+            ("tls_verify", flag(self.tls_verify)),
+            ("media_encryption", self.media_encryption.clone()),
+            ("stun", self.stun.clone()),
+            ("voicemail_number", self.voicemail_number.clone()),
+        ] {
+            text.push_str(&format!("account.{number}.{key}={}\n", one_line(&value)));
+        }
+    }
+}
+
+/// How an account is shown: `4009 @ pbx.example.com`, or what there is.
+pub fn account_title(user: &str, server: &str) -> String {
+    match (user.trim(), server.trim()) {
+        ("", "") => "новый аккаунт".to_owned(),
+        (user, "") => user.to_owned(),
+        ("", server) => server.to_owned(),
+        (user, server) => format!("{user} @ {server}"),
+    }
 }
 
 fn parse_volume(value: &str) -> Option<u32> {
@@ -381,6 +532,7 @@ mod tests {
             voicemail_number: "*98".to_owned(),
             echo_cancellation: false,
             noise_suppression: true,
+            accounts: Vec::new(),
         }
     }
 
@@ -394,6 +546,83 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         directory
+    }
+
+    #[test]
+    fn other_accounts_are_kept_numbered_and_switching_swaps_them() {
+        let mut settings = sample();
+        let mut office = AccountSettings::of(&settings);
+        office.server = "office.example.com".to_owned();
+        office.user = "4010".to_owned();
+        office.password_protected = "ffee".to_owned();
+        let mut home = AccountSettings {
+            server: "sip.provider.ru".to_owned(),
+            user: "74951234567".to_owned(),
+            save_password: false,
+            password_protected: "must-not-be-written".to_owned(),
+            ..AccountSettings::default()
+        };
+        settings.accounts = vec![office.clone(), home.clone()];
+
+        let text = settings.serialize();
+        // The active account is written as always, the others after it.
+        assert!(text.contains("\nserver=pbx.example.com:5080\n"));
+        assert!(text.contains("\naccount.1.server=office.example.com\n"));
+        assert!(text.contains("\naccount.1.password_protected=ffee\n"));
+        assert!(text.contains("\naccount.2.user=74951234567\n"));
+        // Not allowed to remember it: no form of that password is written.
+        assert!(!text.contains("must-not-be-written"));
+        assert!(text.contains("\naccount.2.password_protected=\n"));
+
+        let parsed = Settings::parse(&text);
+        home.password_protected.clear();
+        assert_eq!(parsed.accounts, [office.clone(), home]);
+        assert_eq!(parsed.server, "pbx.example.com:5080");
+
+        // Switching: the chosen one becomes active, the active one is kept.
+        let mut switched = parsed.clone();
+        let chosen = switched.accounts.remove(0);
+        let previous = AccountSettings::of(&switched);
+        chosen.apply_to(&mut switched);
+        switched.accounts.push(previous.clone());
+        assert_eq!(switched.server, "office.example.com");
+        assert_eq!(switched.user, "4010");
+        assert_eq!(switched.password_protected, "ffee");
+        assert_eq!(AccountSettings::of(&switched), office);
+        assert_eq!(switched.accounts[1], previous);
+        assert_eq!(Settings::parse(&switched.serialize()), switched);
+    }
+
+    #[test]
+    fn account_lines_out_of_order_or_unknown_are_handled() {
+        let text = "server=main\naccount.7.server=seven\naccount.2.server=two\n\
+                    account.2.colour=blue\naccount.x.server=bad\naccount.3.nonsense=1\n";
+        let settings = Settings::parse(text);
+        let servers: Vec<&str> = settings
+            .accounts
+            .iter()
+            .map(|account| account.server.as_str())
+            .collect();
+        // In the order of their numbers; nothing made of unknown keys.
+        assert_eq!(servers, ["two", "seven"]);
+        assert_eq!(settings.server, "main");
+    }
+
+    #[test]
+    fn accounts_have_readable_titles() {
+        assert_eq!(
+            account_title("4009", "pbx.example.com"),
+            "4009 @ pbx.example.com"
+        );
+        assert_eq!(account_title(" 4009 ", ""), "4009");
+        assert_eq!(account_title("", "pbx"), "pbx");
+        assert_eq!(account_title("", ""), "новый аккаунт");
+        let account = AccountSettings {
+            user: "100".to_owned(),
+            server: "sip.local".to_owned(),
+            ..AccountSettings::default()
+        };
+        assert_eq!(account.title(), "100 @ sip.local");
     }
 
     #[test]
