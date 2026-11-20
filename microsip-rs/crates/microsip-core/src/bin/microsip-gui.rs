@@ -3012,12 +3012,24 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         ui.horizontal_centered(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().button_padding = egui::vec2(9.0, 6.0);
-                ui.menu_button(
-                    egui::RichText::new("☰").size(18.0).color(colors.text),
-                    |ui| {
-                        self.main_menu(ui);
-                    },
-                );
+                let menu = ui
+                    .menu_button(
+                        egui::RichText::new("☰").size(18.0).color(colors.text),
+                        |ui| {
+                            self.main_menu(ui);
+                        },
+                    )
+                    .response;
+                // News in the pages of the menu: a red dot on its button.
+                let unread = self.chat.received_since(self.messages_seen);
+                let new_mail = self.voicemail.map_or(0, |voicemail| voicemail.new);
+                if unread > 0 || new_mail > 0 {
+                    ui.painter().circle_filled(
+                        menu.rect.right_top() + egui::vec2(-3.0, 3.0),
+                        4.5,
+                        colors.red,
+                    );
+                }
                 if let Some(letters) = letters.as_ref() {
                     let [width, height] = letters.size();
                     let tall = 24.0;
@@ -3076,6 +3088,40 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
     /// fill the top row.
     fn main_menu(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(200.0);
+        // The pages that have no tile.
+        let unread = self.chat.received_since(self.messages_seen);
+        let new_mail = self.voicemail.map_or(0, |voicemail| voicemail.new);
+        if ui.button(tr!("Контакты", "Contacts")).clicked() {
+            self.tab = Tab::Contacts;
+            self.settings_open = false;
+            ui.close_menu();
+        }
+        let chat = if unread > 0 {
+            tr!(
+                format!("Чат (новых: {unread})"),
+                format!("Chat ({unread} new)")
+            )
+        } else {
+            tr!("Чат", "Chat").to_owned()
+        };
+        if ui.button(chat).clicked() {
+            self.tab = Tab::Messages;
+            self.settings_open = false;
+            ui.close_menu();
+        }
+        let mail = if new_mail > 0 {
+            tr!(
+                format!("Голосовая почта (новых: {new_mail})"),
+                format!("Voicemail ({new_mail} new)")
+            )
+        } else {
+            tr!("Голосовая почта", "Voicemail").to_owned()
+        };
+        if ui.button(mail).clicked() {
+            self.voicemail_requested = true;
+            ui.close_menu();
+        }
+        ui.separator();
         if ui.button(tr!("Настройки", "Settings")).clicked() {
             self.settings_open = !self.settings_open;
             ui.close_menu();
@@ -3143,51 +3189,24 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         }
     }
 
-    /// The tiles under the card: the pages and the mailbox, the page shown
-    /// in the accent colour, a red count where something is new.
+    /// The two tiles under the card, dial and calls, the page shown in the
+    /// accent colour and the missed calls counted in red; the other pages
+    /// are in the menu.
     fn tiles(&mut self, ui: &mut egui::Ui, rect: egui::Rect, colors: &Palette) {
         let missed = self.history.missed_since(self.missed_seen);
-        let unread = self.chat.received_since(self.messages_seen);
-        let new_mail = self.voicemail.map_or(0, |voicemail| voicemail.new);
-        let tiles: [(Option<Tab>, Icon, &str, usize); 5] = [
-            (Some(Tab::Dialpad), Icon::Keypad, tr!("Набор", "Dial"), 0),
-            (
-                Some(Tab::Calls),
-                Icon::Clock,
-                tr!("Звонки", "Calls"),
-                missed,
-            ),
-            (
-                Some(Tab::Contacts),
-                Icon::Person,
-                tr!("Контакты", "Contacts"),
-                0,
-            ),
-            (
-                Some(Tab::Messages),
-                Icon::Bubble,
-                tr!("Чат", "Chat"),
-                unread,
-            ),
-            (
-                None,
-                Icon::Envelope,
-                tr!("Почта", "Mail"),
-                new_mail as usize,
-            ),
+        let tiles = [
+            (Tab::Dialpad, Icon::Keypad, tr!("Набор", "Dial"), 0),
+            (Tab::Calls, Icon::Clock, tr!("Звонки", "Calls"), missed),
         ];
         let gap = 8.0;
-        let width = (rect.width() - gap * (tiles.len() as f32 - 1.0)) / tiles.len() as f32;
-        let compact = rect.height() < 56.0;
+        let width = (rect.width() - gap) / 2.0;
         for (index, (tab, icon, label, count)) in tiles.into_iter().enumerate() {
             let tile = egui::Rect::from_min_size(
                 rect.min + egui::vec2(index as f32 * (width + gap), 0.0),
                 egui::vec2(width, rect.height()),
             );
-            let response = ui
-                .interact(tile, ui.id().with(("tile", index)), egui::Sense::click())
-                .on_hover_text(label);
-            let shown = tab.is_some_and(|tab| tab == self.tab);
+            let response = ui.interact(tile, ui.id().with(("tile", index)), egui::Sense::click());
+            let shown = tab == self.tab;
             let fill = if response.hovered() {
                 colors.key_hover
             } else {
@@ -3202,47 +3221,44 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 egui::StrokeKind::Inside,
             );
             let ink = if shown { colors.accent } else { colors.weak };
-            let label_ink = if shown { colors.accent } else { colors.weak };
-            let icon_center = if compact {
-                tile.center()
-            } else {
-                tile.center() - egui::vec2(0.0, 9.0)
-            };
-            paint_icon(painter, icon, icon_center, ink);
-            if !compact {
-                painter.text(
-                    tile.center() + egui::vec2(0.0, 15.0),
-                    egui::Align2::CENTER_CENTER,
-                    label,
-                    egui::FontId::proportional(11.5),
-                    label_ink,
-                );
-            }
-            if count > 0 {
-                let spot = icon_center + egui::vec2(11.0, -9.0);
+            // The mark and the word side by side, together in the middle.
+            let word =
+                painter.layout_no_wrap(label.to_owned(), egui::FontId::proportional(14.0), ink);
+            let badge = (count > 0).then(|| {
                 let text = if count > 99 {
                     "99+".to_owned()
                 } else {
                     count.to_string()
                 };
-                let radius = if text.len() > 1 { 8.0 } else { 7.0 };
-                painter.circle_filled(spot, radius, colors.red);
-                painter.text(
-                    spot,
-                    egui::Align2::CENTER_CENTER,
-                    text,
-                    egui::FontId::proportional(9.5),
+                painter.layout_no_wrap(text, egui::FontId::proportional(10.0), egui::Color32::WHITE)
+            });
+            let badge_width = badge.as_ref().map_or(0.0, |badge| badge.size().x + 18.0);
+            let total = 22.0 + 10.0 + word.size().x + badge_width;
+            let left = tile.center().x - total / 2.0;
+            paint_icon(painter, icon, egui::pos2(left + 11.0, tile.center().y), ink);
+            let word_left = left + 32.0;
+            let word_width = word.size().x;
+            painter.galley(
+                egui::pos2(word_left, tile.center().y - word.size().y / 2.0),
+                word,
+                ink,
+            );
+            if let Some(badge) = badge {
+                let size = egui::vec2(badge.size().x + 12.0, 17.0);
+                let pill = egui::Rect::from_min_size(
+                    egui::pos2(word_left + word_width + 6.0, tile.center().y - size.y / 2.0),
+                    size,
+                );
+                painter.rect_filled(pill, 9, colors.red);
+                painter.galley(
+                    pill.center() - badge.size() / 2.0,
+                    badge,
                     egui::Color32::WHITE,
                 );
             }
             if response.clicked() {
-                match tab {
-                    Some(tab) => {
-                        self.tab = tab;
-                        self.settings_open = false;
-                    }
-                    None => self.voicemail_requested = true,
-                }
+                self.tab = tab;
+                self.settings_open = false;
             }
         }
     }
@@ -3640,30 +3656,71 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
 
     fn calls_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         self.missed_seen = now_unix();
+        let colors = palette(self.light_theme);
+        // The buttons give way to the number in a narrow window: with words
+        // when there is room, as small marks in less, and none at all in a
+        // narrow one; the right click on a call offers all of them anyway.
+        let room = ui.available_width();
+        let buttons = if room >= 330.0 {
+            RowButtons::Words
+        } else if room >= 250.0 {
+            RowButtons::Marks
+        } else {
+            RowButtons::None
+        };
+        let free = self.dialog.is_none();
+        let has_calls = !self.history.is_empty();
+        let download_hint = tr!(
+            "Сохранить все звонки в файл CSV для Excel: дата, время, номер, \
+             длительность разговора и статус",
+            "Save every call to a CSV file for Excel: date, time, number, \
+             length of the conversation and status"
+        );
         ui.horizontal(|ui| {
             ui.label(tr!(
                 format!("Звонков: {}", self.history.records().len()),
                 format!("Calls: {}", self.history.records().len()),
             ));
-            if !self.history.is_empty() && ui.button(tr!("Очистить", "Clear")).clicked() {
-                actions.push(Action::ClearHistory);
-            }
-            let free = self.dialog.is_none();
-            if ui
-                .add_enabled(
-                    free && !self.history.is_empty(),
-                    egui::Button::new(tr!("Скачать историю…", "Download the history…")),
-                )
-                .on_hover_text(tr!(
-                    "Сохранить все звонки в файл CSV для Excel: дата, время, номер, \
-                     длительность разговора и статус",
-                    "Save every call to a CSV file for Excel: date, time, number, \
-                     length of the conversation and status"
-                ))
-                .clicked()
-            {
-                actions.push(Action::Browse(Dialog::ExportHistory));
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let download = match buttons {
+                    RowButtons::Words => Some(tr!("Скачать историю…", "Download the history…")),
+                    RowButtons::Marks => Some(tr!("Скачать…", "Download…")),
+                    RowButtons::None => None,
+                };
+                if let Some(download) = download {
+                    if ui
+                        .add_enabled(free && has_calls, egui::Button::new(download))
+                        .on_hover_text(download_hint)
+                        .clicked()
+                    {
+                        actions.push(Action::Browse(Dialog::ExportHistory));
+                    }
+                    if has_calls && ui.button(tr!("Очистить", "Clear")).clicked() {
+                        actions.push(Action::ClearHistory);
+                    }
+                } else {
+                    ui.menu_button("•••", |ui| {
+                        if ui
+                            .add_enabled(
+                                free && has_calls,
+                                egui::Button::new(tr!("Скачать историю…", "Download the history…")),
+                            )
+                            .on_hover_text(download_hint)
+                            .clicked()
+                        {
+                            actions.push(Action::Browse(Dialog::ExportHistory));
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(has_calls, egui::Button::new(tr!("Очистить", "Clear")))
+                            .clicked()
+                        {
+                            actions.push(Action::ClearHistory);
+                            ui.close_menu();
+                        }
+                    });
+                }
+            });
         });
         ui.separator();
         let can_dial = self.lines[self.at].view.can_dial();
@@ -3674,18 +3731,18 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                     Direction::Outgoing => (
                         tr!("Исх.", "Out"),
                         self.tint(
-                            egui::Color32::LIGHT_BLUE,
+                            egui::Color32::from_rgb(76, 141, 255),
                             egui::Color32::from_rgb(30, 90, 170),
                         ),
                     ),
                     Direction::Incoming => (
                         tr!("Вх.", "In"),
                         self.tint(
-                            egui::Color32::LIGHT_GREEN,
+                            egui::Color32::from_rgb(34, 197, 94),
                             egui::Color32::from_rgb(30, 130, 50),
                         ),
                     ),
-                    Direction::Missed => (tr!("Проп.", "Missed"), egui::Color32::RED),
+                    Direction::Missed => (tr!("Проп.", "Missed"), colors.red),
                 };
                 // A contact saved later names old calls too.
                 let name = self
@@ -3697,37 +3754,68 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 } else {
                     format!("{name} ({})", record.number)
                 };
+                let recorded = !record.recording.is_empty();
+                let mut chosen = None;
                 ui.push_id(index, |ui| {
                     ui.horizontal(|ui| {
                         ui.colored_label(color, mark);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add_enabled(can_dial, egui::Button::new(tr!("Позвонить", "Call")))
-                                .clicked()
-                            {
-                                actions.push(Action::Call(record.number.clone()));
-                            }
-                            if name.is_empty()
-                                && ui.button(tr!("В контакты", "To contacts")).clicked()
-                            {
-                                to_contacts = Some(record.number.clone());
-                            }
-                            if !record.recording.is_empty()
-                                && ui.button(tr!("Запись", "Recording")).clicked()
-                            {
-                                actions.push(Action::Open(PathBuf::from(&record.recording)));
+                            match buttons {
+                                RowButtons::Words => {
+                                    if ui
+                                        .add_enabled(
+                                            can_dial,
+                                            egui::Button::new(tr!("Позвонить", "Call")),
+                                        )
+                                        .clicked()
+                                    {
+                                        chosen = Some(RowChoice::Call);
+                                    }
+                                    if name.is_empty()
+                                        && ui.button(tr!("В контакты", "To contacts")).clicked()
+                                    {
+                                        chosen = Some(RowChoice::ToContacts);
+                                    }
+                                    if recorded && ui.button(tr!("Запись", "Recording")).clicked()
+                                    {
+                                        chosen = Some(RowChoice::Recording);
+                                    }
+                                }
+                                RowButtons::Marks => {
+                                    if mark_button(ui, Icon::Phone, can_dial, &colors)
+                                        .on_hover_text(tr!("Позвонить", "Call"))
+                                        .clicked()
+                                    {
+                                        chosen = Some(RowChoice::Call);
+                                    }
+                                    if name.is_empty()
+                                        && mark_button(ui, Icon::PersonAdd, true, &colors)
+                                            .on_hover_text(tr!("В контакты", "To contacts"))
+                                            .clicked()
+                                    {
+                                        chosen = Some(RowChoice::ToContacts);
+                                    }
+                                }
+                                RowButtons::None => {}
                             }
                             // The name takes the room the buttons leave.
                             ui.with_layout(
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    // Selectable with the mouse, and a right
-                                    // click offers to copy, as in MicroSIP.
+                                    // Selectable with the mouse; a right click
+                                    // offers to copy, save and call.
                                     let label = ui
                                         .add(egui::Label::new(&who).truncate().selectable(true))
                                         .on_hover_text(&who);
                                     label.context_menu(|ui| {
-                                        copy_menu(ui, &record.number, name);
+                                        call_menu(
+                                            ui,
+                                            &record.number,
+                                            name,
+                                            can_dial,
+                                            recorded,
+                                            &mut chosen,
+                                        );
                                     });
                                 },
                             );
@@ -3739,22 +3827,38 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                         String::new()
                     };
                     ui.horizontal_wrapped(|ui| {
-                        ui.weak(format!(
-                            "{}{}{length}",
-                            format_timestamp(record.time, self.utc_offset),
-                            end_text(record.time, record.ended, self.utc_offset)
-                        ));
+                        let when = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "{}{}{length}",
+                                    format_timestamp(record.time, self.utc_offset),
+                                    end_text(record.time, record.ended, self.utc_offset)
+                                ))
+                                .weak(),
+                            )
+                            .sense(egui::Sense::click()),
+                        );
+                        when.context_menu(|ui| {
+                            call_menu(ui, &record.number, name, can_dial, recorded, &mut chosen);
+                        });
                         // Why the call did not take place, as MicroSIP shows it.
                         if let Some(why) = result_text(&record.result) {
                             // A long reason is cut at the window's edge; the
                             // whole of it shows under the mouse.
-                            let text = egui::RichText::new(why.clone())
-                                .color(egui::Color32::from_rgb(210, 80, 80));
+                            let text = egui::RichText::new(why.clone()).color(colors.red);
                             ui.add(egui::Label::new(text).truncate()).on_hover_text(why);
                         }
                     });
                     ui.separator();
                 });
+                match chosen {
+                    Some(RowChoice::Call) => actions.push(Action::Call(record.number.clone())),
+                    Some(RowChoice::ToContacts) => to_contacts = Some(record.number.clone()),
+                    Some(RowChoice::Recording) => {
+                        actions.push(Action::Open(PathBuf::from(&record.recording)));
+                    }
+                    None => {}
+                }
             }
         });
         if let Some(number) = to_contacts {
@@ -4754,60 +4858,40 @@ fn paint_card(painter: &egui::Painter, rect: egui::Rect, radius: u8, colors: &Pa
 enum Icon {
     Keypad,
     Clock,
-    Person,
-    Bubble,
-    Envelope,
     Speaker,
     Microphone,
+    Phone,
+    PersonAdd,
 }
 
 fn paint_icon(painter: &egui::Painter, icon: Icon, center: egui::Pos2, ink: egui::Color32) {
+    paint_icon_scaled(painter, icon, center, ink, 1.0);
+}
+
+/// A mark, `scale` times its usual size.
+fn paint_icon_scaled(
+    painter: &egui::Painter,
+    icon: Icon,
+    center: egui::Pos2,
+    ink: egui::Color32,
+    scale: f32,
+) {
     let stroke = egui::Stroke::new(1.6_f32, ink);
-    let at = |x: f32, y: f32| center + egui::vec2(x, y);
+    let at = |x: f32, y: f32| center + egui::vec2(x, y) * scale;
     match icon {
         Icon::Keypad => {
             for row in 0..3 {
                 for column in 0..3 {
                     let spot = at(column as f32 * 5.5 - 5.5, row as f32 * 5.0 - 7.0);
-                    painter.circle_filled(spot, 1.7, ink);
+                    painter.circle_filled(spot, 1.7 * scale, ink);
                 }
             }
-            painter.circle_filled(at(0.0, 8.0), 1.7, ink);
+            painter.circle_filled(at(0.0, 8.0), 1.7 * scale, ink);
         }
         Icon::Clock => {
-            painter.circle_stroke(center, 8.5, stroke);
+            painter.circle_stroke(center, 8.5 * scale, stroke);
             painter.line_segment([at(0.0, -5.0), at(0.0, 0.0)], stroke);
             painter.line_segment([at(0.0, 0.0), at(3.5, 2.5)], stroke);
-        }
-        Icon::Person => {
-            painter.circle_stroke(at(0.0, -4.5), 3.8, stroke);
-            let shoulders: Vec<egui::Pos2> = (0..=12)
-                .map(|step| {
-                    let angle = std::f32::consts::PI * (1.0 + step as f32 / 12.0);
-                    at(8.0 * angle.cos(), 9.0 + 7.0 * angle.sin())
-                })
-                .collect();
-            painter.add(egui::Shape::line(shoulders, stroke));
-        }
-        Icon::Bubble => {
-            let outline = vec![
-                at(-8.5, -7.0),
-                at(8.5, -7.0),
-                at(8.5, 4.0),
-                at(-2.5, 4.0),
-                at(-7.0, 8.0),
-                at(-7.0, 4.0),
-                at(-8.5, 4.0),
-            ];
-            painter.add(egui::Shape::closed_line(outline, stroke));
-        }
-        Icon::Envelope => {
-            let body = egui::Rect::from_center_size(center, egui::vec2(18.0, 13.0));
-            painter.rect_stroke(body, 2, stroke, egui::StrokeKind::Middle);
-            painter.add(egui::Shape::line(
-                vec![at(-9.0, -5.0), at(0.0, 1.5), at(9.0, -5.0)],
-                stroke,
-            ));
         }
         Icon::Speaker => {
             let cone = vec![
@@ -4828,7 +4912,7 @@ fn paint_icon(painter: &egui::Painter, icon: Icon, center: egui::Pos2, ink: egui
             painter.add(egui::Shape::line(wave, stroke));
         }
         Icon::Microphone => {
-            let body = egui::Rect::from_center_size(at(0.0, -2.5), egui::vec2(6.0, 10.0));
+            let body = egui::Rect::from_center_size(at(0.0, -2.5), egui::vec2(6.0, 10.0) * scale);
             painter.rect_stroke(body, 3, stroke, egui::StrokeKind::Middle);
             let cup: Vec<egui::Pos2> = (0..=10)
                 .map(|step| {
@@ -4838,6 +4922,32 @@ fn paint_icon(painter: &egui::Painter, icon: Icon, center: egui::Pos2, ink: egui
                 .collect();
             painter.add(egui::Shape::line(cup, stroke));
             painter.line_segment([at(0.0, 5.5), at(0.0, 8.5)], stroke);
+        }
+        Icon::Phone => {
+            // A handset: two ear pieces joined by a curved grip.
+            let grip: Vec<egui::Pos2> = (0..=12)
+                .map(|step| {
+                    let angle = std::f32::consts::PI * (1.0 + 0.5 * step as f32 / 12.0);
+                    at(5.0 + 11.0 * angle.cos(), -5.0 - 11.0 * angle.sin())
+                })
+                .collect();
+            let first = grip[0];
+            let last = grip[grip.len() - 1];
+            painter.add(egui::Shape::line(grip, egui::Stroke::new(3.0 * scale, ink)));
+            painter.circle_filled(first, 2.6 * scale, ink);
+            painter.circle_filled(last, 2.6 * scale, ink);
+        }
+        Icon::PersonAdd => {
+            painter.circle_stroke(at(-2.5, -4.0), 3.6 * scale, stroke);
+            let shoulders: Vec<egui::Pos2> = (0..=12)
+                .map(|step| {
+                    let angle = std::f32::consts::PI * (1.0 + step as f32 / 12.0);
+                    at(-2.5 + 7.0 * angle.cos(), 9.0 + 6.5 * angle.sin())
+                })
+                .collect();
+            painter.add(egui::Shape::line(shoulders, stroke));
+            painter.line_segment([at(7.0, -3.0), at(7.0, 3.0)], stroke);
+            painter.line_segment([at(4.0, 0.0), at(10.0, 0.0)], stroke);
         }
     }
 }
@@ -4965,6 +5075,73 @@ fn history_file_name() -> String {
 
 /// "Copy the number" (and the name, when there is one) for a right click on
 /// a call or a contact.
+/// How the buttons of a call in the list are shown, by the room there is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowButtons {
+    Words,
+    Marks,
+    None,
+}
+
+/// What was chosen for a call in the list, with a button or its menu.
+#[derive(Clone, Copy)]
+enum RowChoice {
+    Call,
+    ToContacts,
+    Recording,
+}
+
+/// The right click on a call in the list: copy, save to the contacts, call,
+/// and open the recording when there is one.
+fn call_menu(
+    ui: &mut egui::Ui,
+    number: &str,
+    name: &str,
+    can_dial: bool,
+    recorded: bool,
+    chosen: &mut Option<RowChoice>,
+) {
+    copy_menu(ui, number, name);
+    ui.separator();
+    if name.is_empty() && ui.button(tr!("В контакты", "To contacts")).clicked() {
+        *chosen = Some(RowChoice::ToContacts);
+        ui.close_menu();
+    }
+    if ui
+        .add_enabled(can_dial, egui::Button::new(tr!("Позвонить", "Call")))
+        .clicked()
+    {
+        *chosen = Some(RowChoice::Call);
+        ui.close_menu();
+    }
+    if recorded
+        && ui
+            .button(tr!("Открыть запись", "Open the recording"))
+            .clicked()
+    {
+        *chosen = Some(RowChoice::Recording);
+        ui.close_menu();
+    }
+}
+
+/// A small square button with a drawn mark instead of words.
+fn mark_button(ui: &mut egui::Ui, icon: Icon, enabled: bool, colors: &Palette) -> egui::Response {
+    let button = egui::Button::new("")
+        .fill(colors.key)
+        .stroke(egui::Stroke::new(1.0_f32, colors.key_line))
+        .corner_radius(8)
+        .min_size(egui::vec2(28.0, 22.0));
+    let response = ui.add_enabled(enabled, button);
+    let ink = if enabled {
+        colors.text
+    } else {
+        colors.weak.gamma_multiply(0.6)
+    };
+    let painter = ui.painter().with_clip_rect(response.rect);
+    paint_icon_scaled(&painter, icon, response.rect.center(), ink, 0.75);
+    response
+}
+
 fn copy_menu(ui: &mut egui::Ui, number: &str, name: &str) {
     if ui
         .button(tr!("Копировать номер", "Copy the number"))
@@ -5284,6 +5461,7 @@ impl PhoneWindow {
                 (screen.y - size.y - 72.0).max(0.0),
             ));
         }
+        let colors = palette(self.light_theme);
         let mut answer = false;
         let mut decline = false;
         let mut closed = false;
@@ -5305,17 +5483,23 @@ impl PhoneWindow {
                         let half = egui::vec2((ui.available_width() - 8.0) / 2.0, 34.0);
                         let green = egui::Button::new(
                             egui::RichText::new(tr!("Ответить", "Answer"))
-                                .color(egui::Color32::WHITE),
+                                .strong()
+                                .color(colors.on_call),
                         )
-                        .fill(egui::Color32::from_rgb(46, 140, 64));
+                        .fill(colors.call)
+                        .stroke(egui::Stroke::NONE)
+                        .corner_radius(12);
                         if ui.add_sized(half, green).clicked() {
                             answer = true;
                         }
                         let red = egui::Button::new(
                             egui::RichText::new(tr!("Отклонить", "Decline"))
+                                .strong()
                                 .color(egui::Color32::WHITE),
                         )
-                        .fill(egui::Color32::from_rgb(180, 50, 50));
+                        .fill(colors.red)
+                        .stroke(egui::Stroke::NONE)
+                        .corner_radius(12);
                         if ui.add_sized(half, red).clicked() {
                             decline = true;
                         }
@@ -5323,6 +5507,12 @@ impl PhoneWindow {
                 });
                 if ctx.input(|input| input.viewport().close_requested()) {
                     closed = true;
+                }
+                // Answered or declined here: the little window goes at once,
+                // without waiting for the main window to be drawn again
+                // (Windows does not draw a window that is minimized).
+                if answer || decline {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 }
             },
         );
