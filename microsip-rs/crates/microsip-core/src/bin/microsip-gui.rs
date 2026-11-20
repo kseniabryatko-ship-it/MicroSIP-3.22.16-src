@@ -683,7 +683,11 @@ impl PhoneWindow {
         visuals.extreme_bg_color = colors.key;
         visuals.faint_bg_color = colors.key;
         visuals.selection.bg_fill = colors.accent;
-        visuals.selection.stroke.color = egui::Color32::WHITE;
+        visuals.selection.stroke.color = colors.on_call;
+        if self.light_theme {
+            // Black on white would hide the selected text.
+            visuals.selection.stroke.color = egui::Color32::WHITE;
+        }
         visuals.hyperlink_color = colors.accent;
         visuals.window_corner_radius = egui::CornerRadius::same(14);
         visuals.menu_corner_radius = egui::CornerRadius::same(10);
@@ -700,7 +704,7 @@ impl PhoneWindow {
         }
         widgets.inactive.weak_bg_fill = colors.key;
         widgets.inactive.bg_fill = colors.key;
-        widgets.inactive.bg_stroke = egui::Stroke::NONE;
+        widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, colors.key_line);
         widgets.inactive.fg_stroke.color = colors.text;
         widgets.hovered.weak_bg_fill = colors.key_hover;
         widgets.hovered.bg_fill = colors.key_hover;
@@ -2487,7 +2491,7 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             self.user.trim().to_owned()
         };
         egui::ComboBox::from_id_salt("account-choice")
-            .selected_text(egui::RichText::new(short).small())
+            .selected_text(egui::RichText::new(short).strong())
             .width(64.0)
             .show_ui(ui, |ui| {
                 ui.add_enabled(false, egui::SelectableLabel::new(true, &current));
@@ -2721,15 +2725,15 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                                     (sizes.key_font * 0.36).max(9.0),
                                 ),
                                 color: colors.weak,
-                                extra_letter_spacing: 1.0,
+                                extra_letter_spacing: 1.5,
                                 ..Default::default()
                             },
                         );
                     }
                     let key = egui::Button::new(text)
                         .fill(colors.key)
-                        .stroke(egui::Stroke::NONE)
-                        .corner_radius(12);
+                        .stroke(egui::Stroke::new(1.0_f32, colors.key_line))
+                        .corner_radius(14);
                     if ui.add_sized(sizes.key, key).clicked() {
                         actions.push(Action::Digit(digit));
                     }
@@ -2753,29 +2757,30 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         let half = egui::vec2((ui.available_width() - spacing) / 2.0, sizes.row);
         let small_row = egui::vec2(ui.available_width(), (sizes.row * 0.75).max(28.0));
         let small_half = egui::vec2(half.x, small_row.y);
-        let big = |text: &str| {
-            egui::RichText::new(text)
-                .size(sizes.row_font + 1.0)
-                .color(egui::Color32::WHITE)
-        };
-        let colored = |text: &str, fill: egui::Color32| {
-            egui::Button::new(big(text))
-                .fill(fill)
-                .stroke(egui::Stroke::NONE)
-                .corner_radius(12)
+        let colored = |text: &str, fill: egui::Color32, ink: egui::Color32| {
+            egui::Button::new(
+                egui::RichText::new(text)
+                    .size(sizes.row_font + 1.0)
+                    .strong()
+                    .color(ink),
+            )
+            .fill(fill)
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(14)
         };
         let plain = |text: &str| {
             egui::Button::new(egui::RichText::new(text).color(colors.text))
                 .fill(colors.key)
-                .stroke(egui::Stroke::NONE)
-                .corner_radius(10)
+                .stroke(egui::Stroke::new(1.0_f32, colors.key_line))
+                .corner_radius(12)
         };
+        let white = egui::Color32::WHITE;
         match phase {
             Phase::Idle => {
                 ui.horizontal(|ui| {
                     let erase_width = (sizes.key.x * 0.55).clamp(48.0, 90.0);
                     let call_width = ui.available_width() - erase_width - spacing;
-                    let call = colored(tr!("✆  Позвонить", "✆  Call"), colors.green);
+                    let call = colored(tr!("✆  Позвонить", "✆  Call"), colors.call, colors.on_call);
                     if ui
                         .add_sized([call_width, sizes.row], call)
                         .on_hover_text(tr!(
@@ -2792,8 +2797,8 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                             has_number,
                             egui::Button::new("")
                                 .fill(colors.key)
-                                .stroke(egui::Stroke::NONE)
-                                .corner_radius(12)
+                                .stroke(egui::Stroke::new(1.0_f32, colors.key_line))
+                                .corner_radius(14)
                                 .min_size(egui::vec2(erase_width, sizes.row)),
                         )
                         .on_hover_text(tr!(
@@ -2813,13 +2818,19 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             Phase::Incoming => {
                 ui.horizontal(|ui| {
                     if ui
-                        .add_sized(half, colored(tr!("Ответить", "Answer"), colors.green))
+                        .add_sized(
+                            half,
+                            colored(tr!("Ответить", "Answer"), colors.call, colors.on_call),
+                        )
                         .clicked()
                     {
                         actions.push(Action::Answer);
                     }
                     if ui
-                        .add_sized(half, colored(tr!("Отклонить", "Decline"), colors.red))
+                        .add_sized(
+                            half,
+                            colored(tr!("Отклонить", "Decline"), colors.red, white),
+                        )
                         .clicked()
                     {
                         actions.push(Action::Reject);
@@ -2829,7 +2840,10 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             _ => {
                 let pressed = ui
                     .add_enabled_ui(self.lines[self.at].view.can_hangup(), |ui| {
-                        ui.add_sized(wide, colored(tr!("Завершить", "Hang up"), colors.red))
+                        ui.add_sized(
+                            wide,
+                            colored(tr!("Завершить", "Hang up"), colors.red, white),
+                        )
                     })
                     .inner
                     .clicked();
@@ -2880,43 +2894,27 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         }
     }
 
-    /// The whole window: a coloured band with the account and a greeting,
-    /// a white card over it with the current page, tiles for the other
-    /// pages, and the volumes at the bottom of the dial page.
+    /// The whole window: the account, NAVI and the menu at the top; a card
+    /// with the current page; tiles for the pages; the volumes at the bottom
+    /// of the dial page.
     fn main_screen(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let colors = palette(self.light_theme);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(colors.page))
             .show(ctx, |ui| {
                 let full = ui.max_rect();
-                let margin = 12.0;
-                // A low window keeps the band to one line.
-                let tall = full.height() >= 560.0;
-                let band = if tall { 122.0 } else { 52.0 };
-                let band_rect = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), band));
-                let overlap = if tall { 34.0 } else { 4.0 };
-                let picture = if self.header_picture {
-                    self.header_texture(ui.ctx())
-                } else {
-                    None
-                };
-                match picture.as_ref() {
-                    Some(texture) => {
-                        paint_picture_band(ui.painter(), band_rect, overlap, texture);
-                    }
-                    None => paint_band(ui.painter(), band_rect, &colors),
-                }
+                let margin = 16.0;
                 let head = egui::Rect::from_min_max(
-                    full.min + egui::vec2(16.0, 10.0),
-                    egui::pos2(full.right() - 12.0, band_rect.bottom()),
+                    full.min + egui::vec2(margin, 12.0),
+                    egui::pos2(full.right() - margin, full.top() + 12.0 + 36.0),
                 );
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(head), |ui| {
-                    self.header(ui, tall);
+                    self.header(ui, &colors);
                 });
 
-                let bottom = full.bottom() - margin;
-                let volumes = if self.tab == Tab::Dialpad { 66.0 } else { 0.0 };
-                let tiles_height = if full.height() >= 460.0 { 62.0 } else { 44.0 };
+                let bottom = full.bottom() - 14.0;
+                let volumes = if self.tab == Tab::Dialpad { 70.0 } else { 0.0 };
+                let tiles_height = if full.height() >= 460.0 { 64.0 } else { 40.0 };
                 let volume_rect = egui::Rect::from_min_max(
                     egui::pos2(full.left() + margin, bottom - volumes),
                     egui::pos2(full.right() - margin, bottom),
@@ -2930,14 +2928,12 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                     egui::pos2(full.left() + margin, tiles_bottom - tiles_height),
                     egui::pos2(full.right() - margin, tiles_bottom),
                 );
-                // The card overlaps the band, as in the design.
-                let card_top = band_rect.bottom() - if tall { 34.0 } else { 4.0 };
                 let card_rect = egui::Rect::from_min_max(
-                    egui::pos2(full.left() + margin, card_top),
+                    egui::pos2(full.left() + margin, head.bottom() + 12.0),
                     egui::pos2(full.right() - margin, tiles_rect.top() - 10.0),
                 );
-                paint_card(ui.painter(), card_rect, 16, &colors);
-                let inside = card_rect.shrink(12.0);
+                paint_card(ui.painter(), card_rect, 20, &colors);
+                let inside = card_rect.shrink(14.0);
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inside), |ui| {
                     ui.set_clip_rect(card_rect.shrink(2.0));
                     match self.tab {
@@ -2949,17 +2945,17 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 });
                 self.tiles(ui, tiles_rect, &colors);
                 if volumes > 0.0 {
-                    paint_card(ui.painter(), volume_rect, 14, &colors);
-                    let inside = volume_rect.shrink2(egui::vec2(14.0, 8.0));
+                    paint_card(ui.painter(), volume_rect, 18, &colors);
+                    let inside = volume_rect.shrink2(egui::vec2(16.0, 10.0));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inside), |ui| {
-                        ui.spacing_mut().item_spacing.y = 6.0;
-                        self.volume_sliders(ui);
+                        ui.spacing_mut().item_spacing.y = 8.0;
+                        self.volume_sliders(ui, &colors);
                     });
                 }
             });
     }
 
-    /// The picture of the band, loaded once from the program itself.
+    /// The letters NAVI, loaded once from the program itself.
     fn header_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
         if self.header_texture.is_none() {
             let decoded =
@@ -2968,80 +2964,112 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                     .to_rgba8();
             let size = [decoded.width() as usize, decoded.height() as usize];
             let picture = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
-            self.header_texture =
-                Some(ctx.load_texture("header-picture", picture, egui::TextureOptions::LINEAR));
+            self.header_texture = Some(ctx.load_texture(
+                "header-picture",
+                picture,
+                // Shown much smaller than drawn: smoothed at every size.
+                egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear)),
+            ));
         }
         self.header_texture.clone()
     }
 
-    /// The band's contents: account and its state, the menu, a greeting.
-    fn header(&mut self, ui: &mut egui::Ui, tall: bool) {
-        let white = egui::Color32::WHITE;
-        // White on the band: text, and the account list's button.
+    /// The top row: the account and its state in a pill, NAVI and the menu.
+    fn header(&mut self, ui: &mut egui::Ui, colors: &Palette) {
         {
             let visuals = ui.visuals_mut();
-            visuals.override_text_color = Some(white);
-            let glass = egui::Color32::from_white_alpha(40);
-            visuals.widgets.inactive.weak_bg_fill = glass;
-            visuals.widgets.inactive.bg_fill = glass;
-            visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_white_alpha(70);
-            visuals.widgets.hovered.bg_fill = egui::Color32::from_white_alpha(70);
-            visuals.widgets.inactive.fg_stroke.color = white;
-            visuals.widgets.hovered.fg_stroke.color = white;
-            visuals.widgets.active.fg_stroke.color = white;
+            for state in [
+                &mut visuals.widgets.inactive,
+                &mut visuals.widgets.hovered,
+                &mut visuals.widgets.active,
+                &mut visuals.widgets.open,
+            ] {
+                state.weak_bg_fill = colors.chip;
+                state.bg_fill = colors.chip;
+                state.bg_stroke = egui::Stroke::NONE;
+                state.fg_stroke.color = colors.text;
+            }
+            visuals.widgets.hovered.weak_bg_fill = colors.key_hover;
         }
         let (dot, text) = match self.registration.as_ref() {
-            Some(RegistrationState::Registered { .. }) => (
-                egui::Color32::from_rgb(120, 240, 150),
-                tr!("в сети", "online").to_owned(),
-            ),
+            Some(RegistrationState::Registered { .. }) => {
+                (colors.green, tr!("в сети", "online").to_owned())
+            }
             Some(RegistrationState::Registering) => (
-                egui::Color32::from_rgb(255, 214, 102),
+                egui::Color32::from_rgb(245, 180, 0),
                 tr!("подключение…", "connecting…").to_owned(),
             ),
-            Some(state @ RegistrationState::Failed(_)) => (
-                egui::Color32::from_rgb(255, 130, 130),
-                registration_text(state),
-            ),
-            Some(RegistrationState::Unregistered) | None => (
-                egui::Color32::from_gray(210),
-                tr!("не в сети", "offline").to_owned(),
-            ),
+            Some(state @ RegistrationState::Failed(_)) => (colors.red, registration_text(state)),
+            Some(RegistrationState::Unregistered) | None => {
+                (colors.weak, tr!("не в сети", "offline").to_owned())
+            }
         };
-        ui.horizontal(|ui| {
-            let (spot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-            ui.painter().circle_filled(spot.center(), 5.0, dot);
-            self.account_choice(ui);
-            let user = self.user.trim();
-            let status = if user.is_empty() || !self.other_accounts.is_empty() {
-                text
-            } else {
-                format!("{user} · {text}")
-            };
+        let letters = if self.header_picture {
+            self.header_texture(ui.ctx())
+        } else {
+            None
+        };
+        ui.horizontal_centered(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button(egui::RichText::new("☰").size(20.0).color(white), |ui| {
-                    self.main_menu(ui);
-                });
+                ui.spacing_mut().button_padding = egui::vec2(9.0, 6.0);
+                ui.menu_button(
+                    egui::RichText::new("☰").size(18.0).color(colors.text),
+                    |ui| {
+                        self.main_menu(ui);
+                    },
+                );
+                if let Some(letters) = letters.as_ref() {
+                    let [width, height] = letters.size();
+                    let tall = 24.0;
+                    let size = egui::vec2(tall * width as f32 / height as f32, tall);
+                    let (place, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                    ui.painter().image(
+                        letters.id(),
+                        place,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        colors.accent,
+                    );
+                }
                 if self.do_not_disturb {
                     ui.label(
                         egui::RichText::new(tr!("Не беспокоить", "Do not disturb"))
-                            .color(egui::Color32::from_rgb(255, 170, 170))
+                            .color(colors.red)
                             .small(),
                     );
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.add(egui::Label::new(status).truncate());
+                    egui::Frame::NONE
+                        .fill(colors.chip)
+                        .corner_radius(16)
+                        .inner_margin(egui::Margin {
+                            left: 10,
+                            right: 12,
+                            top: 5,
+                            bottom: 5,
+                        })
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let (spot, _) = ui
+                                .allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                            ui.painter().circle_filled(
+                                spot.center(),
+                                6.0,
+                                dot.gamma_multiply(0.25),
+                            );
+                            ui.painter().circle_filled(spot.center(), 4.0, dot);
+                            self.account_choice(ui);
+                            let user = self.user.trim();
+                            if !user.is_empty() && self.other_accounts.is_empty() {
+                                ui.label(egui::RichText::new(user).strong().color(colors.text));
+                            }
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(text).color(colors.weak))
+                                    .truncate(),
+                            );
+                        });
                 });
             });
         });
-        if tall {
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(greeting(self.utc_offset))
-                    .size(24.0)
-                    .color(white),
-            );
-        }
     }
 
     /// The window's menu: settings, the log and the switches that used to
@@ -3115,79 +3143,96 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         }
     }
 
-    /// The tiles under the card: the other pages, and the mailbox.
+    /// The tiles under the card: the pages and the mailbox, the page shown
+    /// in the accent colour, a red count where something is new.
     fn tiles(&mut self, ui: &mut egui::Ui, rect: egui::Rect, colors: &Palette) {
         let missed = self.history.missed_since(self.missed_seen);
         let unread = self.chat.received_since(self.messages_seen);
-        let mut tiles: Vec<(Option<Tab>, &str, String, bool)> = Vec::new();
-        for tab in [Tab::Calls, Tab::Contacts, Tab::Messages] {
-            // The page shown has no tile; the dial page takes its place.
-            let tab = if tab == self.tab { Tab::Dialpad } else { tab };
-            let (icon, label, alert) = match tab {
-                Tab::Dialpad => ("⌨", tr!("Набор", "Dial").to_owned(), false),
-                Tab::Calls if missed > 0 => (
-                    "🕑",
-                    tr!(format!("Звонки ({missed})"), format!("Calls ({missed})"),),
-                    true,
-                ),
-                Tab::Calls => ("🕑", tr!("Звонки", "Calls").to_owned(), false),
-                Tab::Contacts => ("👤", tr!("Контакты", "Contacts").to_owned(), false),
-                Tab::Messages if unread > 0 => (
-                    "💬",
-                    tr!(format!("Чат ({unread})"), format!("Chat ({unread})"),),
-                    true,
-                ),
-                Tab::Messages => ("💬", tr!("Чат", "Chat").to_owned(), false),
-            };
-            tiles.push((Some(tab), icon, label, alert));
-        }
         let new_mail = self.voicemail.map_or(0, |voicemail| voicemail.new);
-        let mail = if new_mail > 0 {
-            tr!(format!("Почта {new_mail}"), format!("Mail {new_mail}"),)
-        } else {
-            tr!("Почта", "Mail").to_owned()
-        };
-        tiles.push((None, "✉", mail, new_mail > 0));
-
+        let tiles: [(Option<Tab>, Icon, &str, usize); 5] = [
+            (Some(Tab::Dialpad), Icon::Keypad, tr!("Набор", "Dial"), 0),
+            (
+                Some(Tab::Calls),
+                Icon::Clock,
+                tr!("Звонки", "Calls"),
+                missed,
+            ),
+            (
+                Some(Tab::Contacts),
+                Icon::Person,
+                tr!("Контакты", "Contacts"),
+                0,
+            ),
+            (
+                Some(Tab::Messages),
+                Icon::Bubble,
+                tr!("Чат", "Chat"),
+                unread,
+            ),
+            (
+                None,
+                Icon::Envelope,
+                tr!("Почта", "Mail"),
+                new_mail as usize,
+            ),
+        ];
         let gap = 8.0;
         let width = (rect.width() - gap * (tiles.len() as f32 - 1.0)) / tiles.len() as f32;
         let compact = rect.height() < 56.0;
-        for (index, (tab, icon, label, alert)) in tiles.into_iter().enumerate() {
+        for (index, (tab, icon, label, count)) in tiles.into_iter().enumerate() {
             let tile = egui::Rect::from_min_size(
                 rect.min + egui::vec2(index as f32 * (width + gap), 0.0),
                 egui::vec2(width, rect.height()),
             );
-            let response = ui.interact(tile, ui.id().with(("tile", index)), egui::Sense::click());
+            let response = ui
+                .interact(tile, ui.id().with(("tile", index)), egui::Sense::click())
+                .on_hover_text(label);
+            let shown = tab.is_some_and(|tab| tab == self.tab);
             let fill = if response.hovered() {
-                colors.key
+                colors.key_hover
             } else {
                 colors.card
             };
-            paint_card(ui.painter(), tile, 12, colors);
-            ui.painter().rect_filled(tile, 12, fill);
-            let ink = if alert { colors.red } else { colors.text };
-            if compact {
-                ui.painter().text(
-                    tile.center(),
-                    egui::Align2::CENTER_CENTER,
-                    format!("{icon} {label}"),
-                    egui::FontId::proportional(12.0),
-                    ink,
-                );
+            let painter = ui.painter();
+            painter.rect(
+                tile,
+                14,
+                fill,
+                egui::Stroke::new(1.0_f32, colors.card_line),
+                egui::StrokeKind::Inside,
+            );
+            let ink = if shown { colors.accent } else { colors.weak };
+            let label_ink = if shown { colors.accent } else { colors.weak };
+            let icon_center = if compact {
+                tile.center()
             } else {
-                ui.painter().text(
-                    tile.center() - egui::vec2(0.0, 10.0),
-                    egui::Align2::CENTER_CENTER,
-                    icon,
-                    egui::FontId::proportional(20.0),
-                    if alert { colors.red } else { colors.accent },
-                );
-                ui.painter().text(
-                    tile.center() + egui::vec2(0.0, 14.0),
+                tile.center() - egui::vec2(0.0, 9.0)
+            };
+            paint_icon(painter, icon, icon_center, ink);
+            if !compact {
+                painter.text(
+                    tile.center() + egui::vec2(0.0, 15.0),
                     egui::Align2::CENTER_CENTER,
                     label,
-                    egui::FontId::proportional(12.0),
-                    ink,
+                    egui::FontId::proportional(11.5),
+                    label_ink,
+                );
+            }
+            if count > 0 {
+                let spot = icon_center + egui::vec2(11.0, -9.0);
+                let text = if count > 99 {
+                    "99+".to_owned()
+                } else {
+                    count.to_string()
+                };
+                let radius = if text.len() > 1 { 8.0 } else { 7.0 };
+                painter.circle_filled(spot, radius, colors.red);
+                painter.text(
+                    spot,
+                    egui::Align2::CENTER_CENTER,
+                    text,
+                    egui::FontId::proportional(9.5),
+                    egui::Color32::WHITE,
                 );
             }
             if response.clicked() {
@@ -3202,12 +3247,10 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         }
     }
 
-    fn volume_sliders(&mut self, ui: &mut egui::Ui) {
+    fn volume_sliders(&mut self, ui: &mut egui::Ui, colors: &Palette) {
         let before = (self.speaker_volume, self.microphone_volume);
-        let width = (ui.available_width() - 100.0).clamp(60.0, 400.0);
-        ui.spacing_mut().slider_width = width;
-        // During a call the bars under the sliders show how loud the other
-        // side is and how loud the microphone is, as in MicroSIP.
+        // During a call a thin bar under each slider shows how loud the
+        // other side is and how loud the microphone is, as in MicroSIP.
         let talking = self
             .lines
             .iter()
@@ -3219,64 +3262,47 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
         let (heard_level, spoken_level) = self.levels;
-        let bar = |ui: &egui::Ui, slider: &egui::Response, level: f32| {
-            if !talking {
-                return;
-            }
-            let width = ui.spacing().slider_width;
-            let left = slider.rect.left();
-            let y = slider.rect.bottom() - 1.0;
-            let full =
-                egui::Rect::from_min_max(egui::pos2(left, y - 3.0), egui::pos2(left + width, y));
-            ui.painter()
-                .rect_filled(full, 1.0, ui.visuals().extreme_bg_color);
-            // A level shown on a sound scale: quiet speech is still seen.
-            let shown = (1.0 + (level.max(0.000_1)).log10() / 3.0).clamp(0.0, 1.0);
-            let color = if level > 0.9 {
-                egui::Color32::from_rgb(210, 50, 50)
-            } else {
-                egui::Color32::from_rgb(60, 180, 75)
-            };
-            let mut filled = full;
-            filled.set_right(left + width * shown);
-            ui.painter().rect_filled(filled, 1.0, color);
-        };
-        ui.horizontal(|ui| {
-            ui.add_sized(
-                [26.0, 18.0],
-                egui::Label::new(egui::RichText::new("🔈").size(17.0)),
-            )
-            .on_hover_text(tr!("Динамик", "Speaker"));
-            let slider = ui
-                .add(
-                    egui::Slider::new(&mut self.speaker_volume, 0..=200)
-                        .suffix("%")
-                        .trailing_fill(true),
-                )
-                .on_hover_text(tr!(
+        let rows = [
+            (
+                Icon::Speaker,
+                tr!("Динамик", "Speaker"),
+                tr!(
                     "Полоска — как громко говорит собеседник",
                     "The bar shows how loud the other side speaks"
-                ));
-            bar(ui, &slider, heard_level);
-        });
-        ui.horizontal(|ui| {
-            ui.add_sized(
-                [26.0, 18.0],
-                egui::Label::new(egui::RichText::new("🎤").size(17.0)),
-            )
-            .on_hover_text(tr!("Микрофон", "Microphone"));
-            let slider = ui
-                .add(
-                    egui::Slider::new(&mut self.microphone_volume, 0..=200)
-                        .suffix("%")
-                        .trailing_fill(true),
-                )
-                .on_hover_text(tr!(
+                ),
+                heard_level,
+            ),
+            (
+                Icon::Microphone,
+                tr!("Микрофон", "Microphone"),
+                tr!(
                     "Полоска — как громко вас слышно",
                     "The bar shows how loud you are"
-                ));
-            bar(ui, &slider, spoken_level);
-        });
+                ),
+                spoken_level,
+            ),
+        ];
+        for (index, (icon, name, hint, level)) in rows.into_iter().enumerate() {
+            let value = if index == 0 {
+                &mut self.speaker_volume
+            } else {
+                &mut self.microphone_volume
+            };
+            ui.horizontal(|ui| {
+                let (spot, mark) =
+                    ui.allocate_exact_size(egui::vec2(20.0, 18.0), egui::Sense::hover());
+                paint_icon(ui.painter(), icon, spot.center(), colors.weak);
+                mark.on_hover_text(name);
+                let width = (ui.available_width() - 46.0).max(60.0);
+                level_slider(ui, value, 200, width, colors, talking.then_some(level))
+                    .on_hover_text(hint);
+                ui.label(
+                    egui::RichText::new(format!("{value}%"))
+                        .color(colors.weak)
+                        .size(12.5),
+                );
+            });
+        }
         if before != (self.speaker_volume, self.microphone_volume) {
             // Volumes act at once; they are saved when the window closes.
             self.apply_audio_settings();
@@ -4212,7 +4238,7 @@ format!("Phone address: {local}"),
                         if ui
                             .checkbox(
                                 &mut self.header_picture,
-                                tr!("Картинка в шапке", "Picture in the top band"),
+                                tr!("Надпись NAVI в шапке", "NAVI at the top"),
                             )
                             .changed()
                         {
@@ -4598,71 +4624,77 @@ fn result_text(code: &str) -> Option<String> {
     })
 }
 
-/// The colours of the window, light or dark.
+/// The colours of the window, light or dark. One layout for both: the
+/// dark one in NAVI black and yellow, the light one white and black with
+/// the yellow kept for the call button.
 #[derive(Clone, Copy)]
 struct Palette {
     page: egui::Color32,
     card: egui::Color32,
+    /// The thin frame of the cards and tiles.
+    card_line: egui::Color32,
     key: egui::Color32,
     key_hover: egui::Color32,
+    /// The frame of a key; transparent where the keys stand out by colour.
+    key_line: egui::Color32,
+    /// The account's pill and the menu button.
+    chip: egui::Color32,
     text: egui::Color32,
     weak: egui::Color32,
     line: egui::Color32,
+    /// NAVI, the page shown, the filled part of the sliders.
     accent: egui::Color32,
-    band_left: egui::Color32,
-    band_right: egui::Color32,
+    call: egui::Color32,
+    on_call: egui::Color32,
+    track: egui::Color32,
+    knob: egui::Color32,
     green: egui::Color32,
     red: egui::Color32,
-    shadow: egui::Color32,
 }
 
 fn palette(light: bool) -> Palette {
     let rgb = egui::Color32::from_rgb;
     if light {
         Palette {
-            page: rgb(246, 247, 251),
+            page: rgb(255, 255, 255),
             card: rgb(255, 255, 255),
-            key: rgb(238, 240, 247),
-            key_hover: rgb(226, 229, 242),
-            text: rgb(29, 36, 51),
-            weak: rgb(107, 114, 128),
-            line: rgb(229, 231, 240),
-            accent: rgb(124, 58, 237),
-            band_left: rgb(79, 70, 229),
-            band_right: rgb(124, 58, 237),
+            card_line: rgb(229, 229, 229),
+            key: rgb(255, 255, 255),
+            key_hover: rgb(245, 245, 245),
+            key_line: rgb(229, 229, 229),
+            chip: rgb(243, 243, 243),
+            text: rgb(10, 10, 10),
+            weak: rgb(115, 115, 115),
+            line: rgb(229, 229, 229),
+            accent: rgb(10, 10, 10),
+            call: rgb(10, 10, 10),
+            on_call: rgb(255, 229, 0),
+            track: rgb(229, 229, 229),
+            knob: rgb(10, 10, 10),
             green: rgb(34, 197, 94),
-            red: rgb(239, 68, 68),
-            shadow: egui::Color32::from_black_alpha(28),
+            red: rgb(225, 29, 72),
         }
     } else {
         Palette {
-            page: rgb(18, 20, 23),
-            card: rgb(30, 33, 39),
-            key: rgb(42, 46, 54),
-            key_hover: rgb(54, 59, 69),
-            text: rgb(230, 232, 236),
-            weak: rgb(150, 156, 168),
-            line: rgb(48, 52, 60),
-            accent: rgb(139, 92, 246),
-            band_left: rgb(55, 48, 163),
-            band_right: rgb(91, 33, 182),
-            green: rgb(34, 170, 84),
-            red: rgb(220, 60, 60),
-            shadow: egui::Color32::from_black_alpha(90),
+            page: rgb(11, 11, 12),
+            card: rgb(20, 20, 22),
+            card_line: rgb(34, 34, 38),
+            key: rgb(31, 31, 35),
+            key_hover: rgb(42, 42, 47),
+            key_line: egui::Color32::TRANSPARENT,
+            chip: rgb(28, 28, 31),
+            text: rgb(245, 245, 245),
+            weak: rgb(138, 141, 147),
+            line: rgb(34, 34, 38),
+            accent: rgb(255, 229, 0),
+            call: rgb(255, 229, 0),
+            on_call: rgb(11, 11, 12),
+            track: rgb(42, 42, 47),
+            knob: rgb(255, 255, 255),
+            green: rgb(34, 197, 94),
+            red: rgb(255, 69, 58),
         }
     }
-}
-
-/// The coloured band at the top: a gradient from left to right.
-fn paint_band(painter: &egui::Painter, rect: egui::Rect, colors: &Palette) {
-    let mut mesh = egui::Mesh::default();
-    mesh.colored_vertex(rect.left_top(), colors.band_left);
-    mesh.colored_vertex(rect.right_top(), colors.band_right);
-    mesh.colored_vertex(rect.right_bottom(), colors.band_right);
-    mesh.colored_vertex(rect.left_bottom(), colors.band_left);
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(0, 2, 3);
-    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// ` – 14:35` after the start of a call in the list: when it ended, with
@@ -4681,8 +4713,8 @@ fn end_text(started: u64, ended: u64, offset: i64) -> String {
     }
 }
 
-/// The picture of the top band, built into the program: the letters NAVI,
-/// yellow on nothing, drawn on the band's black.
+/// The letters NAVI at the top, built into the program: white on nothing,
+/// painted in the theme's accent colour.
 const HEADER_PICTURE: &[u8] = include_bytes!("../../assets/header-letters.png");
 
 /// The windows' own icon: NAVI on black. Small, so it costs next to
@@ -4705,52 +4737,175 @@ fn window_icon() -> Arc<egui::IconData> {
     .clone()
 }
 
-/// The band with the picture: black like the picture's own background,
-/// the picture whole on the right, where the text of the band leaves room
-/// and the card does not cover it.
-fn paint_picture_band(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    overlap: f32,
-    texture: &egui::TextureHandle,
-) {
-    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(5, 5, 5));
-    let [width, height] = texture.size();
-    let aspect = width as f32 / height as f32;
-    // The part of the band that stays in sight above the card, less the
-    // room of the menu button on the right.
-    let room = egui::Rect::from_min_max(
-        // A low band has the account on the same line: more room for it.
-        egui::pos2(
-            rect.left() + rect.width() * if overlap < 10.0 { 0.58 } else { 0.42 },
-            rect.top() + 6.0,
-        ),
-        egui::pos2(rect.right() - 48.0, rect.bottom() - overlap - 6.0),
-    );
-    let mut size = egui::vec2(room.height() * aspect, room.height());
-    if size.x > room.width() {
-        size = egui::vec2(room.width(), room.width() / aspect);
-    }
-    // Some air around the letters, so they do not touch the window's top.
-    let place = egui::Rect::from_center_size(room.center(), size * 0.8);
-    painter.image(
-        texture.id(),
-        place,
-        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        egui::Color32::WHITE,
+/// A card: filled, with a thin frame.
+fn paint_card(painter: &egui::Painter, rect: egui::Rect, radius: u8, colors: &Palette) {
+    painter.rect(
+        rect,
+        radius,
+        colors.card,
+        egui::Stroke::new(1.0_f32, colors.card_line),
+        egui::StrokeKind::Inside,
     );
 }
 
-/// A rounded card with a soft shadow under it.
-fn paint_card(painter: &egui::Painter, rect: egui::Rect, radius: u8, colors: &Palette) {
-    let shadow = egui::Shadow {
-        offset: [0, 4],
-        blur: 14,
-        spread: 0,
-        color: colors.shadow,
-    };
-    painter.add(shadow.as_shape(rect, egui::CornerRadius::same(radius)));
-    painter.rect_filled(rect, radius, colors.card);
+/// The marks of the tiles and the volumes, drawn in one thin line so that
+/// they look alike (the fonts' symbols differ from each other).
+#[derive(Clone, Copy)]
+enum Icon {
+    Keypad,
+    Clock,
+    Person,
+    Bubble,
+    Envelope,
+    Speaker,
+    Microphone,
+}
+
+fn paint_icon(painter: &egui::Painter, icon: Icon, center: egui::Pos2, ink: egui::Color32) {
+    let stroke = egui::Stroke::new(1.6_f32, ink);
+    let at = |x: f32, y: f32| center + egui::vec2(x, y);
+    match icon {
+        Icon::Keypad => {
+            for row in 0..3 {
+                for column in 0..3 {
+                    let spot = at(column as f32 * 5.5 - 5.5, row as f32 * 5.0 - 7.0);
+                    painter.circle_filled(spot, 1.7, ink);
+                }
+            }
+            painter.circle_filled(at(0.0, 8.0), 1.7, ink);
+        }
+        Icon::Clock => {
+            painter.circle_stroke(center, 8.5, stroke);
+            painter.line_segment([at(0.0, -5.0), at(0.0, 0.0)], stroke);
+            painter.line_segment([at(0.0, 0.0), at(3.5, 2.5)], stroke);
+        }
+        Icon::Person => {
+            painter.circle_stroke(at(0.0, -4.5), 3.8, stroke);
+            let shoulders: Vec<egui::Pos2> = (0..=12)
+                .map(|step| {
+                    let angle = std::f32::consts::PI * (1.0 + step as f32 / 12.0);
+                    at(8.0 * angle.cos(), 9.0 + 7.0 * angle.sin())
+                })
+                .collect();
+            painter.add(egui::Shape::line(shoulders, stroke));
+        }
+        Icon::Bubble => {
+            let outline = vec![
+                at(-8.5, -7.0),
+                at(8.5, -7.0),
+                at(8.5, 4.0),
+                at(-2.5, 4.0),
+                at(-7.0, 8.0),
+                at(-7.0, 4.0),
+                at(-8.5, 4.0),
+            ];
+            painter.add(egui::Shape::closed_line(outline, stroke));
+        }
+        Icon::Envelope => {
+            let body = egui::Rect::from_center_size(center, egui::vec2(18.0, 13.0));
+            painter.rect_stroke(body, 2, stroke, egui::StrokeKind::Middle);
+            painter.add(egui::Shape::line(
+                vec![at(-9.0, -5.0), at(0.0, 1.5), at(9.0, -5.0)],
+                stroke,
+            ));
+        }
+        Icon::Speaker => {
+            let cone = vec![
+                at(-7.0, -2.5),
+                at(-3.5, -2.5),
+                at(1.0, -6.5),
+                at(1.0, 6.5),
+                at(-3.5, 2.5),
+                at(-7.0, 2.5),
+            ];
+            painter.add(egui::Shape::closed_line(cone, stroke));
+            let wave: Vec<egui::Pos2> = (0..=8)
+                .map(|step| {
+                    let angle = -0.9 + 1.8 * step as f32 / 8.0;
+                    at(1.5 + 5.5 * angle.cos(), 5.5 * angle.sin())
+                })
+                .collect();
+            painter.add(egui::Shape::line(wave, stroke));
+        }
+        Icon::Microphone => {
+            let body = egui::Rect::from_center_size(at(0.0, -2.5), egui::vec2(6.0, 10.0));
+            painter.rect_stroke(body, 3, stroke, egui::StrokeKind::Middle);
+            let cup: Vec<egui::Pos2> = (0..=10)
+                .map(|step| {
+                    let angle = std::f32::consts::PI * step as f32 / 10.0;
+                    at(6.0 * angle.cos(), 0.5 + 5.0 * angle.sin())
+                })
+                .collect();
+            painter.add(egui::Shape::line(cup, stroke));
+            painter.line_segment([at(0.0, 5.5), at(0.0, 8.5)], stroke);
+        }
+    }
+}
+
+/// A volume slider in the window's colours: a thin rail filled up to a round
+/// knob; `level`, during a call, a thin bar under it showing how loud the
+/// sound is.
+fn level_slider(
+    ui: &mut egui::Ui,
+    value: &mut u32,
+    max: u32,
+    width: f32,
+    colors: &Palette,
+    level: Option<f32>,
+) -> egui::Response {
+    let (rect, mut response) =
+        ui.allocate_exact_size(egui::vec2(width, 20.0), egui::Sense::click_and_drag());
+    let knob_radius = 7.0;
+    let left = rect.left() + knob_radius;
+    let span = (rect.width() - 2.0 * knob_radius).max(1.0);
+    if let Some(pointer) = response.interact_pointer_pos() {
+        let share = ((pointer.x - left) / span).clamp(0.0, 1.0);
+        let chosen = (share * max as f32).round() as u32;
+        if chosen != *value {
+            *value = chosen;
+            response.mark_changed();
+        }
+    }
+    // The wheel moves it in steps of five.
+    if response.hovered() {
+        let scroll = ui.input(|input| input.smooth_scroll_delta.y + input.smooth_scroll_delta.x);
+        if scroll.abs() > 0.5 {
+            let step = if scroll > 0.0 { 5 } else { -5 };
+            *value = (*value as i32 + step).clamp(0, max as i32) as u32;
+            response.mark_changed();
+        }
+    }
+    let share = (*value).min(max) as f32 / max as f32;
+    let y = rect.center().y;
+    let knob = egui::pos2(left + span * share, y);
+    let painter = ui.painter();
+    let rail =
+        egui::Rect::from_min_max(egui::pos2(left, y - 2.5), egui::pos2(left + span, y + 2.5));
+    painter.rect_filled(rail, 3, colors.track);
+    let mut filled = rail;
+    filled.set_right(knob.x);
+    painter.rect_filled(filled, 3, colors.accent);
+    if let Some(level) = level {
+        // A level on a sound scale: quiet speech is still seen.
+        let shown = (1.0 + (level.max(0.000_1)).log10() / 3.0).clamp(0.0, 1.0);
+        let color = if level > 0.9 {
+            colors.red
+        } else {
+            colors.green
+        };
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(left, y + 6.0),
+            egui::pos2(left + span * shown, y + 8.0),
+        );
+        painter.rect_filled(bar, 1, color);
+    }
+    painter.circle_filled(
+        knob + egui::vec2(0.0, 1.0),
+        knob_radius,
+        egui::Color32::from_black_alpha(60),
+    );
+    painter.circle_filled(knob, knob_radius, colors.knob);
+    response
 }
 
 /// The backspace mark (the fonts have no glyph for it): a key pointing
@@ -4796,16 +4951,6 @@ fn key_letters(digit: char) -> &'static str {
         '9' => "WXYZ",
         '0' => "+",
         _ => "",
-    }
-}
-
-/// "Good morning" and so on, by the local time of day.
-fn greeting(offset: i64) -> &'static str {
-    match DateTime::from_unix(now_unix(), offset).hour {
-        5..=11 => tr!("Доброе утро!", "Good morning!"),
-        12..=17 => tr!("Добрый день!", "Good afternoon!"),
-        18..=22 => tr!("Добрый вечер!", "Good evening!"),
-        _ => tr!("Доброй ночи!", "Good night!"),
     }
 }
 
