@@ -520,6 +520,9 @@ struct ControlsInner {
     /// One queue per line of the phone, in the order the lines were made.
     heard: Mutex<Vec<HeardQueue>>,
     speaker_percent: Arc<AtomicU32>,
+    /// The ring of an incoming call: it follows the speaker volume, but not
+    /// the speaker switched off, so that no call is missed.
+    ring_percent: Arc<AtomicU32>,
     microphone_percent: AtomicU32,
     input_device: Mutex<Option<String>>,
     output_device: Mutex<Option<String>>,
@@ -541,6 +544,7 @@ impl Default for AudioControls {
                 conference: AtomicBool::new(false),
                 heard: Mutex::new(Vec::new()),
                 speaker_percent: Arc::new(AtomicU32::new(100)),
+                ring_percent: Arc::new(AtomicU32::new(100)),
                 microphone_percent: AtomicU32::new(100),
                 input_device: Mutex::new(None),
                 output_device: Mutex::new(None),
@@ -656,6 +660,13 @@ impl AudioControls {
             .fold(0.0_f32, |peak, sample| peak.max(sample.abs()))
             .min(1.0);
         level.fetch_max((peak * 1_000.0).round() as u32, Ordering::Relaxed);
+    }
+
+    /// Volume of the ring of incoming calls, in percent as the speaker's.
+    pub fn set_ring_volume(&self, percent: u32) {
+        self.inner
+            .ring_percent
+            .store(percent.min(MAX_VOLUME_PERCENT), Ordering::Relaxed);
     }
 
     /// The speaker volume shared with the sound card, for other players.
@@ -797,7 +808,11 @@ impl Ringer {
         // Only the ring of an incoming call has a device and a melody of
         // its own; the ringback belongs to the conversation.
         let ring_device = incoming.then(|| controls.ring_device()).flatten();
-        let volume = controls.speaker_volume_handle();
+        let volume = if incoming {
+            Arc::clone(&controls.inner.ring_percent)
+        } else {
+            controls.speaker_volume_handle()
+        };
         let speaker = match ring_device {
             // A ring device that was unplugged must not silence the phone.
             Some(device) => Speaker::start_on(Some(&device), Arc::clone(&volume), 0)
@@ -1233,6 +1248,13 @@ mod tests {
         controls.set_output_device(Some("Speakers".to_owned()));
         assert_eq!(other.speaker_volume(), 40);
         assert_eq!(other.microphone_volume(), 150);
+        // The ring keeps its own volume: a speaker switched off (0) does
+        // not silence incoming calls.
+        controls.set_speaker_volume(0);
+        controls.set_ring_volume(80);
+        assert_eq!(other.speaker_volume(), 0);
+        assert_eq!(other.inner.ring_percent.load(Ordering::Relaxed), 80);
+        controls.set_speaker_volume(40);
         assert_eq!(other.input_device().as_deref(), Some("Headset"));
         assert_eq!(other.output_device().as_deref(), Some("Speakers"));
         // The running speaker reads the very same number.

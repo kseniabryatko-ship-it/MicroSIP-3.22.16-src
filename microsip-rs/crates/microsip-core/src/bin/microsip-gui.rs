@@ -87,7 +87,6 @@ enum Action {
     Answer,
     Reject,
     Hangup,
-    ToggleMute,
     ToggleHold,
     Digit(char),
     Connect,
@@ -178,7 +177,6 @@ const LINES: usize = 2;
 #[derive(Default)]
 struct LineUi {
     view: CallView,
-    muted: bool,
     current: Option<CurrentCall>,
     caller: Option<(String, String)>,
     /// The file being written now.
@@ -236,6 +234,10 @@ struct PhoneWindow {
     header_texture: Option<egui::TextureHandle>,
     /// When the key sounds' speaker was last asked to be ready.
     key_tones_warmed: Option<Instant>,
+    /// The speaker and the microphone switched off with their marks next to
+    /// the volumes; not kept: the phone always starts with both on.
+    speaker_off: bool,
+    microphone_off: bool,
     /// Asks the window to look again from other threads: the phone engine
     /// and the system dialogs call it when they have news.
     repaint: egui::Context,
@@ -564,6 +566,8 @@ impl PhoneWindow {
             key_tones: KeyTones::new(controls.clone()),
             key_tones_warmed: None,
             repaint: ctx.clone(),
+            speaker_off: false,
+            microphone_off: false,
             exiting: false,
             header_picture: saved.header_picture,
             header_texture: None,
@@ -638,8 +642,22 @@ impl PhoneWindow {
     }
 
     fn apply_audio_settings(&mut self) {
-        self.controls.set_speaker_volume(self.speaker_volume);
-        self.controls.set_microphone_volume(self.microphone_volume);
+        // Switched off with its mark: nothing is heard or sent, and the
+        // chosen volume comes back when it is switched on again.
+        let speaker = if self.speaker_off {
+            0
+        } else {
+            self.speaker_volume
+        };
+        let microphone = if self.microphone_off {
+            0
+        } else {
+            self.microphone_volume
+        };
+        self.controls.set_speaker_volume(speaker);
+        // Incoming calls ring even with the speaker switched off.
+        self.controls.set_ring_volume(self.speaker_volume);
+        self.controls.set_microphone_volume(microphone);
         self.controls
             .set_input_device(Some(self.microphone.clone()));
         self.controls.set_output_device(Some(self.speaker.clone()));
@@ -1138,11 +1156,10 @@ impl PhoneWindow {
         }
     }
 
+    /// The microphone off or on again, for every call, until switched back.
     fn toggle_mute(&mut self) {
-        if self.lines[self.at].view.phase() == Phase::Connected {
-            self.lines[self.at].muted = !self.lines[self.at].muted;
-            self.send(UiCommand::Mute(self.lines[self.at].muted));
-        }
+        self.microphone_off = !self.microphone_off;
+        self.apply_audio_settings();
     }
 
     fn toggle_hold(&mut self) {
@@ -1229,7 +1246,6 @@ impl PhoneWindow {
     /// Ends the bookkeeping of the current call and, when `record` is set,
     /// writes it to the call list.
     fn finish_call(&mut self, reason: EndReason, record: bool) {
-        self.lines[self.at].muted = false;
         self.lines[self.at].answer_at = None;
         self.transfer_to.clear();
         // The phone finishes the file itself when the call ends.
@@ -1619,7 +1635,6 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
             Action::Answer => self.answer(),
             Action::Reject => self.reject(),
             Action::Hangup => self.hangup(),
-            Action::ToggleMute => self.toggle_mute(),
             Action::ToggleHold => self.toggle_hold(),
             Action::Digit(digit) => self.digit(digit),
             Action::Connect => self.connect(),
@@ -2670,7 +2685,7 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         let (below, fixed) = if idle {
             (0.95, 5.0 * gap.y)
         } else {
-            (0.95 + 2.0 * 0.71, 8.0 * gap.y + 30.0)
+            (0.95 + 0.71, 6.0 * gap.y + 30.0)
         };
         // The buttons under the keys stop growing at a comfortable height;
         // what a large window has left goes to the keys.
@@ -2851,33 +2866,34 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                     actions.push(Action::Hangup);
                 }
                 let connected = phase == Phase::Connected;
-                let mute = if self.lines[self.at].muted {
-                    tr!("Включить микрофон", "Unmute")
-                } else {
-                    tr!("Выключить микрофон", "Mute")
-                };
                 let hold = if self.lines[self.at].view.is_held() {
                     tr!("Продолжить", "Resume")
                 } else {
                     tr!("Удержание", "Hold")
                 };
                 let record = if self.lines[self.at].recording.is_some() {
-                    tr!("Остановить запись", "Stop recording")
+                    tr!("Стоп запись", "Stop recording")
                 } else {
-                    tr!("Записать разговор", "Record the call")
+                    tr!("Записать", "Record")
                 };
+                // The microphone is switched off with its mark next to the
+                // volumes, for every call.
                 ui.add_enabled_ui(connected, |ui| {
                     ui.horizontal(|ui| {
-                        if ui.add_sized(small_half, plain(mute)).clicked() {
-                            actions.push(Action::ToggleMute);
-                        }
                         if ui.add_sized(small_half, plain(hold)).clicked() {
                             actions.push(Action::ToggleHold);
                         }
+                        if ui
+                            .add_sized(small_half, plain(record))
+                            .on_hover_text(tr!(
+                                "Записать разговор в файл",
+                                "Record the call to a file"
+                            ))
+                            .clicked()
+                        {
+                            actions.push(Action::ToggleRecording);
+                        }
                     });
-                    if ui.add_sized(small_row, plain(record)).clicked() {
-                        actions.push(Action::ToggleRecording);
-                    }
                     ui.horizontal(|ui| {
                         let field = egui::TextEdit::singleline(&mut self.transfer_to)
                             .hint_text(tr!("Перевести на номер", "Transfer to number"))
@@ -3298,26 +3314,74 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 spoken_level,
             ),
         ];
+        let mut toggled = None;
         for (index, (icon, name, hint, level)) in rows.into_iter().enumerate() {
+            let off = if index == 0 {
+                self.speaker_off
+            } else {
+                self.microphone_off
+            };
             let value = if index == 0 {
                 &mut self.speaker_volume
             } else {
                 &mut self.microphone_volume
             };
             ui.horizontal(|ui| {
+                // The mark switches it off and on; off, it is crossed out
+                // in red and the slider is dimmed.
                 let (spot, mark) =
-                    ui.allocate_exact_size(egui::vec2(20.0, 18.0), egui::Sense::hover());
-                paint_icon(ui.painter(), icon, spot.center(), colors.weak);
-                mark.on_hover_text(name);
+                    ui.allocate_exact_size(egui::vec2(24.0, 22.0), egui::Sense::click());
+                if mark.hovered() {
+                    ui.painter().rect_filled(spot, 6, colors.key_hover);
+                }
+                let ink = if off { colors.red } else { colors.weak };
+                paint_icon(ui.painter(), icon, spot.center(), ink);
+                if off {
+                    let center = spot.center();
+                    ui.painter().line_segment(
+                        [
+                            center + egui::vec2(-8.0, -8.0),
+                            center + egui::vec2(8.0, 8.0),
+                        ],
+                        egui::Stroke::new(2.0_f32, colors.red),
+                    );
+                }
+                let switch = match (index, off) {
+                    (0, false) => tr!("Выключить динамик", "Turn the speaker off"),
+                    (0, true) => tr!("Включить динамик", "Turn the speaker on"),
+                    (_, false) => tr!("Выключить микрофон", "Mute the microphone"),
+                    (_, true) => tr!("Включить микрофон", "Unmute the microphone"),
+                };
+                if mark.on_hover_text(format!("{name}: {switch}")).clicked() {
+                    toggled = Some(index);
+                }
                 let width = (ui.available_width() - 46.0).max(60.0);
-                level_slider(ui, value, 200, width, colors, talking.then_some(level))
+                let dimmed = if off {
+                    Palette {
+                        accent: colors.weak,
+                        knob: colors.weak,
+                        ..*colors
+                    }
+                } else {
+                    *colors
+                };
+                level_slider(ui, value, 200, width, &dimmed, talking.then_some(level))
                     .on_hover_text(hint);
-                ui.label(
-                    egui::RichText::new(format!("{value}%"))
-                        .color(colors.weak)
-                        .size(12.5),
-                );
+                let shown = if off {
+                    tr!("выкл", "off").to_owned()
+                } else {
+                    format!("{value}%")
+                };
+                ui.label(egui::RichText::new(shown).color(ink).size(12.5));
             });
+        }
+        match toggled {
+            Some(0) => {
+                self.speaker_off = !self.speaker_off;
+                self.apply_audio_settings();
+            }
+            Some(_) => self.toggle_mute(),
+            None => {}
         }
         if before != (self.speaker_volume, self.microphone_volume) {
             // Volumes act at once; they are saved when the window closes.
@@ -3630,7 +3694,7 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                     tr!("Идёт запись разговора", "The call is being recorded"),
                 );
             }
-            if self.lines[self.at].muted {
+            if self.microphone_off {
                 ui.colored_label(
                     egui::Color32::YELLOW,
                     tr!("Микрофон выключен", "Microphone muted"),
@@ -5559,8 +5623,9 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_icon(window_icon())
             .with_inner_size([400.0, 640.0])
-            // Any size from small to full screen; the window adapts.
-            .with_min_inner_size([280.0, 360.0]),
+            // Any size up to full screen; the window adapts. Below this the
+            // buttons of a call would no longer fit under the keys.
+            .with_min_inner_size([280.0, 580.0]),
         ..Default::default()
     };
     eframe::run_native(
