@@ -237,6 +237,8 @@ struct PhoneWindow {
     /// The speaker and the microphone switched off with their marks next to
     /// the volumes; not kept: the phone always starts with both on.
     speaker_off: bool,
+    /// What is typed in the search of the call list; not kept.
+    calls_query: String,
     microphone_off: bool,
     /// Asks the window to look again from other threads: the phone engine
     /// and the system dialogs call it when they have news.
@@ -567,6 +569,7 @@ impl PhoneWindow {
             key_tones_warmed: None,
             repaint: ctx.clone(),
             speaker_off: false,
+            calls_query: String::new(),
             microphone_off: false,
             exiting: false,
             header_picture: saved.header_picture,
@@ -3740,11 +3743,32 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             "Save every call to a CSV file for Excel: date, time, number, \
              length of the conversation and status"
         );
+        let total = self.history.records().len();
+        let searching = !self.calls_query.trim().is_empty();
+        let shown = if searching {
+            self.history
+                .records()
+                .iter()
+                .filter(|record| {
+                    let name = self
+                        .contacts
+                        .name_of(&record.number)
+                        .unwrap_or(&record.name);
+                    call_matches(&record.number, name, &self.calls_query)
+                })
+                .count()
+        } else {
+            total
+        };
         ui.horizontal(|ui| {
-            ui.label(tr!(
-                format!("Звонков: {}", self.history.records().len()),
-                format!("Calls: {}", self.history.records().len()),
-            ));
+            ui.label(if searching {
+                tr!(
+                    format!("Найдено: {shown} из {total}"),
+                    format!("Found: {shown} of {total}"),
+                )
+            } else {
+                tr!(format!("Звонков: {total}"), format!("Calls: {total}"))
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let download = match buttons {
                     RowButtons::Words => Some(tr!("Скачать историю…", "Download the history…")),
@@ -3786,11 +3810,59 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 }
             });
         });
+        // Search by number (however it is written) or by name.
+        ui.horizontal(|ui| {
+            let clear = !self.calls_query.is_empty();
+            // Room left for the cross and the gap before it, and for the
+            // field's own margins, so the row does not grow past the card.
+            let margins = 2.0 * ui.spacing().button_padding.x;
+            let cross_room = 24.0 + ui.spacing().item_spacing.x;
+            let width = ui.available_width() - margins - if clear { cross_room } else { 0.0 };
+            ui.add(
+                egui::TextEdit::singleline(&mut self.calls_query)
+                    .hint_text(tr!(
+                        "🔍 Поиск по номеру или имени",
+                        "🔍 Search by number or name"
+                    ))
+                    .desired_width(width),
+            );
+            if clear {
+                let cross = ui
+                    .add_sized([24.0, 20.0], egui::Button::new(""))
+                    .on_hover_text(tr!("Очистить поиск", "Clear the search"));
+                // Drawn: the fonts have no cross.
+                let center = cross.rect.center();
+                let stroke = egui::Stroke::new(1.6_f32, colors.weak);
+                for (from, to) in [((-4.0, -4.0), (4.0, 4.0)), ((-4.0, 4.0), (4.0, -4.0))] {
+                    ui.painter().line_segment(
+                        [
+                            center + egui::vec2(from.0, from.1),
+                            center + egui::vec2(to.0, to.1),
+                        ],
+                        stroke,
+                    );
+                }
+                if cross.clicked() {
+                    self.calls_query.clear();
+                }
+            }
+        });
         ui.separator();
         let can_dial = self.lines[self.at].view.can_dial();
         let mut to_contacts = None;
+        let query = self.calls_query.clone();
+        let mut found = 0;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (index, record) in self.history.records().iter().enumerate() {
+                // A contact saved later names old calls too.
+                let name = self
+                    .contacts
+                    .name_of(&record.number)
+                    .unwrap_or(&record.name);
+                if !call_matches(&record.number, name, &query) {
+                    continue;
+                }
+                found += 1;
                 let (mark, color) = match record.direction {
                     Direction::Outgoing => (
                         tr!("Исх.", "Out"),
@@ -3808,11 +3880,6 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                     ),
                     Direction::Missed => (tr!("Проп.", "Missed"), colors.red),
                 };
-                // A contact saved later names old calls too.
-                let name = self
-                    .contacts
-                    .name_of(&record.number)
-                    .unwrap_or(&record.name);
                 let who = if name.is_empty() {
                     record.number.clone()
                 } else {
@@ -3923,6 +3990,13 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                     }
                     None => {}
                 }
+            }
+            if found == 0 && !query.trim().is_empty() {
+                ui.add_space(8.0);
+                ui.weak(tr!(
+                    "Звонков с таким номером нет",
+                    "No calls with such a number"
+                ));
             }
         });
         if let Some(number) = to_contacts {
@@ -5139,6 +5213,34 @@ fn history_file_name() -> String {
 
 /// "Copy the number" (and the name, when there is one) for a right click on
 /// a call or a contact.
+/// Whether a call fits the search of the call list. Digits are looked for
+/// among the number's digits however either is written, so `901 075`
+/// finds `+7 (901) 075-06-27`, and a Russian number found with 8 is found
+/// with 7 as well; with letters the name and the number are searched,
+/// ignoring case.
+fn call_matches(number: &str, name: &str, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    let digits: String = query.chars().filter(char::is_ascii_digit).collect();
+    if !digits.is_empty() && !query.chars().any(char::is_alphabetic) {
+        let number_digits: String = number.chars().filter(char::is_ascii_digit).collect();
+        if number_digits.contains(&digits) {
+            return true;
+        }
+        // 8 or +7 at the start: the same number.
+        let other = match digits.as_bytes() {
+            [b'8', ..] => Some(format!("7{}", &digits[1..])),
+            [b'7', ..] => Some(format!("8{}", &digits[1..])),
+            _ => None,
+        };
+        return digits.len() >= 4 && other.is_some_and(|other| number_digits.starts_with(&other));
+    }
+    let query = query.to_lowercase();
+    name.to_lowercase().contains(&query) || number.to_lowercase().contains(&query)
+}
+
 /// How the buttons of a call in the list are shown, by the room there is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RowButtons {
@@ -5646,6 +5748,33 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calls_are_found_by_any_part_of_the_number_or_the_name() {
+        let number = "+7 (901) 075-06-27";
+        for query in [
+            "",
+            "  ",
+            "901",
+            "075-06",
+            "79010750627",
+            "8 901 075",
+            "0627",
+        ] {
+            assert!(call_matches(number, "", query), "{query}");
+        }
+        for query in ["902", "8902", "12345"] {
+            assert!(!call_matches(number, "", query), "{query}");
+        }
+        // Written with 8, found with +7 too.
+        assert!(call_matches("89010750627", "", "+7 901"));
+        assert!(call_matches("4010", "Анна Смирнова", "анна"));
+        assert!(call_matches("4010", "Анна Смирнова", "СМИР"));
+        assert!(call_matches("4010", "Анна Смирнова", "401"));
+        assert!(!call_matches("4010", "Анна Смирнова", "Иван"));
+        // Letters typed into a short number are no match.
+        assert!(!call_matches("4010", "", "4010a"));
+    }
 
     #[test]
     fn the_end_of_a_call_follows_its_start() {
