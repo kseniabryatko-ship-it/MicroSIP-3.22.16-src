@@ -239,6 +239,11 @@ struct PhoneWindow {
     speaker_off: bool,
     /// What is typed in the search of the call list; not kept.
     calls_query: String,
+    /// A very low window: one row of volumes, small keys, and in a call
+    /// the keys hidden until asked for.
+    tiny: bool,
+    /// The keys shown during a call in a very low window.
+    keys_in_call: bool,
     microphone_off: bool,
     /// Asks the window to look again from other threads: the phone engine
     /// and the system dialogs call it when they have news.
@@ -570,6 +575,8 @@ impl PhoneWindow {
             repaint: ctx.clone(),
             speaker_off: false,
             calls_query: String::new(),
+            tiny: false,
+            keys_in_call: false,
             microphone_off: false,
             exiting: false,
             header_picture: saved.header_picture,
@@ -2681,7 +2688,16 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         // hints, and the lines when there are calls; below them one row of
         // buttons when idle, about four in a call.
         let dialling = self.lines[self.at].view.phase() == Phase::Idle;
-        let above = if dialling { 40.0 } else { 70.0 } + if calls { 34.0 } else { 0.0 };
+        let tiny = self.tiny;
+        let above = match (dialling, tiny) {
+            (true, true) => 32.0,
+            (true, false) => 40.0,
+            (false, true) => 52.0,
+            (false, false) => 70.0,
+        } + if calls { 34.0 } else { 0.0 };
+        // In a very low window the keys of a call are hidden unless asked
+        // for: the call's own buttons come first.
+        let keys_shown = !tiny || idle || self.keys_in_call;
         // Rows under the keys, in key heights and in fixed pixels: the
         // call button (0.95 of a key); in a call also two smaller rows and
         // the transfer field.
@@ -2692,15 +2708,19 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         };
         // The buttons under the keys stop growing at a comfortable height;
         // what a large window has left goes to the keys.
-        let estimate = ((room.y - above - 14.0 - fixed) / (4.0 + below)).clamp(22.0, 150.0);
-        let row = (estimate * 0.95).clamp(26.0, 64.0);
+        let key_rows = if keys_shown { 4.0 } else { 0.0 };
+        let smallest_key = if tiny { 18.0 } else { 22.0 };
+        let estimate =
+            ((room.y - above - 14.0 - fixed) / (key_rows + below)).clamp(smallest_key, 150.0);
+        let row = (estimate * 0.95).clamp(if tiny { 24.0 } else { 26.0 }, 64.0);
         let rows = row * below / 0.95;
-        let key_height = ((room.y - above - 14.0 - fixed - rows) / 4.0).clamp(22.0, 150.0);
+        let key_height = ((room.y - above - 14.0 - fixed - rows) / 4.0).clamp(smallest_key, 150.0);
         let sizes = PadSizes {
             key: egui::vec2(((room.x - 2.0 * gap.x) / 3.0).max(36.0), key_height),
-            key_font: (key_height * 0.42).clamp(13.0, 40.0),
+            key_font: (key_height * 0.42).clamp(12.0, 40.0),
             row,
             row_font: (row * 0.32).clamp(13.0, 20.0),
+            keys_shown,
         };
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -2883,11 +2903,22 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 // volumes, for every call.
                 ui.add_enabled_ui(connected, |ui| {
                     ui.horizontal(|ui| {
-                        if ui.add_sized(small_half, plain(hold)).clicked() {
+                        // A very low window hides the keys in a call; this
+                        // brings them back.
+                        let keys_button = if self.tiny { 40.0 } else { 0.0 };
+                        let half = if self.tiny {
+                            egui::vec2(
+                                (small_half.x * 2.0 - keys_button - spacing) / 2.0,
+                                small_half.y,
+                            )
+                        } else {
+                            small_half
+                        };
+                        if ui.add_sized(half, plain(hold)).clicked() {
                             actions.push(Action::ToggleHold);
                         }
                         if ui
-                            .add_sized(small_half, plain(record))
+                            .add_sized(half, plain(record))
                             .on_hover_text(tr!(
                                 "Записать разговор в файл",
                                 "Record the call to a file"
@@ -2895,6 +2926,40 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                             .clicked()
                         {
                             actions.push(Action::ToggleRecording);
+                        }
+                        if self.tiny {
+                            let keys = ui
+                                .add_sized(
+                                    [keys_button, small_half.y],
+                                    egui::Button::new("")
+                                        .fill(if self.keys_in_call {
+                                            colors.key_hover
+                                        } else {
+                                            colors.key
+                                        })
+                                        .stroke(egui::Stroke::new(1.0_f32, colors.key_line))
+                                        .corner_radius(12),
+                                )
+                                .on_hover_text(if self.keys_in_call {
+                                    tr!("Спрятать клавиатуру", "Hide the keypad")
+                                } else {
+                                    tr!("Показать клавиатуру", "Show the keypad")
+                                });
+                            let ink = if self.keys_in_call {
+                                colors.accent
+                            } else {
+                                colors.text
+                            };
+                            paint_icon_scaled(
+                                ui.painter(),
+                                Icon::Keypad,
+                                keys.rect.center(),
+                                ink,
+                                0.7,
+                            );
+                            if keys.clicked() {
+                                self.keys_in_call = !self.keys_in_call;
+                            }
                         }
                     });
                     ui.horizontal(|ui| {
@@ -2923,9 +2988,10 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             .show(ctx, |ui| {
                 let full = ui.max_rect();
                 let margin = 16.0;
+                let top = if full.height() < 440.0 { 6.0 } else { 12.0 };
                 let head = egui::Rect::from_min_max(
-                    full.min + egui::vec2(margin, 12.0),
-                    egui::pos2(full.right() - margin, full.top() + 12.0 + 36.0),
+                    full.min + egui::vec2(margin, top),
+                    egui::pos2(full.right() - margin, full.top() + top + 36.0),
                 );
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(head), |ui| {
                     self.header(ui, &colors);
@@ -2934,14 +3000,30 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 // A low window: lower tiles and volumes and smaller gaps, so
                 // that the card keeps room for the keys and the call buttons.
                 let low = full.height() < 600.0;
-                let gap = if low { 8.0 } else { 10.0 };
-                let bottom = full.bottom() - if low { 10.0 } else { 14.0 };
-                let volumes = match (self.tab == Tab::Dialpad, low) {
-                    (false, _) => 0.0,
-                    (true, true) => 52.0,
-                    (true, false) => 70.0,
+                // Very low: the volumes in one row, everything tighter.
+                self.tiny = full.height() < 440.0;
+                let tiny = self.tiny;
+                let gap = if tiny {
+                    6.0
+                } else if low {
+                    8.0
+                } else {
+                    10.0
                 };
-                let tiles_height = if low { 36.0 } else { 64.0 };
+                let bottom = full.bottom() - if low { 8.0 } else { 14.0 };
+                let volumes = match (self.tab == Tab::Dialpad, tiny, low) {
+                    (false, _, _) => 0.0,
+                    (true, true, _) => 32.0,
+                    (true, false, true) => 52.0,
+                    (true, false, false) => 70.0,
+                };
+                let tiles_height = if tiny {
+                    30.0
+                } else if low {
+                    36.0
+                } else {
+                    64.0
+                };
                 let volume_rect = egui::Rect::from_min_max(
                     egui::pos2(full.left() + margin, bottom - volumes),
                     egui::pos2(full.right() - margin, bottom),
@@ -2960,7 +3042,13 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                     egui::pos2(full.right() - margin, tiles_rect.top() - gap),
                 );
                 paint_card(ui.painter(), card_rect, 20, &colors);
-                let inside = card_rect.shrink(if low { 10.0 } else { 14.0 });
+                let inside = card_rect.shrink(if tiny {
+                    8.0
+                } else if low {
+                    10.0
+                } else {
+                    14.0
+                });
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inside), |ui| {
                     ui.set_clip_rect(card_rect.shrink(2.0));
                     match self.tab {
@@ -2973,8 +3061,16 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 self.tiles(ui, tiles_rect, &colors);
                 if volumes > 0.0 {
                     paint_card(ui.painter(), volume_rect, 18, &colors);
-                    let inside =
-                        volume_rect.shrink2(egui::vec2(16.0, if low { 4.0 } else { 10.0 }));
+                    let inside = volume_rect.shrink2(egui::vec2(
+                        if tiny { 10.0 } else { 16.0 },
+                        if tiny {
+                            5.0
+                        } else if low {
+                            4.0
+                        } else {
+                            10.0
+                        },
+                    ));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inside), |ui| {
                         ui.spacing_mut().item_spacing.y = if low { 2.0 } else { 8.0 };
                         self.volume_sliders(ui, &colors);
@@ -3306,94 +3402,66 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
         let (heard_level, spoken_level) = self.levels;
-        let rows = [
-            (
-                Icon::Speaker,
-                tr!("Динамик", "Speaker"),
-                tr!(
-                    "Полоска — как громко говорит собеседник",
-                    "The bar shows how loud the other side speaks"
-                ),
-                heard_level,
+        let speaker = VolumeRow {
+            icon: Icon::Speaker,
+            name: tr!("Динамик", "Speaker"),
+            hint: tr!(
+                "Полоска — как громко говорит собеседник",
+                "The bar shows how loud the other side speaks"
             ),
-            (
-                Icon::Microphone,
-                tr!("Микрофон", "Microphone"),
-                tr!(
-                    "Полоска — как громко вас слышно",
-                    "The bar shows how loud you are"
-                ),
-                spoken_level,
+            level: talking.then_some(heard_level),
+            off: self.speaker_off,
+            switch: if self.speaker_off {
+                tr!("Включить динамик", "Turn the speaker on")
+            } else {
+                tr!("Выключить динамик", "Turn the speaker off")
+            },
+        };
+        let microphone = VolumeRow {
+            icon: Icon::Microphone,
+            name: tr!("Микрофон", "Microphone"),
+            hint: tr!(
+                "Полоска — как громко вас слышно",
+                "The bar shows how loud you are"
             ),
-        ];
-        let mut toggled = None;
-        for (index, (icon, name, hint, level)) in rows.into_iter().enumerate() {
-            let off = if index == 0 {
-                self.speaker_off
+            level: talking.then_some(spoken_level),
+            off: self.microphone_off,
+            switch: if self.microphone_off {
+                tr!("Включить микрофон", "Unmute the microphone")
             } else {
-                self.microphone_off
-            };
-            let value = if index == 0 {
-                &mut self.speaker_volume
-            } else {
-                &mut self.microphone_volume
-            };
+                tr!("Выключить микрофон", "Mute the microphone")
+            },
+        };
+        let (mut speaker_toggled, mut microphone_toggled) = (false, false);
+        if self.tiny {
+            // A very low window: both in one row, without the percentages
+            // (they show under the mouse).
             ui.horizontal(|ui| {
-                // The mark switches it off and on; off, it is crossed out
-                // in red and the slider is dimmed.
-                let (spot, mark) =
-                    ui.allocate_exact_size(egui::vec2(24.0, 22.0), egui::Sense::click());
-                if mark.hovered() {
-                    ui.painter().rect_filled(spot, 6, colors.key_hover);
-                }
-                let ink = if off { colors.red } else { colors.weak };
-                paint_icon(ui.painter(), icon, spot.center(), ink);
-                if off {
-                    let center = spot.center();
-                    ui.painter().line_segment(
-                        [
-                            center + egui::vec2(-8.0, -8.0),
-                            center + egui::vec2(8.0, 8.0),
-                        ],
-                        egui::Stroke::new(2.0_f32, colors.red),
-                    );
-                }
-                let switch = match (index, off) {
-                    (0, false) => tr!("Выключить динамик", "Turn the speaker off"),
-                    (0, true) => tr!("Включить динамик", "Turn the speaker on"),
-                    (_, false) => tr!("Выключить микрофон", "Mute the microphone"),
-                    (_, true) => tr!("Включить микрофон", "Unmute the microphone"),
-                };
-                if mark.on_hover_text(format!("{name}: {switch}")).clicked() {
-                    toggled = Some(index);
-                }
-                let width = (ui.available_width() - 46.0).max(60.0);
-                let dimmed = if off {
-                    Palette {
-                        accent: colors.weak,
-                        knob: colors.weak,
-                        ..*colors
-                    }
-                } else {
-                    *colors
-                };
-                level_slider(ui, value, 200, width, &dimmed, talking.then_some(level))
-                    .on_hover_text(hint);
-                let shown = if off {
-                    tr!("выкл", "off").to_owned()
-                } else {
-                    format!("{value}%")
-                };
-                ui.label(egui::RichText::new(shown).color(ink).size(12.5));
+                let width =
+                    ((ui.available_width() - 2.0 * 24.0 - 4.0 * ui.spacing().item_spacing.x) / 2.0)
+                        .max(40.0);
+                speaker_toggled = speaker.show(ui, &mut self.speaker_volume, width, false, colors);
+                ui.add_space(6.0);
+                microphone_toggled =
+                    microphone.show(ui, &mut self.microphone_volume, width, false, colors);
+            });
+        } else {
+            ui.horizontal(|ui| {
+                let width = (ui.available_width() - 70.0).max(60.0);
+                speaker_toggled = speaker.show(ui, &mut self.speaker_volume, width, true, colors);
+            });
+            ui.horizontal(|ui| {
+                let width = (ui.available_width() - 70.0).max(60.0);
+                microphone_toggled =
+                    microphone.show(ui, &mut self.microphone_volume, width, true, colors);
             });
         }
-        match toggled {
-            Some(0) => {
-                self.speaker_off = !self.speaker_off;
-                self.apply_audio_settings();
-            }
-            Some(_) => self.toggle_mute(),
-            None => {}
+        if speaker_toggled {
+            self.speaker_off = !self.speaker_off;
+            self.apply_audio_settings();
+        }
+        if microphone_toggled {
+            self.toggle_mute();
         }
         if before != (self.speaker_volume, self.microphone_volume) {
             // Volumes act at once; they are saved when the window closes.
@@ -3504,10 +3572,22 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         } else {
             self.call_info(ui, phase);
         }
-        ui.add_space(6.0);
-        self.keypad(ui, actions, sizes, &colors);
-        ui.add_space(8.0);
-        self.call_buttons(ui, actions, sizes, phase, &colors);
+        ui.add_space(if self.tiny { 3.0 } else { 6.0 });
+        // A call in a very low window: its buttons above the keys, so that
+        // hanging up and hiding the keys again never scroll out of sight.
+        if self.tiny && !idle && phase != Phase::Incoming {
+            self.call_buttons(ui, actions, sizes, phase, &colors);
+            if sizes.keys_shown {
+                ui.add_space(4.0);
+                self.keypad(ui, actions, sizes, &colors);
+            }
+        } else {
+            if sizes.keys_shown {
+                self.keypad(ui, actions, sizes, &colors);
+                ui.add_space(if self.tiny { 4.0 } else { 8.0 });
+            }
+            self.call_buttons(ui, actions, sizes, phase, &colors);
+        }
         if let Some(error) = self.last_error.as_ref() {
             ui.add_space(4.0);
             ui.colored_label(egui::Color32::RED, error);
@@ -3519,7 +3599,11 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
     fn number_field(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>, colors: &Palette) {
         let idle = true;
         let number_id = egui::Id::new("number-field");
-        let size = (ui.available_width() / 11.0).clamp(20.0, 30.0);
+        let size = if self.tiny {
+            20.0
+        } else {
+            (ui.available_width() / 11.0).clamp(20.0, 30.0)
+        };
         let field = egui::TextEdit::singleline(&mut self.number)
             .id(number_id)
             .hint_text(egui::RichText::new(tr!("Номер", "Number")).color(colors.weak))
@@ -3662,7 +3746,7 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 _ => phase_text(phase).to_owned(),
             };
             ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new(who).size(22.0));
+                ui.label(egui::RichText::new(who).size(if self.tiny { 17.0 } else { 22.0 }));
             });
             let live = self.lines[self.at]
                 .view
@@ -4829,6 +4913,8 @@ fn error_text(message: &str) -> String {
 struct PadSizes {
     key: egui::Vec2,
     key_font: f32,
+    /// The keys are drawn; in a call in a very low window they may not be.
+    keys_shown: bool,
     /// Height of the rows of buttons under the keys.
     row: f32,
     row_font: f32,
@@ -5096,6 +5182,75 @@ fn paint_icon_scaled(
             painter.line_segment([at(7.0, -3.0), at(7.0, 3.0)], stroke);
             painter.line_segment([at(4.0, 0.0), at(10.0, 0.0)], stroke);
         }
+    }
+}
+
+/// One volume: its mark (a switch), its slider and, with room, its
+/// percentage.
+struct VolumeRow {
+    icon: Icon,
+    name: &'static str,
+    hint: &'static str,
+    /// How loud the sound is, during a call.
+    level: Option<f32>,
+    off: bool,
+    /// What a click on the mark does, in words.
+    switch: &'static str,
+}
+
+impl VolumeRow {
+    /// Draws the row; true when its mark was clicked to switch it.
+    fn show(
+        &self,
+        ui: &mut egui::Ui,
+        value: &mut u32,
+        width: f32,
+        percent: bool,
+        colors: &Palette,
+    ) -> bool {
+        // The mark switches it off and on; off, it is crossed out in red
+        // and the slider is dimmed.
+        let (spot, mark) = ui.allocate_exact_size(egui::vec2(24.0, 22.0), egui::Sense::click());
+        if mark.hovered() {
+            ui.painter().rect_filled(spot, 6, colors.key_hover);
+        }
+        let ink = if self.off { colors.red } else { colors.weak };
+        paint_icon(ui.painter(), self.icon, spot.center(), ink);
+        if self.off {
+            let center = spot.center();
+            ui.painter().line_segment(
+                [
+                    center + egui::vec2(-8.0, -8.0),
+                    center + egui::vec2(8.0, 8.0),
+                ],
+                egui::Stroke::new(2.0_f32, colors.red),
+            );
+        }
+        let clicked = mark
+            .on_hover_text(format!("{}: {}", self.name, self.switch))
+            .clicked();
+        let dimmed = if self.off {
+            Palette {
+                accent: colors.weak,
+                knob: colors.weak,
+                ..*colors
+            }
+        } else {
+            *colors
+        };
+        let shown = if self.off {
+            tr!("выкл", "off").to_owned()
+        } else {
+            format!("{value}%")
+        };
+        let slider = level_slider(ui, value, 200, width, &dimmed, self.level);
+        if percent {
+            slider.on_hover_text(self.hint);
+            ui.label(egui::RichText::new(shown).color(ink).size(12.5));
+        } else {
+            slider.on_hover_text(format!("{} {shown}. {}", self.name, self.hint));
+        }
+        clicked
     }
 }
 
@@ -5735,8 +5890,8 @@ fn main() -> eframe::Result<()> {
             .with_icon(window_icon())
             .with_inner_size([400.0, 640.0])
             // Any size up to full screen; the window adapts. Below this the
-            // buttons of a call would no longer fit under the keys.
-            .with_min_inner_size([280.0, 480.0]),
+            // buttons of a call would no longer fit.
+            .with_min_inner_size([280.0, 320.0]),
         ..Default::default()
     };
     eframe::run_native(
