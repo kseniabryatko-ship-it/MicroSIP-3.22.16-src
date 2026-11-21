@@ -2692,13 +2692,13 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         };
         // The buttons under the keys stop growing at a comfortable height;
         // what a large window has left goes to the keys.
-        let estimate = ((room.y - above - 14.0 - fixed) / (4.0 + below)).clamp(28.0, 150.0);
-        let row = (estimate * 0.95).clamp(30.0, 64.0);
+        let estimate = ((room.y - above - 14.0 - fixed) / (4.0 + below)).clamp(22.0, 150.0);
+        let row = (estimate * 0.95).clamp(26.0, 64.0);
         let rows = row * below / 0.95;
-        let key_height = ((room.y - above - 14.0 - fixed - rows) / 4.0).clamp(28.0, 150.0);
+        let key_height = ((room.y - above - 14.0 - fixed - rows) / 4.0).clamp(22.0, 150.0);
         let sizes = PadSizes {
             key: egui::vec2(((room.x - 2.0 * gap.x) / 3.0).max(36.0), key_height),
-            key_font: (key_height * 0.42).clamp(15.0, 40.0),
+            key_font: (key_height * 0.42).clamp(13.0, 40.0),
             row,
             row_font: (row * 0.32).clamp(13.0, 20.0),
         };
@@ -2773,7 +2773,7 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         let spacing = ui.spacing().item_spacing.x;
         let wide = egui::vec2(ui.available_width(), sizes.row);
         let half = egui::vec2((ui.available_width() - spacing) / 2.0, sizes.row);
-        let small_row = egui::vec2(ui.available_width(), (sizes.row * 0.75).max(28.0));
+        let small_row = egui::vec2(ui.available_width(), (sizes.row * 0.75).max(22.0));
         let small_half = egui::vec2(half.x, small_row.y);
         let colored = |text: &str, fill: egui::Color32, ink: egui::Color32| {
             egui::Button::new(
@@ -2931,15 +2931,23 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                     self.header(ui, &colors);
                 });
 
-                let bottom = full.bottom() - 14.0;
-                let volumes = if self.tab == Tab::Dialpad { 70.0 } else { 0.0 };
-                let tiles_height = if full.height() >= 460.0 { 64.0 } else { 40.0 };
+                // A low window: lower tiles and volumes and smaller gaps, so
+                // that the card keeps room for the keys and the call buttons.
+                let low = full.height() < 600.0;
+                let gap = if low { 8.0 } else { 10.0 };
+                let bottom = full.bottom() - if low { 10.0 } else { 14.0 };
+                let volumes = match (self.tab == Tab::Dialpad, low) {
+                    (false, _) => 0.0,
+                    (true, true) => 52.0,
+                    (true, false) => 70.0,
+                };
+                let tiles_height = if low { 36.0 } else { 64.0 };
                 let volume_rect = egui::Rect::from_min_max(
                     egui::pos2(full.left() + margin, bottom - volumes),
                     egui::pos2(full.right() - margin, bottom),
                 );
                 let tiles_bottom = if volumes > 0.0 {
-                    volume_rect.top() - 10.0
+                    volume_rect.top() - gap
                 } else {
                     bottom
                 };
@@ -2948,11 +2956,11 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                     egui::pos2(full.right() - margin, tiles_bottom),
                 );
                 let card_rect = egui::Rect::from_min_max(
-                    egui::pos2(full.left() + margin, head.bottom() + 12.0),
-                    egui::pos2(full.right() - margin, tiles_rect.top() - 10.0),
+                    egui::pos2(full.left() + margin, head.bottom() + gap),
+                    egui::pos2(full.right() - margin, tiles_rect.top() - gap),
                 );
                 paint_card(ui.painter(), card_rect, 20, &colors);
-                let inside = card_rect.shrink(14.0);
+                let inside = card_rect.shrink(if low { 10.0 } else { 14.0 });
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inside), |ui| {
                     ui.set_clip_rect(card_rect.shrink(2.0));
                     match self.tab {
@@ -2965,9 +2973,10 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 self.tiles(ui, tiles_rect, &colors);
                 if volumes > 0.0 {
                     paint_card(ui.painter(), volume_rect, 18, &colors);
-                    let inside = volume_rect.shrink2(egui::vec2(16.0, 10.0));
+                    let inside =
+                        volume_rect.shrink2(egui::vec2(16.0, if low { 4.0 } else { 10.0 }));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inside), |ui| {
-                        ui.spacing_mut().item_spacing.y = 8.0;
+                        ui.spacing_mut().item_spacing.y = if low { 2.0 } else { 8.0 };
                         self.volume_sliders(ui, &colors);
                     });
                 }
@@ -5727,7 +5736,7 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([400.0, 640.0])
             // Any size up to full screen; the window adapts. Below this the
             // buttons of a call would no longer fit under the keys.
-            .with_min_inner_size([280.0, 580.0]),
+            .with_min_inner_size([280.0, 480.0]),
         ..Default::default()
     };
     eframe::run_native(
