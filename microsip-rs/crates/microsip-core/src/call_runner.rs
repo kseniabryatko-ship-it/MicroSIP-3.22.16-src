@@ -26,7 +26,8 @@ use crate::invite_control::{build_cancel, build_failure_ack};
 use crate::live_quality::{LiveQuality, QualityMeter};
 use crate::presence::{PresenceStatus, Publication, PublishReply, RemotePresence, parse_pidf};
 use crate::registration::{
-    Account, Output, RETRY_DELAY, Registration, RegistrationState, add_rport,
+    Account, HideCallerId, Output, RETRY_DELAY, Registration, RegistrationState, add_rport,
+    quoted_display_name,
 };
 use crate::rtp::dtmf::{DtmfMethod, info_body};
 use crate::services::{
@@ -595,6 +596,52 @@ struct ServerCall {
     contact_uri: String,
     from_tag: String,
     authorized: bool,
+    /// Who the call says it is from, kept for the INVITE sent again with
+    /// credentials.
+    identity: CallerIdentity,
+}
+
+/// How a call through the server presents this phone, from the account:
+/// its display name, whether its number is hidden, and the address put
+/// into the audio offer.
+#[derive(Debug, Clone, Default)]
+struct CallerIdentity {
+    display_name: String,
+    hide: HideCallerId,
+    public_address: Option<IpAddr>,
+}
+
+impl CallerIdentity {
+    fn of(account: &Account) -> Self {
+        Self {
+            display_name: account.display_name.clone(),
+            hide: account.hide_caller_id,
+            public_address: account.public_address,
+        }
+    }
+
+    /// Writes the identity into an INVITE about to be sent, as MicroSIP
+    /// does: the name in From; with the number hidden a `Privacy: id`
+    /// header, and when hidden hard a From of "Anonymous".
+    fn apply(&self, headers: &mut crate::sip::message::Headers) -> Result<()> {
+        let Some(from) = headers.get("from").map(str::to_owned) else {
+            return Ok(());
+        };
+        if self.hide != HideCallerId::Off {
+            headers.insert("privacy", "id")?;
+        }
+        let from = if self.hide == HideCallerId::Hard {
+            // The tag after the address stays: the dialog is known by it.
+            let rest = from.find('>').map_or("", |end| &from[end + 1..]);
+            format!("\"Anonymous\" <sip:anonymous@anonymous.invalid>{rest}")
+        } else if let Some(name) = quoted_display_name(&self.display_name) {
+            format!("{name} {from}")
+        } else {
+            return Ok(());
+        };
+        headers.insert("from", from)?;
+        Ok(())
+    }
 }
 
 impl Call {
@@ -3887,7 +3934,7 @@ impl<M: Media> Runner<M> {
             format!("sip:{user}@{peer}"),
             format!("sip:{user}@{local}"),
             format!("sip:{user}@{local}"),
-            false,
+            None,
         )
     }
 
@@ -3929,7 +3976,8 @@ impl<M: Media> Runner<M> {
             registration.contact_address(),
             transport
         );
-        self.start_call(peer, target, from_uri, contact_uri, true)?;
+        let identity = CallerIdentity::of(registration.account());
+        self.start_call(peer, target, from_uri, contact_uri, Some(identity))?;
         if let Some(call) = self.lines[self.cur].call.as_mut() {
             call.account = account.map(str::to_owned);
         }
@@ -3954,13 +4002,22 @@ impl<M: Media> Runner<M> {
         target: String,
         from_uri: String,
         contact_uri: String,
-        through_server: bool,
+        identity: Option<CallerIdentity>,
     ) -> Result<()> {
         if self.lines[self.cur].engine.state() != State::Idle {
             return Err("a call is already in progress".into());
         }
         let local_rtp = self.lines[self.cur].media.prepare(self.local.ip())?;
-        let local_rtp = self.audio_address(local_rtp);
+        // An address set for the account (Public Address) is offered
+        // instead of the local one, unless a STUN server finds the real one.
+        let public = identity
+            .as_ref()
+            .and_then(|identity| identity.public_address)
+            .filter(|_| self.stun.is_none());
+        let local_rtp = match public {
+            Some(ip) => SocketAddr::new(ip, local_rtp.port()),
+            None => self.audio_address(local_rtp),
+        };
         let local = self.local;
         let call_id = format!("{}@{}", self.unique(), local.ip());
         let branch = self.branch();
@@ -3992,19 +4049,23 @@ impl<M: Media> Runner<M> {
         )
         .body(offer.into_bytes())
         .build()?;
+        if let Some(identity) = identity.as_ref() {
+            identity.apply(&mut invite.headers)?;
+        }
         add_rport(&mut invite.headers)?;
 
         let local_tag = format!("rs-{}", self.unique());
         let mut call = Call::new(peer, invite, local_rtp, local_tag)?;
         call.crypto_local = crypto;
         call.savp = savp;
-        if through_server {
+        if let Some(identity) = identity {
             call.server = Some(ServerCall {
                 target,
                 from_uri,
                 contact_uri,
                 from_tag,
                 authorized: false,
+                identity,
             });
         }
         self.lines[self.cur].call = Some(call);
@@ -4102,6 +4163,7 @@ impl<M: Media> Runner<M> {
         .body(offer_sdp(call.local_rtp, &self.codecs, call.sdp_crypto()).into_bytes())
         .build()?;
         invite.headers.insert(name, value)?;
+        server.identity.apply(&mut invite.headers)?;
         add_rport(&mut invite.headers)?;
         let invite_headers = TransactionHeaders::from_message(&Message::Request(invite.clone()))?;
 

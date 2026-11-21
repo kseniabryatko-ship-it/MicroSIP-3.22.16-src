@@ -1443,6 +1443,7 @@ dependencies = [
  "native-tls",
  "oxideav-gsm",
  "oxideav-speex",
+ "regex",
  "sha1",
  "sonora",
  "windows-sys 0.59.0",

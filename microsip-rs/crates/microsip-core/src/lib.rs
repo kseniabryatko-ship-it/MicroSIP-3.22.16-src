@@ -6,6 +6,7 @@ pub mod call_view;
 pub mod chat;
 pub mod codec;
 pub mod contacts;
+pub mod dial_plan;
 pub mod gain;
 pub mod history;
 pub mod key_tones;

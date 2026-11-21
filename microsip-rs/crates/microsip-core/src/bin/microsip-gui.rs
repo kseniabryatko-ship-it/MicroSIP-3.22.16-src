@@ -13,6 +13,7 @@ use microsip_core::call_view::{CallView, Phase};
 use microsip_core::chat::{Chat, ChatMessage};
 use microsip_core::codec::Codec;
 use microsip_core::contacts::{Contacts, dialable};
+use microsip_core::dial_plan;
 use microsip_core::history::{CallRecord, Direction, History, TableWords};
 use microsip_core::key_tones::KeyTones;
 use microsip_core::links::{self, Instance, Request as LinkRequest};
@@ -22,12 +23,13 @@ use microsip_core::localtime::{
 };
 use microsip_core::presence::{PresenceStatus, RemotePresence};
 use microsip_core::recording::recording_file_name;
+use microsip_core::registration::HideCallerId;
 use microsip_core::registration::{Account, RegistrationState};
 use microsip_core::rtp::dtmf::DtmfMethod;
 use microsip_core::secret;
 use microsip_core::services::{LineState, Voicemail};
 use microsip_core::settings::{
-    self, AccountSettings, Settings, account_title, default_recordings_dir,
+    self, AccountOptions, AccountSettings, Settings, account_title, default_recordings_dir,
 };
 use microsip_core::srtp::MediaEncryption;
 use microsip_core::stream::SipTransport;
@@ -133,8 +135,6 @@ enum Action {
     AllAccounts(bool),
     /// How keypad digits are sent.
     DtmfMethod(DtmfMethod),
-    /// Statuses for colleagues on or off.
-    Statuses(bool),
     /// The window's language: English or not.
     English(bool),
     /// The codecs or their order were changed.
@@ -239,6 +239,10 @@ struct PhoneWindow {
     speaker_off: bool,
     /// What is typed in the search of the call list; not kept.
     calls_query: String,
+    /// The rest of MicroSIP's fields of the active account.
+    account_options: AccountOptions,
+    /// The account window, while open: what is being typed into it.
+    account_draft: Option<AccountDraft>,
     /// A very low window: one row of volumes, small keys, and in a call
     /// the keys hidden until asked for.
     tiny: bool,
@@ -268,7 +272,6 @@ struct PhoneWindow {
     user: String,
     auth_user: String,
     password: String,
-    show_password: bool,
     save_password: bool,
     local_port: String,
     transport: SipTransport,
@@ -499,7 +502,6 @@ impl PhoneWindow {
             user: saved.user.clone(),
             auth_user: saved.auth_user.clone(),
             password,
-            show_password: false,
             save_password: saved.save_password,
             transport: SipTransport::from_name(&saved.transport),
             proxy: saved.proxy.clone(),
@@ -575,6 +577,8 @@ impl PhoneWindow {
             repaint: ctx.clone(),
             speaker_off: false,
             calls_query: String::new(),
+            account_options: saved.options.clone(),
+            account_draft: None,
             tiny: false,
             keys_in_call: false,
             microphone_off: false,
@@ -609,7 +613,8 @@ impl PhoneWindow {
         if window.account_is_set() && !window.password.is_empty() {
             window.connect();
         } else {
-            window.settings_open = true;
+            // What is missing is typed in the account window.
+            window.account_draft = Some(AccountDraft::from_window(&window));
         }
         window
     }
@@ -710,12 +715,14 @@ impl PhoneWindow {
         visuals.window_fill = colors.card;
         visuals.extreme_bg_color = colors.key;
         visuals.faint_bg_color = colors.key;
-        visuals.selection.bg_fill = colors.accent;
-        visuals.selection.stroke.color = colors.on_call;
-        if self.light_theme {
-            // Black on white would hide the selected text.
-            visuals.selection.stroke.color = egui::Color32::WHITE;
-        }
+        // Selected text on yellow, NAVI's colour: bright under black text,
+        // dimmed under white text, so the text stays readable.
+        visuals.selection.bg_fill = if self.light_theme {
+            egui::Color32::from_rgb(255, 229, 0)
+        } else {
+            egui::Color32::from_rgb(110, 99, 0)
+        };
+        visuals.selection.stroke.color = colors.text;
         visuals.hyperlink_color = colors.accent;
         visuals.window_corner_radius = egui::CornerRadius::same(14);
         visuals.menu_corner_radius = egui::CornerRadius::same(10);
@@ -801,6 +808,7 @@ impl PhoneWindow {
             incoming_popup: self.incoming_popup,
             always_on_top: self.always_on_top,
             header_picture: self.header_picture,
+            options: self.account_options.clone(),
             accounts: self.other_accounts.clone(),
         };
         if current == self.saved {
@@ -852,19 +860,22 @@ impl PhoneWindow {
         self.disconnect();
         self.last_error = None;
         if !self.account_is_set() {
-            self.settings_open = true;
+            self.account_draft = Some(AccountDraft::from_window(self));
             return self.error(tr!(
-                "Укажите сервер и номер в настройках",
-                "Enter the server and the number in the settings"
+                "Укажите сервер и пользователя в окне аккаунта",
+                "Enter the server and the username in the account window"
             ));
         }
         self.save_settings();
-        let account = Account::new(self.server.trim(), self.user.trim(), self.password.trim())
-            .with_domain(self.domain.trim())
-            .with_auth_username(self.auth_user.trim())
-            .with_transport(self.transport)
-            .with_proxy(self.proxy.trim())
-            .with_tls_verify(self.tls_verify);
+        let account = with_options(
+            Account::new(self.server.trim(), self.user.trim(), self.password.trim())
+                .with_domain(self.domain.trim())
+                .with_auth_username(self.auth_user.trim())
+                .with_transport(self.transport)
+                .with_proxy(self.proxy.trim())
+                .with_tls_verify(self.tls_verify),
+            &self.account_options,
+        );
         let server = match account.connect_host_port().and_then(|(host, port)| {
             resolve_socket_address(&host, port).map_err(|error| {
                 tr!(
@@ -1108,6 +1119,27 @@ impl PhoneWindow {
                 "Not registered on the server: numbers cannot be called"
             ));
         }
+        // The account's Dialing Prefix and Dial Plan, as in MicroSIP.
+        let options = match self.call_from.filter(|_| self.all_accounts) {
+            Some(index) => self.other_accounts.get(index).map_or_else(
+                || self.account_options.clone(),
+                |saved| saved.options.clone(),
+            ),
+            None => self.account_options.clone(),
+        };
+        let dialled = if direct {
+            target.clone()
+        } else {
+            match dial_plan::prepare(&target, options.dialing_prefix.trim(), &options.dial_plan) {
+                Some(dialled) => dialled,
+                None => {
+                    return self.error(tr!(
+                        format!("{target}: номер не подходит под план набора аккаунта"),
+                        format!("{target}: the number does not fit the account's dial plan"),
+                    ));
+                }
+            }
+        };
         self.last_error = None;
         self.number = target.clone();
         self.last_dialled = target.clone();
@@ -1124,9 +1156,18 @@ impl PhoneWindow {
             account: String::new(),
         });
         self.lines[self.at].view.dialing_target(&target);
+        if dialled != target {
+            self.log(tr!(
+                format!("Набирается {dialled} (план набора аккаунта)"),
+                format!("Dialling {dialled} (the account's dial plan)"),
+            ));
+        }
         match self.call_from_key() {
-            Some(account) => self.send(UiCommand::DialFrom { account, target }),
-            None => self.send(UiCommand::DialTarget(target)),
+            Some(account) => self.send(UiCommand::DialFrom {
+                account,
+                target: dialled,
+            }),
+            None => self.send(UiCommand::DialTarget(dialled)),
         }
         self.tab = Tab::Dialpad;
     }
@@ -1765,15 +1806,6 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
                 self.send(UiCommand::DtmfMethod(method));
                 self.save_settings();
             }
-            Action::Statuses(on) => {
-                self.presence_on = on;
-                if !on {
-                    self.statuses.clear();
-                    self.status_refused = None;
-                }
-                self.send(UiCommand::Presence(on.then_some(self.my_status)));
-                self.save_settings();
-            }
             Action::English(on) => {
                 set_english(on);
                 self.save_settings();
@@ -1813,10 +1845,10 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
             Action::Voicemail => {
                 let number = self.voicemail_number.trim().to_owned();
                 if number.is_empty() {
-                    self.settings_open = true;
+                    self.account_draft = Some(AccountDraft::from_window(self));
                     self.error(tr!(
-                        "Укажите номер голосовой почты в настройках",
-                        "Enter the voicemail number in the settings"
+                        "Укажите номер голосовой почты в окне аккаунта",
+                        "Enter the voicemail number in the account window"
                     ));
                 } else {
                     self.call(number);
@@ -2151,11 +2183,12 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
         self.messages_seen = now_unix();
         ui.horizontal(|ui| {
             ui.label(tr!("Кому", "To"));
-            ui.add(
+            let field = ui.add(
                 egui::TextEdit::singleline(&mut self.chat_with)
                     .hint_text(tr!("номер", "number"))
                     .desired_width(140.0),
             );
+            edit_menu(&field, &mut self.chat_with, false);
             let partners = self.chat.partners();
             if !partners.is_empty() {
                 egui::ComboBox::from_id_salt("chat-partners")
@@ -2228,6 +2261,7 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
                 .hint_text(tr!("Сообщение", "Message"))
                 .desired_width(ui.available_width() - 100.0);
             let response = ui.add(field);
+            edit_menu(&response, &mut self.chat_draft, false);
             let enter =
                 response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             let can_send = self.is_online() && !with.is_empty();
@@ -2279,6 +2313,8 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
             media_encryption: self.encryption.name().to_owned(),
             stun: self.stun.trim().to_owned(),
             voicemail_number: self.voicemail_number.trim().to_owned(),
+            presence: self.presence_on,
+            options: self.account_options.clone(),
         }
     }
 
@@ -2301,12 +2337,15 @@ format!("The exchange does not take the status ({why}): colleagues see only whet
 
     /// The account the phone registers for a saved one.
     fn account_of(account: &AccountSettings, password: &str) -> Account {
-        Account::new(account.server.trim(), account.user.trim(), password.trim())
-            .with_domain(account.domain.trim())
-            .with_auth_username(account.auth_user.trim())
-            .with_transport(SipTransport::from_name(&account.transport))
-            .with_proxy(account.proxy.trim())
-            .with_tls_verify(account.tls_verify)
+        with_options(
+            Account::new(account.server.trim(), account.user.trim(), password.trim())
+                .with_domain(account.domain.trim())
+                .with_auth_username(account.auth_user.trim())
+                .with_transport(SipTransport::from_name(&account.transport))
+                .with_proxy(account.proxy.trim())
+                .with_tls_verify(account.tls_verify),
+            &account.options,
+        )
     }
 
     /// The saved accounts besides the active one that can be registered
@@ -2394,6 +2433,8 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         self.encryption = MediaEncryption::from_name(&account.media_encryption);
         self.stun = account.stun.clone();
         self.voicemail_number = account.voicemail_number.clone();
+        self.presence_on = account.presence;
+        self.account_options = account.options.clone();
         // What the previous account's exchange said does not apply.
         self.voicemail = None;
         self.presence.clear();
@@ -2418,7 +2459,7 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             self.connect();
         } else {
             self.disconnect();
-            self.settings_open = true;
+            self.account_draft = Some(AccountDraft::from_window(self));
         }
     }
 
@@ -2460,23 +2501,13 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 "An account can be added when there are no calls"
             ));
         }
-        let current = self.current_account();
-        self.other_accounts.push(current);
-        self.load_account(&AccountSettings::default());
-        self.disconnect();
-        self.save_settings();
-        self.settings_open = true;
-        self.log(tr!(
-            "Новый аккаунт: укажите сервер, номер и пароль",
-            "New account: enter the server, the number and the password"
-        ));
+        // A new account is typed in the account window; nothing changes
+        // until it is saved there.
+        self.account_draft = Some(AccountDraft::new_account());
     }
 
     /// Forgets the active account; the next saved one takes its place.
     fn remove_account(&mut self) {
-        if self.other_accounts.is_empty() {
-            return;
-        }
         if self
             .lines
             .iter()
@@ -2487,9 +2518,17 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 "An account can be removed when there are no calls"
             ));
         }
-        let removed = shown_title(account_title(&self.user, &self.server));
+        let removed = shown_title(self.current_account().title());
         self.call_from = None;
-        let next = self.other_accounts.remove(0);
+        // The only account: the phone is left without one, as MicroSIP.
+        let next = if self.other_accounts.is_empty() {
+            AccountSettings {
+                voicemail_number: String::new(),
+                ..AccountSettings::default()
+            }
+        } else {
+            self.other_accounts.remove(0)
+        };
         self.load_account(&next);
         self.log(tr!(
             format!("Аккаунт удалён: {removed}"),
@@ -2967,6 +3006,7 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                             .hint_text(tr!("Перевести на номер", "Transfer to number"))
                             .desired_width((ui.available_width() - 100.0).max(80.0));
                         let typed = ui.add(field);
+                        edit_menu(&typed, &mut self.transfer_to, false);
                         let enter = typed.lost_focus()
                             && ui.input(|input| input.key_pressed(egui::Key::Enter));
                         if ui.add(plain(tr!("Перевести", "Transfer"))).clicked() || enter {
@@ -3011,19 +3051,18 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                     10.0
                 };
                 let bottom = full.bottom() - if low { 8.0 } else { 14.0 };
-                let volumes = match (self.tab == Tab::Dialpad, tiny, low) {
-                    (false, _, _) => 0.0,
-                    (true, true, _) => 32.0,
-                    (true, false, true) => 52.0,
-                    (true, false, false) => 70.0,
+                // Tiles and volumes grow with the window, a little at a time,
+                // from the smallest window to a tall one: no sudden jumps.
+                let grown = ((full.height() - 320.0) / (760.0 - 320.0)).clamp(0.0, 1.0);
+                let volumes = match (self.tab == Tab::Dialpad, tiny) {
+                    (false, _) => 0.0,
+                    (true, true) => 32.0,
+                    (true, false) => {
+                        let two_rows = ((full.height() - 440.0) / (760.0 - 440.0)).clamp(0.0, 1.0);
+                        52.0 + 18.0 * two_rows
+                    }
                 };
-                let tiles_height = if tiny {
-                    30.0
-                } else if low {
-                    36.0
-                } else {
-                    64.0
-                };
+                let tiles_height = 30.0 + 34.0 * grown;
                 let volume_rect = egui::Rect::from_min_max(
                     egui::pos2(full.left() + margin, bottom - volumes),
                     egui::pos2(full.right() - margin, bottom),
@@ -3061,18 +3100,20 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 self.tiles(ui, tiles_rect, &colors);
                 if volumes > 0.0 {
                     paint_card(ui.painter(), volume_rect, 18, &colors);
+                    // Two rows of 20 pixels; the gap between them and the
+                    // margins grow with the card.
+                    let between = if tiny {
+                        0.0
+                    } else {
+                        2.0 + 6.0 * ((volumes - 52.0) / 18.0).clamp(0.0, 1.0)
+                    };
+                    let rows = if tiny { 20.0 } else { 40.0 + between };
                     let inside = volume_rect.shrink2(egui::vec2(
                         if tiny { 10.0 } else { 16.0 },
-                        if tiny {
-                            5.0
-                        } else if low {
-                            4.0
-                        } else {
-                            10.0
-                        },
+                        ((volumes - rows) / 2.0).max(2.0),
                     ));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inside), |ui| {
-                        ui.spacing_mut().item_spacing.y = if low { 2.0 } else { 8.0 };
+                        ui.spacing_mut().item_spacing.y = between;
                         self.volume_sliders(ui, &colors);
                     });
                 }
@@ -3246,6 +3287,10 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             ui.close_menu();
         }
         ui.separator();
+        if ui.button(tr!("Аккаунт…", "Account…")).clicked() {
+            self.account_draft = Some(AccountDraft::from_window(self));
+            ui.close_menu();
+        }
         if ui.button(tr!("Настройки", "Settings")).clicked() {
             self.settings_open = !self.settings_open;
             ui.close_menu();
@@ -3911,7 +3956,7 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             let margins = 2.0 * ui.spacing().button_padding.x;
             let cross_room = 24.0 + ui.spacing().item_spacing.x;
             let width = ui.available_width() - margins - if clear { cross_room } else { 0.0 };
-            ui.add(
+            let field = ui.add(
                 egui::TextEdit::singleline(&mut self.calls_query)
                     .hint_text(tr!(
                         "🔍 Поиск по номеру или имени",
@@ -3919,6 +3964,7 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                     ))
                     .desired_width(width),
             );
+            edit_menu(&field, &mut self.calls_query, false);
             if clear {
                 let cross = ui
                     .add_sized([24.0, 20.0], egui::Button::new(""))
@@ -4101,9 +4147,13 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
     fn contacts_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             ui.label(tr!("Имя", "Name"));
-            ui.add(egui::TextEdit::singleline(&mut self.new_contact_name).desired_width(120.0));
+            let name =
+                ui.add(egui::TextEdit::singleline(&mut self.new_contact_name).desired_width(120.0));
+            edit_menu(&name, &mut self.new_contact_name, false);
             ui.label(tr!("Номер", "Number"));
-            ui.add(egui::TextEdit::singleline(&mut self.new_contact_number).desired_width(110.0));
+            let number = ui
+                .add(egui::TextEdit::singleline(&mut self.new_contact_number).desired_width(110.0));
+            edit_menu(&number, &mut self.new_contact_number, false);
         });
         ui.horizontal(|ui| {
             if ui
@@ -4143,11 +4193,12 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
             });
         });
         ui.separator();
-        ui.add(
+        let search = ui.add(
             egui::TextEdit::singleline(&mut self.contact_search)
                 .hint_text(tr!("Поиск", "Search"))
                 .desired_width(f32::INFINITY),
         );
+        edit_menu(&search, &mut self.contact_search, false);
         let can_dial = self.lines[self.at].view.can_dial();
         egui::ScrollArea::vertical().show(ui, |ui| {
             let found = self.contacts.matching(&self.contact_search);
@@ -4237,6 +4288,168 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
         });
     }
 
+    /// The account window, as MicroSIP's: its fields in MicroSIP's order,
+    /// Save, Cancel and Delete Account. Nothing changes until Save.
+    fn account_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let Some(mut draft) = self.account_draft.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut outcome = None;
+        let screen = ctx.screen_rect();
+        let title = if draft.adding {
+            tr!("Новый аккаунт", "New account")
+        } else {
+            tr!("Аккаунт", "Account")
+        };
+        egui::Window::new(title)
+            .id(egui::Id::new("account-window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .constrain(true)
+            .max_width((screen.width() - 16.0).max(200.0))
+            .min_width((screen.width() - 16.0).clamp(200.0, 400.0))
+            .show(ctx, |ui| {
+                let room = (screen.height() - 110.0).max(120.0);
+                egui::ScrollArea::vertical()
+                    .max_height(room)
+                    .show(ui, |ui| {
+                        outcome = draft.show(ui);
+                    });
+                ui.separator();
+                if let Some(problem) = draft.problem.as_ref() {
+                    ui.colored_label(palette(self.light_theme).red, problem);
+                }
+                if draft.confirm_delete {
+                    ui.label(tr!(
+                        format!("Удалить аккаунт {}?", draft.title()),
+                        format!("Delete the account {}?", draft.title()),
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(
+                                egui::RichText::new(tr!("Да, удалить", "Yes, delete"))
+                                    .color(palette(self.light_theme).red),
+                            )
+                            .clicked()
+                        {
+                            outcome = Some(DraftOutcome::Delete);
+                        }
+                        if ui.button(tr!("Нет", "No")).clicked() {
+                            draft.confirm_delete = false;
+                        }
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        if !draft.adding
+                            && ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(tr!(
+                                            "Удалить аккаунт",
+                                            "Delete account"
+                                        ))
+                                        .color(palette(self.light_theme).red),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                        {
+                            draft.confirm_delete = true;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(tr!("Отмена", "Cancel")).clicked() {
+                                outcome = Some(DraftOutcome::Cancel);
+                            }
+                            if ui
+                                .button(egui::RichText::new(tr!("Сохранить", "Save")).strong())
+                                .clicked()
+                            {
+                                outcome = Some(DraftOutcome::Save);
+                            }
+                        });
+                    });
+                }
+            });
+        if !open {
+            outcome = Some(DraftOutcome::Cancel);
+        }
+        match outcome {
+            None => self.account_draft = Some(draft),
+            Some(DraftOutcome::Cancel) => {}
+            Some(DraftOutcome::Delete) => actions.push(Action::RemoveAccount),
+            Some(DraftOutcome::Save) => {
+                if let Some(problem) = draft.problem_with_fields() {
+                    draft.problem = Some(problem);
+                    self.account_draft = Some(draft);
+                } else if self
+                    .lines
+                    .iter()
+                    .any(|line| line.view.phase() != Phase::Idle)
+                {
+                    draft.problem = Some(
+                        tr!(
+                            "Сохранить аккаунт можно, когда нет звонков",
+                            "The account can be saved when there are no calls"
+                        )
+                        .to_owned(),
+                    );
+                    self.account_draft = Some(draft);
+                } else {
+                    self.save_account(draft);
+                }
+            }
+        }
+    }
+
+    /// Makes the account typed in the window the active one and connects it.
+    fn save_account(&mut self, draft: AccountDraft) {
+        if draft.adding {
+            // The account in use until now is kept among the others.
+            let current = self.current_account();
+            if !current.server.is_empty() || !current.user.is_empty() {
+                self.other_accounts.push(current);
+            }
+        }
+        if !self.password.is_empty() {
+            self.typed_passwords.insert(
+                (self.server.trim().to_owned(), self.user.trim().to_owned()),
+                self.password.clone(),
+            );
+        }
+        self.server = draft.server.trim().to_owned();
+        self.proxy = draft.proxy.trim().to_owned();
+        self.user = draft.user.trim().to_owned();
+        self.domain = draft.domain.trim().to_owned();
+        self.auth_user = draft.auth_user.trim().to_owned();
+        self.password = draft.password.clone();
+        self.voicemail_number = draft.voicemail_number.trim().to_owned();
+        self.encryption = draft.encryption;
+        self.transport = draft.transport;
+        self.tls_verify = draft.tls_verify;
+        self.save_password = draft.save_password;
+        self.presence_on = draft.presence;
+        let mut options = draft.options.clone();
+        options.register_refresh = draft
+            .register_refresh
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(300)
+            .max(10);
+        options.keep_alive = draft.keep_alive.trim().parse::<u32>().unwrap_or(15).max(2);
+        options.public_addr = options.public_addr.trim().to_owned();
+        self.account_options = options;
+        // What the previous exchange said does not apply to a new account.
+        if draft.adding {
+            self.voicemail = None;
+            self.presence.clear();
+            self.statuses.clear();
+            self.status_refused = None;
+        }
+        self.start_account();
+    }
+
     fn settings_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let mut open = self.settings_open;
         // Never larger than the phone's window, whatever its size; what
@@ -4254,128 +4467,32 @@ format!("No password for {title}: switch off \"All accounts online\", choose it 
                 egui::ScrollArea::both()
                     .max_height(room)
                     .show(ui, |ui| {
+                        ui.heading(tr!("Аккаунт", "Account"));
+                        // The account itself is set up in its own window,
+                        // as in MicroSIP.
                         ui.horizontal(|ui| {
-                            ui.heading(tr!("Аккаунт", "Account"));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui
-                                    .add_enabled(
-                                        !self.other_accounts.is_empty(),
-                                        egui::Button::new(tr!("Удалить этот", "Remove this one")),
-                                    )
-                                    .on_hover_text(tr!("Забыть этот аккаунт; станет активным следующий", "Forget this account; the next one becomes active"))
-                                    .clicked()
-                                {
-                                    actions.push(Action::RemoveAccount);
-                                }
-                                if ui
-                                    .button(tr!("Добавить", "Add"))
-                                    .on_hover_text(tr!("Ещё один аккаунт; переключение — в верхней строке окна", "One more account; switch in the top row of the window"))
-                                    .clicked()
-                                {
-                                    actions.push(Action::AddAccount);
-                                }
-                            });
+                            ui.label(egui::RichText::new(shown_title(self.current_account().title())).strong());
+                            if ui.button(tr!("Изменить…", "Edit…")).clicked() {
+                                self.account_draft = Some(AccountDraft::from_window(self));
+                            }
+                            if ui.button(tr!("Добавить…", "Add…")).clicked() {
+                                actions.push(Action::AddAccount);
+                            }
                         });
-                        if !self.other_accounts.is_empty() && self.all_accounts {
+                        if !self.other_accounts.is_empty() {
                             ui.weak(tr!(
                                 format!(
-                                    "Аккаунтов: {}. Все в сети; здесь — настройки основного.",
+                                    "Аккаунтов: {}. Переключение — в верхней строке окна.",
                                     self.other_accounts.len() + 1
                                 ),
                                 format!(
-                                    "Accounts: {}. All are online; these are the main one's settings.",
+                                    "Accounts: {}. Switch in the top row of the window.",
                                     self.other_accounts.len() + 1
                                 ),
                             ));
-                        } else if !self.other_accounts.is_empty() {
-                            ui.weak(tr!(
-format!(
-                                "Аккаунтов: {}. Работает один — выбранный в верхней строке окна.",
-                                self.other_accounts.len() + 1
-                            ),
-format!("Accounts: {}. One works: the one chosen in the top row of the window.",
-                                self.other_accounts.len() + 1
-                            ),
-));
-                        }
-                        egui::Grid::new("account").num_columns(2).show(ui, |ui| {
-                            ui.label(tr!("SIP-сервер", "SIP server"));
-                            ui.text_edit_singleline(&mut self.server);
-                            ui.end_row();
-                            ui.label(tr!("Номер (пользователь)", "Number (user)"));
-                            ui.text_edit_singleline(&mut self.user);
-                            ui.end_row();
-                            ui.label(tr!("Пароль", "Password"));
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.password)
-                                        .password(!self.show_password)
-                                        .desired_width(150.0),
-                                );
-                                ui.checkbox(&mut self.show_password, tr!("Показать", "Show"));
-                            });
-                            ui.end_row();
-                            ui.label(tr!("Домен (если отличается)", "Domain (if different)"));
-                            ui.text_edit_singleline(&mut self.domain);
-                            ui.end_row();
-                            ui.label(tr!("Логин (если отличается)", "Login (if different)"));
-                            ui.text_edit_singleline(&mut self.auth_user);
-                            ui.end_row();
-ui.label(tr!("Транспорт", "Transport"));
-ui.horizontal(|ui| {
-    for transport in SipTransport::ALL {
-        ui.radio_value(&mut self.transport, transport, transport.name());
-    }
-});
-ui.end_row();
-ui.label(tr!("STUN-сервер", "STUN server"));
-ui.add(
-    egui::TextEdit::singleline(&mut self.stun)
-        .hint_text(tr!("не используется", "not used"))
-        .desired_width(170.0),
-);
-ui.end_row();
-ui.label(tr!("Шифрование (SRTP)", "Encryption (SRTP)"));
-egui::ComboBox::from_id_salt("media-encryption")
-    .selected_text(encryption_text(self.encryption))
-    .width(170.0)
-    .show_ui(ui, |ui| {
-        for mode in MediaEncryption::ALL {
-            ui.selectable_value(&mut self.encryption, mode, encryption_text(mode));
-        }
-    });
-ui.end_row();
-ui.label(tr!("Прокси (если есть)", "Proxy (if any)"));
-ui.add(
-    egui::TextEdit::singleline(&mut self.proxy)
-        .hint_text(tr!("не используется", "not used"))
-        .desired_width(170.0),
-);
-ui.end_row();
-                            ui.label(tr!("Локальный порт", "Local port"));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.local_port)
-                                    .hint_text(tr!("автоматически", "automatic"))
-                                    .desired_width(100.0),
-                            );
-                            ui.end_row();
-                        });
-if self.transport == SipTransport::Tls {
-    ui.checkbox(&mut self.tls_verify, tr!("Проверять сертификат сервера (TLS)", "Check the server certificate (TLS)"));
-    if !self.tls_verify {
-        ui.weak(tr!("Без проверки связь шифруется, но сервер может оказаться подменённым.", "Without the check the link is encrypted, but the server could be an impostor."));
-    }
-}
-                        if secret::is_available() {
-                            ui.checkbox(&mut self.save_password, tr!("Запомнить пароль", "Remember the password"));
-                            ui.weak(
-                                tr!("Пароль хранится зашифрованным для этого пользователя Windows.", "The password is kept encrypted for this Windows user."),
-                            );
-                        } else {
-                            ui.weak(tr!("На этой системе пароль не сохраняется.", "On this system the password is not saved."));
                         }
                         ui.horizontal(|ui| {
-                            if ui.button(tr!("Сохранить и подключить", "Save and connect")).clicked() {
+                            if ui.button(tr!("Подключить", "Connect")).clicked() {
                                 actions.push(Action::Connect);
                             }
                             if ui
@@ -4384,13 +4501,28 @@ if self.transport == SipTransport::Tls {
                             {
                                 actions.push(Action::Disconnect);
                             }
+                            if let Some(local) = self.local {
+                                ui.weak(tr!(format!("Адрес: {local}"), format!("Address: {local}")));
+                            }
                         });
-                        if let Some(local) = self.local {
-                            ui.weak(tr!(
-format!("Адрес телефона: {local}"),
-format!("Phone address: {local}"),
-));
-                        }
+                        egui::Grid::new("network").num_columns(2).show(ui, |ui| {
+                            ui.label(tr!("STUN-сервер", "STUN server"));
+                            let field = ui.add(
+                                egui::TextEdit::singleline(&mut self.stun)
+                                    .hint_text(tr!("не используется", "not used"))
+                                    .desired_width(170.0),
+                            );
+                            edit_menu(&field, &mut self.stun, false);
+                            ui.end_row();
+                            ui.label(tr!("Локальный порт", "Local port"));
+                            let field = ui.add(
+                                egui::TextEdit::singleline(&mut self.local_port)
+                                    .hint_text(tr!("автоматически", "automatic"))
+                                    .desired_width(100.0),
+                            );
+                            edit_menu(&field, &mut self.local_port, false);
+                            ui.end_row();
+                        });
                         let mut all = self.all_accounts;
                         if ui
                             .checkbox(&mut all, tr!("Все аккаунты в сети одновременно", "All accounts online at once"))
@@ -4427,17 +4559,6 @@ format!("Phone address: {local}"),
                                 actions.push(Action::DtmfMethod(self.dtmf_method));
                             }
                         });
-                        let mut statuses = self.presence_on;
-                        if ui
-                            .checkbox(&mut statuses, tr!("Статусы: показывать коллегам свой и видеть их", "Statuses: show mine to colleagues and see theirs"))
-                            .on_hover_text(
-                                tr!("Свой статус выбирается в верхней строке окна. Не все АТС \
-                                 его принимают; Asterisk и FreePBX — нет.", "Your status is chosen in the top row of the window. Not every exchange takes it; Asterisk and FreePBX do not."),
-                            )
-                            .changed()
-                        {
-                            actions.push(Action::Statuses(statuses));
-                        }
 
                         ui.separator();
                         ui.heading(tr!("Звук", "Audio"));
@@ -4466,7 +4587,9 @@ format!("Phone address: {local}"),
                             let field = egui::TextEdit::singleline(&mut self.ringtone)
                                 .hint_text(tr!("встроенный звонок", "built-in ring"))
                                 .desired_width(170.0);
-                            let typed = ui.add(field).lost_focus();
+                            let field = ui.add(field);
+                            edit_menu(&field, &mut self.ringtone, false);
+                            let typed = field.lost_focus();
                             if ui
                                 .add_enabled(self.dialog.is_none(), egui::Button::new(tr!("Обзор…", "Browse…")))
                                 .clicked()
@@ -4502,10 +4625,9 @@ format!("Phone address: {local}"),
                         ui.heading(tr!("Входящие вызовы", "Incoming calls"));
                         ui.horizontal(|ui| {
                             ui.label(tr!("Номер голосовой почты", "Voicemail number"));
-                            if ui
-                                .add(egui::TextEdit::singleline(&mut self.voicemail_number).desired_width(80.0))
-                                .lost_focus()
-                            {
+                            let field = ui.add(egui::TextEdit::singleline(&mut self.voicemail_number).desired_width(80.0));
+                            edit_menu(&field, &mut self.voicemail_number, false);
+                            if field.lost_focus() {
                                 actions.push(Action::WindowChanged);
                             }
                         });
@@ -4518,10 +4640,11 @@ format!("Phone address: {local}"),
                         let before = (self.forward, self.forward_to.clone());
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.forward, tr!("Переадресация на номер", "Forward to number"));
-                            ui.add(
+                            let field = ui.add(
                                 egui::TextEdit::singleline(&mut self.forward_to)
                                     .desired_width(140.0),
                             );
+                            edit_menu(&field, &mut self.forward_to, false);
                         });
                         if before != (self.forward, self.forward_to.clone()) {
                             actions.push(Action::ForwardChanged);
@@ -4535,11 +4658,12 @@ format!("Phone address: {local}"),
                             .unwrap_or_default();
                         ui.horizontal(|ui| {
                             ui.label(tr!("Папка", "Folder"));
-                            ui.add(
+                            let field = ui.add(
                                 egui::TextEdit::singleline(&mut self.recordings_dir)
                                     .hint_text(default)
                                     .desired_width(200.0),
                             );
+                            edit_menu(&field, &mut self.recordings_dir, false);
                             if ui
                                 .add_enabled(self.dialog.is_none(), egui::Button::new(tr!("Обзор…", "Browse…")))
                                 .clicked()
@@ -5375,6 +5499,125 @@ fn history_file_name() -> String {
     )
 }
 
+/// The right-click menu of a Windows text field for any field of the window:
+/// undo, cut, copy, paste, delete and select all. `secret` (a password)
+/// lets nothing be copied out of it. Call it every frame, right after the
+/// field is added, with the text the field edits.
+fn edit_menu(response: &egui::Response, text: &mut String, secret: bool) {
+    use egui::text::{CCursor, CCursorRange};
+    let ctx = response.ctx.clone();
+    let id = response.id;
+    let kept_id = id.with("kept-selection");
+    let paste_id = egui::Id::new("edit-menu-paste");
+    // A paste asked for from the menu: once the field has the focus again,
+    // the system clipboard is asked for its text, which arrives as an
+    // ordinary paste into this field.
+    let asked = ctx.data(|data| data.get_temp::<(egui::Id, f64)>(paste_id));
+    if asked.is_some_and(|(field, _)| field == id) {
+        let now = ctx.input(|input| input.time);
+        if response.has_focus() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            ctx.data_mut(|data| data.remove::<(egui::Id, f64)>(paste_id));
+            ctx.request_repaint();
+        } else if asked.is_some_and(|(_, at)| now - at > 1.0) {
+            // It never got the focus: forgotten, not pasted later by surprise.
+            ctx.data_mut(|data| data.remove::<(egui::Id, f64)>(paste_id));
+        } else {
+            ctx.memory_mut(|memory| memory.request_focus(id));
+            ctx.request_repaint();
+        }
+    }
+    // The selection as it was before the right click, which moves the cursor.
+    let right_click = ctx.input(|input| {
+        input.pointer.button_pressed(egui::PointerButton::Secondary)
+            || input.pointer.button_down(egui::PointerButton::Secondary)
+    });
+    let menu_open = response.context_menu_opened() || ctx.memory(|memory| memory.any_popup_open());
+    if !right_click
+        && !menu_open
+        && let Some(range) =
+            egui::TextEdit::load_state(&ctx, id).and_then(|state| state.cursor.char_range())
+    {
+        ctx.data_mut(|data| data.insert_temp(kept_id, range));
+    }
+    response.context_menu(|ui| {
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+        let length = text.chars().count();
+        let range = ctx
+            .data(|data| data.get_temp::<CCursorRange>(kept_id))
+            .unwrap_or_else(|| CCursorRange::one(CCursor::new(length)));
+        let [from, to] = range.sorted();
+        let (from, to) = (from.index.min(length), to.index.min(length));
+        let selected: String = text.chars().skip(from).take(to - from).collect();
+        let has_selection = from < to;
+        let mut undoer = state.undoer();
+        let current = (range, text.clone());
+        let mut done = false;
+        let item = |ui: &mut egui::Ui, enabled: bool, label: &str, keys: &str| {
+            ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(keys))
+                .clicked()
+        };
+        if item(
+            ui,
+            undoer.has_undo(&current),
+            tr!("Отменить", "Undo"),
+            "Ctrl+Z",
+        ) {
+            if let Some((cursor, before)) = undoer.undo(&current).cloned() {
+                *text = before;
+                state.cursor.set_char_range(Some(cursor));
+            }
+            done = true;
+        }
+        ui.separator();
+        let can_copy = has_selection && !secret;
+        let cut = item(ui, can_copy, tr!("Вырезать", "Cut"), "Ctrl+X");
+        if item(ui, can_copy, tr!("Копировать", "Copy"), "Ctrl+C") || cut {
+            ctx.copy_text(selected.clone());
+            done = true;
+        }
+        if item(ui, true, tr!("Вставить", "Paste"), "Ctrl+V") {
+            // The selection is restored first, so the paste replaces it.
+            state.cursor.set_char_range(Some(range));
+            let now = ctx.input(|input| input.time);
+            ctx.data_mut(|data| data.insert_temp(paste_id, (id, now)));
+            ctx.memory_mut(|memory| memory.request_focus(id));
+            done = true;
+        }
+        if item(ui, has_selection, tr!("Удалить", "Delete"), "Del") || cut {
+            // Undo brings the deleted part back.
+            undoer.add_undo(&current);
+            let kept: String = text
+                .chars()
+                .take(from)
+                .chain(text.chars().skip(to))
+                .collect();
+            *text = kept;
+            state
+                .cursor
+                .set_char_range(Some(CCursorRange::one(CCursor::new(from))));
+            done = true;
+        }
+        ui.separator();
+        if item(ui, length > 0, tr!("Выделить всё", "Select all"), "Ctrl+A") {
+            state.cursor.set_char_range(Some(CCursorRange::two(
+                CCursor::new(0),
+                CCursor::new(length),
+            )));
+            ctx.memory_mut(|memory| memory.request_focus(id));
+            done = true;
+        }
+        if done {
+            if let Some(range) = state.cursor.char_range() {
+                ctx.data_mut(|data| data.insert_temp(kept_id, range));
+            }
+            state.set_undoer(undoer);
+            state.store(&ctx, id);
+            ui.close_menu();
+        }
+    });
+}
+
 /// "Copy the number" (and the name, when there is one) for a right click on
 /// a call or a contact.
 /// Whether a call fits the search of the call list. Digits are looked for
@@ -5403,6 +5646,371 @@ fn call_matches(number: &str, name: &str, query: &str) -> bool {
     }
     let query = query.to_lowercase();
     name.to_lowercase().contains(&query) || number.to_lowercase().contains(&query)
+}
+
+/// What the account window holds while it is open.
+struct AccountDraft {
+    /// A new account rather than the active one.
+    adding: bool,
+    server: String,
+    proxy: String,
+    user: String,
+    domain: String,
+    auth_user: String,
+    password: String,
+    show_password: bool,
+    voicemail_number: String,
+    encryption: MediaEncryption,
+    transport: SipTransport,
+    tls_verify: bool,
+    save_password: bool,
+    presence: bool,
+    options: AccountOptions,
+    register_refresh: String,
+    keep_alive: String,
+    /// Addresses of this computer, offered for Public Address.
+    local_addresses: Vec<String>,
+    confirm_delete: bool,
+    problem: Option<String>,
+}
+
+/// What was chosen in the account window.
+enum DraftOutcome {
+    Save,
+    Cancel,
+    Delete,
+}
+
+impl AccountDraft {
+    /// The active account, to edit.
+    fn from_window(window: &PhoneWindow) -> Self {
+        let options = window.account_options.clone();
+        Self {
+            adding: false,
+            server: window.server.clone(),
+            proxy: window.proxy.clone(),
+            user: window.user.clone(),
+            domain: window.domain.clone(),
+            auth_user: window.auth_user.clone(),
+            password: window.password.clone(),
+            show_password: false,
+            voicemail_number: window.voicemail_number.clone(),
+            encryption: window.encryption,
+            transport: window.transport,
+            tls_verify: window.tls_verify,
+            save_password: window.save_password,
+            presence: window.presence_on,
+            register_refresh: options.register_refresh.to_string(),
+            keep_alive: options.keep_alive.to_string(),
+            options,
+            local_addresses: window
+                .local
+                .map(|local| local.ip().to_string())
+                .into_iter()
+                .collect(),
+            confirm_delete: false,
+            problem: None,
+        }
+    }
+
+    /// An empty account, to add.
+    fn new_account() -> Self {
+        let defaults = AccountSettings::default();
+        let options = AccountOptions::default();
+        Self {
+            adding: true,
+            server: String::new(),
+            proxy: String::new(),
+            user: String::new(),
+            domain: String::new(),
+            auth_user: String::new(),
+            password: String::new(),
+            show_password: false,
+            voicemail_number: String::new(),
+            encryption: MediaEncryption::from_name(&defaults.media_encryption),
+            transport: SipTransport::Udp,
+            tls_verify: true,
+            save_password: defaults.save_password,
+            presence: false,
+            register_refresh: options.register_refresh.to_string(),
+            keep_alive: options.keep_alive.to_string(),
+            options,
+            local_addresses: Vec::new(),
+            confirm_delete: false,
+            problem: None,
+        }
+    }
+
+    fn title(&self) -> String {
+        let label = self.options.label.trim();
+        if label.is_empty() {
+            shown_title(account_title(&self.user, &self.server))
+        } else {
+            label.to_owned()
+        }
+    }
+
+    /// What is missing before the account can be saved.
+    fn problem_with_fields(&self) -> Option<String> {
+        if self.server.trim().is_empty() {
+            return Some(tr!("Укажите SIP-сервер", "Enter the SIP server").to_owned());
+        }
+        if self.user.trim().is_empty() {
+            return Some(tr!("Укажите пользователя (номер)", "Enter the username").to_owned());
+        }
+        let address = self.options.public_addr.trim();
+        if !address.is_empty() && address.parse::<std::net::IpAddr>().is_err() {
+            return Some(
+                tr!(
+                    "Публичный адрес — это IP-адрес, например 203.0.113.5, или «Авто»",
+                    "The public address is an IP address such as 203.0.113.5, or Auto"
+                )
+                .to_owned(),
+            );
+        }
+        None
+    }
+
+    /// The fields, in MicroSIP's order. Returns a choice only for Enter
+    /// in a field (Save).
+    fn show(&mut self, ui: &mut egui::Ui) -> Option<DraftOutcome> {
+        let width = (ui.available_width() - 150.0).clamp(120.0, 230.0);
+        let text = |ui: &mut egui::Ui, value: &mut String, hint: &str| {
+            let field = ui.add(
+                egui::TextEdit::singleline(value)
+                    .hint_text(hint)
+                    .desired_width(width),
+            );
+            edit_menu(&field, value, false);
+            field
+        };
+        egui::Grid::new("account-fields")
+            .num_columns(2)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                ui.label(tr!("Название аккаунта", "Account name"))
+                    .on_hover_text(tr!(
+                        "Как аккаунт называется в списке",
+                        "How the account is called in the list"
+                    ));
+                text(ui, &mut self.options.label, "");
+                ui.end_row();
+                ui.label(tr!("SIP-сервер", "SIP server"));
+                text(ui, &mut self.server, "pbx.example.com:5060");
+                ui.end_row();
+                ui.label(tr!("SIP-прокси", "SIP proxy"));
+                text(ui, &mut self.proxy, "");
+                ui.end_row();
+                // A gap between the groups of fields, as in MicroSIP.
+                ui.label("");
+                ui.end_row();
+                ui.label(tr!("Пользователь *", "Username *"));
+                text(ui, &mut self.user, "");
+                ui.end_row();
+                ui.label(tr!("Домен *", "Domain *"))
+                    .on_hover_text(tr!("Пусто — как у SIP-сервера", "Empty: as the SIP server"));
+                text(ui, &mut self.domain, tr!("как сервер", "as the server"));
+                ui.end_row();
+                ui.label(tr!("Логин", "Login")).on_hover_text(tr!(
+                    "Для пароля, если отличается от пользователя",
+                    "For the password, if it differs from the username"
+                ));
+                text(ui, &mut self.auth_user, "");
+                ui.end_row();
+                ui.label(tr!("Пароль", "Password"));
+                ui.horizontal(|ui| {
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.password)
+                            .password(!self.show_password)
+                            .desired_width(width - 30.0),
+                    );
+                    edit_menu(&field, &mut self.password, !self.show_password);
+                    ui.checkbox(&mut self.show_password, "")
+                        .on_hover_text(tr!("Показать пароль", "Show the password"));
+                });
+                ui.end_row();
+                // A gap between the groups of fields, as in MicroSIP.
+                ui.label("");
+                ui.end_row();
+                ui.label(tr!("Отображаемое имя", "Display name"))
+                    .on_hover_text(tr!(
+                        "Имя, которое видят те, кому вы звоните",
+                        "The name the people you call see"
+                    ));
+                text(ui, &mut self.options.display_name, "");
+                ui.end_row();
+                ui.label(tr!("Голосовая почта", "Voicemail number"));
+                text(ui, &mut self.voicemail_number, "*97");
+                ui.end_row();
+                ui.label(tr!("Префикс набора", "Dialing prefix"))
+                    .on_hover_text(tr!(
+                        "Ставится перед телефонными номерами",
+                        "Put in front of telephone numbers"
+                    ));
+                text(ui, &mut self.options.dialing_prefix, "");
+                ui.end_row();
+                ui.label(tr!("План набора", "Dial plan")).on_hover_text(tr!(
+                    "Как в MicroSIP: шаблоны через |, X — любая цифра, \
+                         <8:+7> — замена. Номер, не подходящий ни под один, не набирается.",
+                    "As in MicroSIP: patterns separated by |, X any digit, \
+                         <8:+7> a replacement. A number fitting none is not dialled."
+                ));
+                text(ui, &mut self.options.dial_plan, "");
+                ui.end_row();
+                ui.label(tr!("Скрыть номер", "Hide caller ID"));
+                let hide = HideCallerId::from_name(&self.options.hide_cid);
+                let hide_text = |hide: HideCallerId| match hide {
+                    HideCallerId::Off => tr!("Нет", "Disabled"),
+                    HideCallerId::Soft => tr!("Мягко (Soft)", "Soft"),
+                    HideCallerId::Hard => tr!("Жёстко (Hard)", "Hard"),
+                };
+                egui::ComboBox::from_id_salt("hide-caller-id")
+                    .selected_text(hide_text(hide))
+                    .width(width)
+                    .show_ui(ui, |ui| {
+                        for choice in [HideCallerId::Off, HideCallerId::Soft, HideCallerId::Hard] {
+                            if ui
+                                .selectable_label(hide == choice, hide_text(choice))
+                                .clicked()
+                            {
+                                self.options.hide_cid = choice.name().to_owned();
+                            }
+                        }
+                    });
+                ui.end_row();
+                ui.label(tr!("Шифрование звука", "Media encryption"));
+                egui::ComboBox::from_id_salt("account-encryption")
+                    .selected_text(encryption_text(self.encryption))
+                    .width(width)
+                    .show_ui(ui, |ui| {
+                        for mode in MediaEncryption::ALL {
+                            ui.selectable_value(&mut self.encryption, mode, encryption_text(mode));
+                        }
+                    });
+                ui.end_row();
+                ui.label(tr!("Транспорт", "Transport"));
+                egui::ComboBox::from_id_salt("account-transport")
+                    .selected_text(self.transport.name())
+                    .width(width)
+                    .show_ui(ui, |ui| {
+                        for transport in SipTransport::ALL {
+                            ui.selectable_value(&mut self.transport, transport, transport.name());
+                        }
+                    });
+                ui.end_row();
+                ui.label(tr!("Публичный адрес", "Public address"))
+                    .on_hover_text(tr!(
+                        "Адрес, который ставится в звонки вместо адреса компьютера; \
+                         «Авто» — само",
+                        "The address put into calls instead of the computer's; Auto: by itself"
+                    ));
+                ui.horizontal(|ui| {
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.options.public_addr)
+                            .hint_text(tr!("Авто", "Auto"))
+                            .desired_width(width - 46.0),
+                    );
+                    edit_menu(&field, &mut self.options.public_addr, false);
+                    // A list to choose from, as MicroSIP's: Auto or an
+                    // address of this computer.
+                    egui::ComboBox::from_id_salt("public-address")
+                        .selected_text("")
+                        .width(18.0)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(false, tr!("Авто", "Auto")).clicked() {
+                                self.options.public_addr.clear();
+                            }
+                            for address in &self.local_addresses {
+                                if ui.selectable_label(false, address).clicked() {
+                                    self.options.public_addr = address.clone();
+                                }
+                            }
+                        });
+                });
+                ui.end_row();
+                ui.label(tr!("Обновление регистрации", "Register refresh"))
+                    .on_hover_text(tr!("Секунды; не меньше 10", "Seconds; 10 at least"));
+                ui.horizontal(|ui| {
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.register_refresh).desired_width(50.0),
+                    );
+                    edit_menu(&field, &mut self.register_refresh, false);
+                    ui.label("Keep-Alive").on_hover_text(tr!(
+                        "Секунды между пакетами «я здесь»; не меньше 2",
+                        "Seconds between keep-alive packets; 2 at least"
+                    ));
+                    let field = ui
+                        .add(egui::TextEdit::singleline(&mut self.keep_alive).desired_width(40.0));
+                    edit_menu(&field, &mut self.keep_alive, false);
+                });
+                ui.end_row();
+            });
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut self.presence,
+            tr!("Публиковать статус", "Publish presence"),
+        )
+        .on_hover_text(tr!(
+            "Показывать коллегам свой статус и видеть их. Не все АТС принимают; \
+                 Asterisk и FreePBX — нет.",
+            "Show your status to colleagues and see theirs. Not every exchange takes it; \
+                 Asterisk and FreePBX do not."
+        ));
+        ui.checkbox(
+            &mut self.options.allow_rewrite,
+            tr!("Разрешить подмену IP", "Allow IP rewrite"),
+        )
+        .on_hover_text(tr!(
+            "Регистрироваться с адресом, под которым компьютер виден серверу (за NAT)",
+            "Register with the address the server sees the computer at (behind NAT)"
+        ));
+        ui.add_enabled(false, egui::Checkbox::new(&mut self.options.ice, "ICE"))
+            .on_disabled_hover_text(tr!(
+                "ICE пока не поддерживается; звонки идут без него, как с выключенной галочкой",
+                "ICE is not supported yet; calls go without it, as with the box clear"
+            ));
+        ui.checkbox(
+            &mut self.options.disable_session_timer,
+            tr!("Отключить таймеры сессии", "Disable session timers"),
+        )
+        .on_hover_text(tr!(
+            "Эта программа таймеры сессии не использует, так что они выключены всегда; \
+             галочка хранится как в MicroSIP",
+            "This program does not use session timers, so they are always off; \
+             the box is kept as in MicroSIP"
+        ));
+        if self.transport == SipTransport::Tls {
+            ui.checkbox(
+                &mut self.tls_verify,
+                tr!(
+                    "Проверять сертификат сервера (TLS)",
+                    "Check the server certificate (TLS)"
+                ),
+            );
+        }
+        if secret::is_available() {
+            ui.checkbox(
+                &mut self.save_password,
+                tr!("Запомнить пароль", "Remember the password"),
+            )
+            .on_hover_text(tr!(
+                "Хранится зашифрованным для этого пользователя Windows",
+                "Kept encrypted for this Windows user"
+            ));
+        }
+        None
+    }
+}
+
+/// The account's MicroSIP fields that the phone engine uses.
+fn with_options(account: Account, options: &AccountOptions) -> Account {
+    account
+        .with_expires(options.register_refresh.max(10))
+        .with_keepalive(options.keep_alive.max(2))
+        .with_allow_rewrite(options.allow_rewrite)
+        .with_display_name(options.display_name.trim())
+        .with_hide_caller_id(HideCallerId::from_name(&options.hide_cid))
+        .with_public_address(options.public_addr.trim().parse().ok())
 }
 
 /// How the buttons of a call in the list are shown, by the room there is.
@@ -5725,6 +6333,9 @@ impl eframe::App for PhoneWindow {
 
         if self.settings_open {
             self.settings_window(ctx, &mut actions);
+        }
+        if self.account_draft.is_some() {
+            self.account_window(ctx, &mut actions);
         }
         if self.log_open {
             self.log_window(ctx);

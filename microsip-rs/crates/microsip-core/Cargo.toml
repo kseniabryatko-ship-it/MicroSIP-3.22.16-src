@@ -16,6 +16,7 @@ getrandom = "0.4"
 sonora = "0.3"
 oxideav-gsm = "0.0.11"
 oxideav-speex = "0.0.12"
+regex = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]

@@ -61,6 +61,52 @@ pub struct Account {
     pub proxy: String,
     /// With TLS: refuse a server whose certificate cannot be trusted.
     pub tls_verify: bool,
+    /// The name shown to the people called (MicroSIP's Display Name);
+    /// empty for none.
+    pub display_name: String,
+    /// Seconds between keep-alive packets to the server (Keep-Alive).
+    pub keepalive_seconds: u32,
+    /// The Contact follows the address the server sees this phone at, as
+    /// behind NAT (Allow IP Rewrite).
+    pub allow_rewrite: bool,
+    /// Hiding this phone's number from the people called (Hide Caller ID).
+    pub hide_caller_id: HideCallerId,
+    /// The address put into the calls' audio offers instead of the local
+    /// one (Public Address); `None` is automatic.
+    pub public_address: Option<std::net::IpAddr>,
+}
+
+/// MicroSIP's Hide Caller ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HideCallerId {
+    #[default]
+    Off,
+    /// The exchange is asked to hide the number (`Privacy: id`); the
+    /// caller is still named to it.
+    Soft,
+    /// As soft, and the call itself comes from "Anonymous".
+    Hard,
+}
+
+impl HideCallerId {
+    /// As MicroSIP writes it in its settings: empty, `soft`, `hard`.
+    pub fn name(self) -> &'static str {
+        match self {
+            HideCallerId::Off => "",
+            HideCallerId::Soft => "soft",
+            HideCallerId::Hard => "hard",
+        }
+    }
+
+    /// Reads `soft`, `hard` (and MicroSIP's old `1` for hard); anything
+    /// else is off.
+    pub fn from_name(name: &str) -> Self {
+        match name.trim() {
+            "soft" => HideCallerId::Soft,
+            "hard" | "1" => HideCallerId::Hard,
+            _ => HideCallerId::Off,
+        }
+    }
 }
 
 impl Account {
@@ -79,7 +125,37 @@ impl Account {
             transport: SipTransport::Udp,
             proxy: String::new(),
             tls_verify: true,
+            display_name: String::new(),
+            keepalive_seconds: KEEPALIVE_INTERVAL.as_secs() as u32,
+            allow_rewrite: true,
+            hide_caller_id: HideCallerId::Off,
+            public_address: None,
         }
+    }
+
+    pub fn with_display_name(mut self, name: impl Into<String>) -> Self {
+        self.display_name = name.into();
+        self
+    }
+
+    pub fn with_keepalive(mut self, seconds: u32) -> Self {
+        self.keepalive_seconds = seconds;
+        self
+    }
+
+    pub fn with_allow_rewrite(mut self, allow: bool) -> Self {
+        self.allow_rewrite = allow;
+        self
+    }
+
+    pub fn with_hide_caller_id(mut self, hide: HideCallerId) -> Self {
+        self.hide_caller_id = hide;
+        self
+    }
+
+    pub fn with_public_address(mut self, address: Option<std::net::IpAddr>) -> Self {
+        self.public_address = address;
+        self
     }
 
     pub fn with_transport(mut self, transport: SipTransport) -> Self {
@@ -174,8 +250,20 @@ impl fmt::Debug for Account {
             .field("auth_username", &self.auth_username)
             .field("password", &"********")
             .field("expires", &self.expires)
+            .field("display_name", &self.display_name)
             .finish()
     }
+}
+
+/// A display name ready for a From header: in quotes, with the characters
+/// that would break the header taken out; `None` for an empty name.
+pub fn quoted_display_name(name: &str) -> Option<String> {
+    let clean: String = name
+        .chars()
+        .filter(|character| !matches!(character, '"' | '\\') && !character.is_control())
+        .collect();
+    let clean = clean.trim();
+    (!clean.is_empty()).then(|| format!("\"{clean}\""))
 }
 
 fn bracket_ipv6(host: &str) -> String {
@@ -306,6 +394,11 @@ impl Registration {
         &self.username
     }
 
+    /// The account as it was given.
+    pub fn account(&self) -> &Account {
+        &self.account
+    }
+
     /// Address to put into Contact headers: the local socket address, or the
     /// public one the server reported when this phone is behind NAT.
     pub fn contact_address(&self) -> SocketAddr {
@@ -313,20 +406,22 @@ impl Registration {
     }
 
     /// True when a keep-alive packet should be sent to the server now. The
-    /// next one is then due after [`KEEPALIVE_INTERVAL`].
+    /// next one is then due after the account's keep-alive interval
+    /// ([`KEEPALIVE_INTERVAL`] unless set otherwise).
     pub fn keepalive_due(&mut self, now: Instant) -> bool {
         if !self.bound || self.finished {
             self.next_keepalive = None;
             return false;
         }
+        let interval = Duration::from_secs(u64::from(self.account.keepalive_seconds.max(1)));
         match self.next_keepalive {
             Some(due) if now < due => false,
             Some(_) => {
-                self.next_keepalive = Some(now + KEEPALIVE_INTERVAL);
+                self.next_keepalive = Some(now + interval);
                 true
             }
             None => {
-                self.next_keepalive = Some(now + KEEPALIVE_INTERVAL);
+                self.next_keepalive = Some(now + interval);
                 false
             }
         }
@@ -488,6 +583,7 @@ impl Registration {
             200..=299 => {
                 let seen = reported_address(&response.headers, self.local);
                 if let Some(seen) = seen.filter(|seen| *seen != self.contact)
+                    && self.account.allow_rewrite
                     && self.contact_changes < MAX_CONTACT_CHANGES
                 {
                     // Behind NAT: register the address the server really sees.
@@ -635,6 +731,17 @@ impl Registration {
                 .headers
                 .insert(name, value)
                 .map_err(|error| error.to_string())?;
+        }
+        // The name shown to others goes with the address of record.
+        if let Some(name) = quoted_display_name(&self.account.display_name) {
+            for header in ["from", "to"] {
+                if let Some(value) = request.headers.get(header).map(str::to_owned) {
+                    request
+                        .headers
+                        .insert(header, format!("{name} {value}"))
+                        .map_err(|error| error.to_string())?;
+                }
+            }
         }
         add_rport(&mut request.headers).map_err(|error| error.to_string())?;
         let bytes = request.serialize().map_err(|error| error.to_string())?;
@@ -1535,6 +1642,46 @@ mod tests {
         registration.unregister();
         registration.on_timeout(now);
         assert!(!registration.keepalive_due(now + KEEPALIVE_INTERVAL * 10));
+    }
+
+    #[test]
+    fn the_account_sets_the_keepalive_the_name_and_whether_the_contact_follows() {
+        let account = Account::new("192.0.2.10", "alice", "secret")
+            .with_expires(120)
+            .with_keepalive(30)
+            .with_display_name("Алиса \"Офис\"")
+            .with_allow_rewrite(false);
+        let mut registration = Registration::new(
+            account,
+            "192.0.2.10:5060".parse().unwrap(),
+            "192.0.2.20:5070".parse().unwrap(),
+            "test",
+        )
+        .unwrap();
+        let now = Instant::now();
+        let first = sent(&registration.start());
+        // The name goes with the address; quotes inside it are dropped.
+        assert_eq!(
+            first.headers.get("from").unwrap().split(';').next(),
+            Some("\"Алиса Офис\" <sip:alice@192.0.2.10>")
+        );
+        // Not allowed to follow the server's view: the local contact stays
+        // and the account is registered at once.
+        let outputs = feed(
+            &mut registration,
+            reply_seen_at(&first, "203.0.113.7:40000", &[("expires", "120")]),
+            now,
+        )
+        .unwrap();
+        assert!(!states(&outputs).is_empty());
+        assert_eq!(
+            registration.contact_address(),
+            "192.0.2.20:5070".parse().unwrap()
+        );
+        // Keep-alive every 30 seconds instead of 15.
+        assert!(!registration.keepalive_due(now));
+        assert!(!registration.keepalive_due(now + Duration::from_secs(29)));
+        assert!(registration.keepalive_due(now + Duration::from_secs(30)));
     }
 
     #[test]

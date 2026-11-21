@@ -7,7 +7,7 @@ use microsip_core::call_runner::{
 };
 use microsip_core::codec::Codec;
 use microsip_core::dialog::{DialogConfig, EstablishedDialog};
-use microsip_core::registration::{Account, RegistrationState};
+use microsip_core::registration::{Account, HideCallerId, RegistrationState};
 use microsip_core::sip::digest::{DigestChallenge, authorization_header_with_cnonce};
 use microsip_core::sip::message::{
     InviteRequest, Message, Method, Request, RequestBuilder, Response, ResponseBuilder,
@@ -175,6 +175,11 @@ impl Server {
     /// Accepts the registration without asking for a password.
     fn register(&self, handle: &CallHandle, password: &str) {
         let account = Account::new(self.address().to_string(), "alice", password);
+        self.register_as(handle, account);
+    }
+
+    /// The same for an account set up by the caller.
+    fn register_as(&self, handle: &CallHandle, account: Account) {
         assert!(handle.send(UiCommand::Register(account)));
         let (request, peer) = self.request("REGISTER");
         self.reply(&request, peer, 200, &[("expires", "3600")], None);
@@ -1234,4 +1239,92 @@ fn options_is_answered_so_the_server_sees_the_phone_alive() {
     assert_eq!(ok.headers.get("cseq"), Some("1 OPTIONS"));
     assert!(ok.headers.get("allow").unwrap().contains("INVITE"));
     assert!(ok.headers.get("to").unwrap().contains(";tag="));
+}
+
+#[test]
+fn calls_carry_the_display_name_and_hide_the_number_as_asked() {
+    // Display name only: it goes into From, with no Privacy.
+    let server = Server::new();
+    let handle = phone(calm_timers());
+    let account = Account::new(server.address().to_string(), "alice", PASSWORD)
+        .with_display_name("Алиса \"Офис\"");
+    server.register_as(&handle, account);
+    assert!(handle.send(UiCommand::DialTarget("100".to_owned())));
+    let (invite, peer) = server.request("INVITE");
+    let from = invite.headers.get("from").unwrap();
+    assert!(from.starts_with("\"Алиса Офис\" <sip:alice@"), "{from}");
+    assert_eq!(invite.headers.get("privacy"), None);
+    server.reply(&invite, peer, 486, &[], None);
+    wait_for(&handle, Event::Ended(EndReason::Rejected(486)));
+
+    // Soft: the exchange is asked to hide the number; the caller is named.
+    let server = Server::new();
+    let handle = phone(calm_timers());
+    let account = Account::new(server.address().to_string(), "alice", PASSWORD)
+        .with_display_name("Алиса")
+        .with_hide_caller_id(HideCallerId::Soft);
+    server.register_as(&handle, account);
+    assert!(handle.send(UiCommand::DialTarget("100".to_owned())));
+    let (invite, peer) = server.request("INVITE");
+    assert_eq!(invite.headers.get("privacy"), Some("id"));
+    assert!(
+        invite
+            .headers
+            .get("from")
+            .unwrap()
+            .starts_with("\"Алиса\" <sip:alice@")
+    );
+    // Asked for the password: the INVITE sent again says the same.
+    server.reply(
+        &invite,
+        peer,
+        407,
+        &[("proxy-authenticate", CHALLENGE)],
+        None,
+    );
+    let (again, peer) = server.request("INVITE");
+    assert_eq!(again.headers.get("cseq"), Some("2 INVITE"));
+    assert_eq!(again.headers.get("privacy"), Some("id"));
+    assert!(
+        again
+            .headers
+            .get("from")
+            .unwrap()
+            .starts_with("\"Алиса\" <sip:alice@")
+    );
+    server.reply(&again, peer, 486, &[], None);
+    wait_for(&handle, Event::Ended(EndReason::Rejected(486)));
+
+    // Hard: the call comes from "Anonymous", with its own tag kept.
+    let server = Server::new();
+    let handle = phone(calm_timers());
+    let account = Account::new(server.address().to_string(), "alice", PASSWORD)
+        .with_display_name("Алиса")
+        .with_hide_caller_id(HideCallerId::Hard);
+    server.register_as(&handle, account);
+    assert!(handle.send(UiCommand::DialTarget("100".to_owned())));
+    let (invite, peer) = server.request("INVITE");
+    let from = invite.headers.get("from").unwrap();
+    assert!(
+        from.starts_with("\"Anonymous\" <sip:anonymous@anonymous.invalid>;tag="),
+        "{from}"
+    );
+    assert_eq!(invite.headers.get("privacy"), Some("id"));
+    server.reply(&invite, peer, 486, &[], None);
+    wait_for(&handle, Event::Ended(EndReason::Rejected(486)));
+}
+
+#[test]
+fn a_public_address_set_for_the_account_is_offered_for_the_audio() {
+    let server = Server::new();
+    let handle = phone(calm_timers());
+    let account = Account::new(server.address().to_string(), "alice", PASSWORD)
+        .with_public_address(Some("203.0.113.5".parse().unwrap()));
+    server.register_as(&handle, account);
+    assert!(handle.send(UiCommand::DialTarget("100".to_owned())));
+    let (invite, peer) = server.request("INVITE");
+    let body = String::from_utf8(invite.body.clone()).unwrap();
+    assert!(body.contains("c=IN IP4 203.0.113.5\r\n"), "{body}");
+    server.reply(&invite, peer, 486, &[], None);
+    wait_for(&handle, Event::Ended(EndReason::Rejected(486)));
 }

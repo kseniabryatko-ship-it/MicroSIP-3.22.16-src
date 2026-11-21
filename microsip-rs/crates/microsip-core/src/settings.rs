@@ -97,9 +97,115 @@ pub struct Settings {
     pub always_on_top: bool,
     /// The band at the top shows the picture instead of the colour.
     pub header_picture: bool,
+    /// The rest of MicroSIP's account fields, for the active account.
+    pub options: AccountOptions,
     /// The saved accounts other than the active one (whose settings are
     /// the fields above), in the order they were added.
     pub accounts: Vec<AccountSettings>,
+}
+
+/// MicroSIP's account fields beyond server, user and password, with its
+/// names in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountOptions {
+    /// Account Name: how the account is called in the list.
+    pub label: String,
+    /// Display Name: the name the people called see.
+    pub display_name: String,
+    /// Dialing Prefix: put in front of telephone numbers dialled.
+    pub dialing_prefix: String,
+    /// Dial Plan, in MicroSIP's syntax.
+    pub dial_plan: String,
+    /// Hide Caller ID: empty, `soft` or `hard`.
+    pub hide_cid: String,
+    /// Public Address: empty for automatic.
+    pub public_addr: String,
+    /// Register Refresh, in seconds (10 at least).
+    pub register_refresh: u32,
+    /// Keep-Alive, in seconds (2 at least).
+    pub keep_alive: u32,
+    pub ice: bool,
+    pub allow_rewrite: bool,
+    pub disable_session_timer: bool,
+}
+
+impl Default for AccountOptions {
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            display_name: String::new(),
+            dialing_prefix: String::new(),
+            dial_plan: String::new(),
+            hide_cid: String::new(),
+            public_addr: String::new(),
+            register_refresh: 300,
+            keep_alive: 15,
+            ice: false,
+            // MicroSIP leaves it off; this phone has always followed the
+            // server's view, so a file without the line keeps doing that.
+            allow_rewrite: true,
+            disable_session_timer: false,
+        }
+    }
+}
+
+impl AccountOptions {
+    /// Sets one field from a line of the file; false for an unknown key.
+    /// Intervals are brought into range as MicroSIP does.
+    fn set(&mut self, key: &str, value: &str) -> bool {
+        let value = value.trim();
+        match key {
+            "label" => self.label = value.to_owned(),
+            "display_name" => self.display_name = value.to_owned(),
+            "dialing_prefix" => self.dialing_prefix = value.to_owned(),
+            "dial_plan" => self.dial_plan = value.to_owned(),
+            "hide_cid" => {
+                self.hide_cid = crate::registration::HideCallerId::from_name(value)
+                    .name()
+                    .to_owned();
+            }
+            "public_addr" => self.public_addr = value.to_owned(),
+            "register_refresh" => {
+                self.register_refresh = match value.parse::<i64>().unwrap_or(0) {
+                    seconds if seconds <= 0 => 300,
+                    seconds => seconds.clamp(10, i64::from(u32::MAX)) as u32,
+                }
+            }
+            "keep_alive" => {
+                self.keep_alive = match value.parse::<i64>().unwrap_or(0) {
+                    seconds if seconds <= 0 => 15,
+                    seconds => seconds.clamp(2, i64::from(u32::MAX)) as u32,
+                }
+            }
+            "ice" => self.ice = value == "1",
+            "allow_rewrite" => self.allow_rewrite = value != "0",
+            "disable_session_timer" => self.disable_session_timer = value == "1",
+            _ => return false,
+        }
+        true
+    }
+
+    /// The lines of these fields, each key after `prefix`.
+    fn lines(&self, prefix: &str) -> String {
+        let flag = |on: bool| if on { "1" } else { "0" }.to_owned();
+        let mut text = String::new();
+        for (key, value) in [
+            ("label", self.label.clone()),
+            ("display_name", self.display_name.clone()),
+            ("dialing_prefix", self.dialing_prefix.clone()),
+            ("dial_plan", self.dial_plan.clone()),
+            ("hide_cid", self.hide_cid.clone()),
+            ("public_addr", self.public_addr.clone()),
+            ("register_refresh", self.register_refresh.to_string()),
+            ("keep_alive", self.keep_alive.to_string()),
+            ("ice", flag(self.ice)),
+            ("allow_rewrite", flag(self.allow_rewrite)),
+            ("disable_session_timer", flag(self.disable_session_timer)),
+        ] {
+            text.push_str(&format!("{prefix}{key}={}\n", one_line(&value)));
+        }
+        text
+    }
 }
 
 impl Default for Settings {
@@ -148,6 +254,7 @@ impl Default for Settings {
             incoming_popup: true,
             always_on_top: false,
             header_picture: true,
+            options: AccountOptions::default(),
             accounts: Vec::new(),
         }
     }
@@ -186,6 +293,9 @@ impl Settings {
                 if account.set(field, value) || known {
                     accounts.insert(number, account);
                 }
+                continue;
+            }
+            if settings.options.set(key.trim(), &value) {
                 continue;
             }
             match key.trim() {
@@ -337,6 +447,7 @@ impl Settings {
             text.push_str(&one_line(value));
             text.push('\n');
         }
+        text.push_str(&self.options.lines(""));
         for (index, account) in self.accounts.iter().enumerate() {
             account.write(index + 1, &mut text);
         }
@@ -389,6 +500,9 @@ pub struct AccountSettings {
     pub media_encryption: String,
     pub stun: String,
     pub voicemail_number: String,
+    /// Publish Presence.
+    pub presence: bool,
+    pub options: AccountOptions,
 }
 
 impl Default for AccountSettings {
@@ -413,6 +527,8 @@ impl AccountSettings {
             media_encryption: settings.media_encryption.clone(),
             stun: settings.stun.clone(),
             voicemail_number: settings.voicemail_number.clone(),
+            presence: settings.presence,
+            options: settings.options.clone(),
         }
     }
 
@@ -430,11 +546,19 @@ impl AccountSettings {
         settings.media_encryption = self.media_encryption.clone();
         settings.stun = self.stun.clone();
         settings.voicemail_number = self.voicemail_number.clone();
+        settings.presence = self.presence;
+        settings.options = self.options.clone();
     }
 
-    /// How the account is shown in a list: `4009 @ pbx.example.com`.
+    /// How the account is shown in a list: its name when it has one,
+    /// otherwise `4009 @ pbx.example.com`.
     pub fn title(&self) -> String {
-        account_title(&self.user, &self.server)
+        let label = self.options.label.trim();
+        if label.is_empty() {
+            account_title(&self.user, &self.server)
+        } else {
+            label.to_owned()
+        }
     }
 
     /// Sets one field from a settings line; false for an unknown key.
@@ -452,7 +576,8 @@ impl AccountSettings {
             "media_encryption" => self.media_encryption = value,
             "stun" => self.stun = value,
             "voicemail_number" => self.voicemail_number = value,
-            _ => return false,
+            "presence" => self.presence = value != "0",
+            other => return self.options.set(other, &value),
         }
         true
     }
@@ -479,9 +604,11 @@ impl AccountSettings {
             ("media_encryption", self.media_encryption.clone()),
             ("stun", self.stun.clone()),
             ("voicemail_number", self.voicemail_number.clone()),
+            ("presence", flag(self.presence)),
         ] {
             text.push_str(&format!("account.{number}.{key}={}\n", one_line(&value)));
         }
+        text.push_str(&self.options.lines(&format!("account.{number}.")));
     }
 }
 
@@ -592,6 +719,19 @@ mod tests {
             incoming_popup: false,
             always_on_top: true,
             header_picture: false,
+            options: AccountOptions {
+                label: "Офис".to_owned(),
+                display_name: "Алиса Иванова".to_owned(),
+                dialing_prefix: "9".to_owned(),
+                dial_plan: "<8:+7>XXXXXXXXXX".to_owned(),
+                hide_cid: "soft".to_owned(),
+                public_addr: "192.168.1.5".to_owned(),
+                register_refresh: 600,
+                keep_alive: 30,
+                ice: false,
+                allow_rewrite: false,
+                disable_session_timer: true,
+            },
             accounts: Vec::new(),
         }
     }
@@ -714,11 +854,33 @@ mod tests {
              voicemail_number=*98\necho_cancellation=0\nnoise_suppression=1\n\
              dtmf_method=info\npresence=1\npresence_status=away\nall_accounts=1\nlanguage=en\n\
              key_tones=0\nincoming_popup=0\nalways_on_top=1\n\
-             header_picture=0\n"
+             header_picture=0\n\
+             label=Офис\ndisplay_name=Алиса Иванова\ndialing_prefix=9\n\
+             dial_plan=<8:+7>XXXXXXXXXX\nhide_cid=soft\npublic_addr=192.168.1.5\n\
+             register_refresh=600\nkeep_alive=30\nice=0\nallow_rewrite=0\n\
+             disable_session_timer=1\n"
         );
         // No line holds the password itself; `save_password` and
         // `password_protected` are different keys.
         assert!(text.lines().all(|line| !line.starts_with("password=")));
+    }
+
+    #[test]
+    fn account_fields_of_microsip_are_kept_and_brought_into_range() {
+        let settings = Settings::parse(
+            "register_refresh=5\nkeep_alive=1\nhide_cid=1\naccount.1.server=two\n\
+             account.1.register_refresh=0\naccount.1.keep_alive=-3\naccount.1.label=Дом\n",
+        );
+        // As MicroSIP: at least 10 s and 2 s; nothing usable is the default;
+        // the old `1` of Hide Caller ID is hard.
+        assert_eq!(settings.options.register_refresh, 10);
+        assert_eq!(settings.options.keep_alive, 2);
+        assert_eq!(settings.options.hide_cid, "hard");
+        assert_eq!(settings.accounts[0].options.register_refresh, 300);
+        assert_eq!(settings.accounts[0].options.keep_alive, 15);
+        assert_eq!(settings.accounts[0].title(), "Дом");
+        // A file of an earlier version keeps following the server's view.
+        assert!(Settings::parse("").options.allow_rewrite);
     }
 
     #[test]
